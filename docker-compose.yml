@@ -36,7 +36,7 @@ services:
     entrypoint:
       - /bin/sh
       - -c
-      - "sleep 3 && ollama pull ${JP_BASE_MODEL:-hf.co/elyza/Llama-3-ELYZA-JP-8B-GGUF:Q4_K_M} && ollama cp ${JP_BASE_MODEL:-hf.co/elyza/Llama-3-ELYZA-JP-8B-GGUF:Q4_K_M} ${IME_LLM_MODEL:-elyza-jp}"
+      - "sleep 3 && ollama pull ${JP_BASE_MODEL:-hf.co/alfredplpl/gemma-2-2b-jpn-it-gguf:Q4_K_M} && ollama cp ${JP_BASE_MODEL:-hf.co/alfredplpl/gemma-2-2b-jpn-it-gguf:Q4_K_M} ${IME_LLM_MODEL:-ime-jp}"
     restart: "no"
 
 volumes:

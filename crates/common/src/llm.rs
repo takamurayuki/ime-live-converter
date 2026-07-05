@@ -46,9 +46,10 @@ impl LlmConfig {
     pub fn from_env() -> Self {
         let url = std::env::var("IME_LLM_URL")
             .unwrap_or_else(|_| "http://localhost:11434/api/generate".to_string());
-        // 既定は日本語特化モデル(elyza-jp = Llama-3-ELYZA-JP-8B)。
-        // 誤字・文法の校正力が Gemma 2B より高い（その分やや遅い）。
-        let model = std::env::var("IME_LLM_MODEL").unwrap_or_else(|_| "elyza-jp".to_string());
+        // 既定は日本語特化モデル(ime-jp = 日本語版 Gemma 2 2B)。
+        // 短縮プロンプトで校正精度が上がり、8Bより速い(~5秒)ため既定にする。
+        // 校正力を最大にしたい場合は IME_LLM_MODEL=elyza-jp（8B, ~10秒）。
+        let model = std::env::var("IME_LLM_MODEL").unwrap_or_else(|_| "ime-jp".to_string());
         // 初回はモデルのメモリ読込に十数秒かかるため既定を長めに取る
         let timeout_ms = std::env::var("IME_LLM_TIMEOUT_MS")
             .ok()
@@ -196,35 +197,32 @@ pub fn llm_correct(
     } else {
         format!("これまでの文章: 「{}」\n", context.trim())
     };
-    // 統計エンジンの候補を「参考候補」として提示し、正しい漢字を選ばせる
+    // 統計エンジンの候補を少数だけ参考として渡す（多いと推論が遅くなる）
     let cand_block = if candidates.is_empty() {
         String::new()
     } else {
-        let mut s = String::from("参考候補（この中の表記を優先して使う）:\n");
-        for c in candidates.iter().take(6) {
-            s.push_str(&format!("- {}\n", c));
+        let mut s = String::from("参考候補: ");
+        for c in candidates.iter().take(3) {
+            s.push_str(&format!("{} / ", c));
         }
+        s.push('\n');
         s
     };
+    // 出力上限は読みの文字数+αで十分（短くして推論を速くする）
+    let predict = (reading.chars().count() as i64 + 16).clamp(24, 96);
     let prompt = format!(
-        "# 指示\n\
-         次は日本語入力の下書き（かな漢字変換の結果）です。読みに忠実に、\
-         誤字脱字と文法の誤りだけを直し、厳密に正しい日本語の一文にしてください。\n\
-         規則: 意味・語順・語尾・文体を変えない。読みに無い語を足さない。\
-         助詞「は/へ/を」は文法どおりに表記する。漢字は参考候補にある表記を優先する。\
-         既に正しければそのまま出力する。出力は正しい一文のみ（説明・引用符なし）。\n\
-         # 例\n\
-         読み: きょうわかいぎがある / 下書き: 今日わ会議がある → 今日は会議がある\n\
-         読み: しりょうおつくる / 下書き: 資料お作る → 資料を作る\n\
-         読み: かいぎのしりょうをかくにん / 下書き: 会議の資料を確認 → 会議の資料を確認\n\
-         # 対象\n\
-         {ctx}{cand_block}読み: {reading} / 下書き: {draft} → "
+        "次の日本語の下書きから、誤字・文法（は/へ/を、送り仮名 等）だけを直し、\
+         正しい一文にしてください。意味・語順・語尾は変えない。読みに無い語を足さない。\
+         既に正しければそのまま。出力は一文のみ。\n\
+         例: 今日わ会議がある → 今日は会議がある\n\
+         例: 資料お作る → 資料を作る\n\
+         {ctx}{cand_block}下書き: {draft} → "
     );
     let body = serde_json::json!({
         "model": cfg.model,
         "prompt": prompt,
         "stream": false,
-        "options": { "temperature": 0.0, "num_predict": 128 },
+        "options": { "temperature": 0.0, "num_predict": predict },
         "keep_alive": "30m"
     });
     let agent = ureq::AgentBuilder::new().timeout(cfg.timeout).build();
@@ -369,8 +367,21 @@ fn clean_output(text: &str) -> String {
         line = line[pos + '→'.len_utf8()..].trim();
     }
     // 前後の引用符・記号を剥がす
-    line.trim_matches(|c| matches!(c, '「' | '」' | '『' | '』' | '"' | '\'' | '`' | ' ' | '　'))
-        .to_string()
+    let trimmed = line
+        .trim_matches(|c| matches!(c, '「' | '」' | '『' | '』' | '"' | '\'' | '`' | ' ' | '　'));
+    // モデルが混入させる絵文字・記号を除去（📖 等の幻覚対策）
+    trimmed.chars().filter(|&c| !is_emoji_or_symbol(c)).collect()
+}
+
+/// 絵文字・装飾記号か（通常の日本語文には現れないもの）
+fn is_emoji_or_symbol(c: char) -> bool {
+    let u = c as u32;
+    (0x1F000..=0x1FAFF).contains(&u)   // 絵文字（補助多言語面）
+        || (0x2600..=0x27BF).contains(&u)  // その他記号・装飾記号
+        || (0x2B00..=0x2BFF).contains(&u)
+        || (0xFE00..=0xFE0F).contains(&u)  // 異体字セレクタ
+        || u == 0x200D                     // ZWJ
+        || (0x2190..=0x21FF).contains(&u)  // 矢印類（→ は前段で処理済み）
 }
 
 #[cfg(test)]

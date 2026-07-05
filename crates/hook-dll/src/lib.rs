@@ -247,6 +247,10 @@ struct LiveConversionState {
     recent_context: String,
     /// かなモード（Escで有効化）。ONの間は漢字変換せず、ひらがなのまま表示する。
     kana_mode: bool,
+    /// 入力世代。入力・確定・取消のたびに増える。非同期のLLM結果が
+    /// 発火時と同じ世代のときだけ適用し、古い結果が別の位置に誤って
+    /// 差し込まれる（前の入力が壊れる）のを防ぐ。
+    generation: u64,
     /// 学習リポジトリ（確定履歴の記録・候補の頻度順ソート）
     learning: Option<LearningRepository>,
     /// 変換が有効かどうか
@@ -273,6 +277,7 @@ impl LiveConversionState {
             committed_segments: Vec::new(),
             recent_context: String::new(),
             kana_mode: false,
+            generation: 0,
             learning: None,
             enabled: true,
         }
@@ -445,8 +450,9 @@ impl LiveConversionState {
             return None;
         }
 
-        // バッファが変わるので候補リストは無効化
+        // バッファが変わるので候補リストは無効化し、世代を進める
         self.clear_candidates();
+        self.generation = self.generation.wrapping_add(1);
 
         self.romaji_buffer.push(ch);
         debug_log!("入力: '{}' → ローマ字バッファ: '{}'", ch, self.romaji_buffer);
@@ -473,6 +479,7 @@ impl LiveConversionState {
         }
 
         self.clear_candidates();
+        self.generation = self.generation.wrapping_add(1);
 
         if !self.romaji_buffer.is_empty() {
             // 入力途中のローマ字は1文字ずつ削除
@@ -844,6 +851,7 @@ impl LiveConversionState {
         self.last_sent_length = 0;
         self.committed_segments.clear();
         self.kana_mode = false;
+        self.generation = self.generation.wrapping_add(1);
         self.clear_candidates();
 
         action
@@ -863,6 +871,7 @@ impl LiveConversionState {
         self.last_sent_length = 0;
         self.committed_segments.clear();
         self.kana_mode = false;
+        self.generation = self.generation.wrapping_add(1);
         self.clear_candidates();
 
         if delete_count > 0 {
@@ -1420,8 +1429,8 @@ fn is_ime_hiragana_mode() -> bool {
 /// 結果が返った時点で読みが変わっていなければ、合成中テキストを
 /// LLM の結果に差し替える。LLM 未起動・失敗時は何もしない。
 fn trigger_llm_conversion() {
-    // 読み・統計変換の下書き・N-best候補・文脈をスナップショット
-    let (reading, draft, candidates, context) = unsafe {
+    // 読み・統計変換の下書き・N-best候補・文脈・世代をスナップショット
+    let (reading, draft, candidates, context, gen) = unsafe {
         match &LIVE_CONTEXT {
             Some(mtx) => match mtx.try_lock() {
                 Ok(ctx) => {
@@ -1432,7 +1441,13 @@ fn trigger_llm_conversion() {
                     // 統計エンジンの結果を下書き、N-bestを参考候補としてLLMに渡す
                     let draft = conv.convert_context_aware_to_string(&ctx.hiragana_buffer);
                     let cands = conv.n_best_strings(&ctx.hiragana_buffer, 6);
-                    (ctx.hiragana_buffer.clone(), draft, cands, ctx.recent_context.clone())
+                    (
+                        ctx.hiragana_buffer.clone(),
+                        draft,
+                        cands,
+                        ctx.recent_context.clone(),
+                        ctx.generation,
+                    )
                 }
                 Err(_) => return,
             },
@@ -1459,7 +1474,10 @@ fn trigger_llm_conversion() {
         unsafe {
             let Some(mtx) = &LIVE_CONTEXT else { return };
             let Ok(mut ctx) = mtx.lock() else { return };
-            if !ctx.enabled || ctx.hiragana_buffer != reading {
+            // 発火時から入力世代が変わっていたら破棄（その間に入力・確定・
+            // 取消があった → 適用すると別位置に差し込まれ前の入力を壊す）
+            if !ctx.enabled || ctx.generation != gen || ctx.hiragana_buffer != reading {
+                debug_log!("LLM校正: 世代不一致のため破棄");
                 return;
             }
             if let Some(action) = ctx.apply_new_result(corrected) {
