@@ -239,10 +239,12 @@ const COMMON_WORD_SEED: &[(&str, &str)] = &[
     ("かんじ", "漢字"), ("へんかん", "変換"), ("にゅうりょく", "入力"),
     ("しゅつりょく", "出力"), ("もじ", "文字"), ("たんご", "単語"), ("ぶんしょう", "文章"),
     ("けんさく", "検索"), ("せってい", "設定"), ("がめん", "画面"), ("そうさ", "操作"),
+    ("もんだい", "問題"), ("ないよう", "内容"), ("かいけつ", "解決"),
 ];
 
 /// 頻出語プリセットのボーナス（moderate。実学習で上書きされる）
 const COMMON_WORD_SEED_BONUS: i32 = 1500;
+
 
 /// 使用頻度をコスト減額（ボーナス）に変換する
 ///
@@ -346,7 +348,12 @@ impl ViterbiConverter {
     /// 新聞の記者」のように、助詞を挟んで離れた前後の語の関係から
     /// 尤もらしい変換を選ぶ（学習が無ければ通常の1-bestのまま）。
     pub fn convert_context_aware(&self, reading: &str) -> Vec<WordEntry> {
-        let mut base = self.convert(reading);
+        let base = self.convert(reading);
+        self.rerank_by_assoc(base)
+    }
+
+    /// 学習した内容語連想で 1-best を微調整する（差し替え）
+    fn rerank_by_assoc(&self, mut base: Vec<WordEntry>) -> Vec<WordEntry> {
         if self.learned_assoc.is_empty() || base.len() < 2 {
             return base;
         }
