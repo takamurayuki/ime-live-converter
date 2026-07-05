@@ -1,0 +1,8 @@
+/target
+ime-learning.db
+# hook-dll のデバッグログ（IME_DEBUG_LOG=1 で生成。キー入力が平文で残るため絶対にコミットしない）
+hook_debug.log
+# IPA辞書から生成されるバイナリ辞書（README の手順で再生成可能）
+dictionaries/system.dic
+# 環境固有のLLM設定（.env.example をコピーして使う）
+.env

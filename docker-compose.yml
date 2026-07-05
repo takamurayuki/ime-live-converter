@@ -1,0 +1,43 @@
+# ローカルLLM（Ollama）を Docker で一元管理する構成。
+#
+# 使い方:
+#   docker compose up -d      # 起動（初回はモデルを自動取得）
+#   docker compose logs -f    # 進捗確認（初回のモデルDLはやや時間がかかる）
+#   docker compose down       # 停止
+#
+# モデルは名前付きボリューム `ollama` に永続化されるので、次回以降は即起動。
+# 使用モデルは .env の OLLAMA_MODEL で変更できる（既定 qwen2.5:3b）。
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ime-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama:/root/.ollama
+    restart: unless-stopped
+    # GPUを使う場合は以下のコメントを外す（NVIDIA + nvidia-container-toolkit 必要）
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  # 初回起動時に日本語特化モデルを取得し、短い別名 ime-jp を作る使い捨てサービス
+  # 既定は日本語版 Gemma 2 2B（かな漢字変換の精度が qwen 等より高い）。
+  model-pull:
+    image: ollama/ollama:latest
+    depends_on:
+      - ollama
+    environment:
+      - OLLAMA_HOST=ollama:11434
+    entrypoint:
+      - /bin/sh
+      - -c
+      - "sleep 3 && ollama pull ${JP_BASE_MODEL:-hf.co/alfredplpl/gemma-2-2b-jpn-it-gguf:Q4_K_M} && ollama cp ${JP_BASE_MODEL:-hf.co/alfredplpl/gemma-2-2b-jpn-it-gguf:Q4_K_M} ${IME_LLM_MODEL:-ime-jp}"
+    restart: "no"
+
+volumes:
+  ollama:

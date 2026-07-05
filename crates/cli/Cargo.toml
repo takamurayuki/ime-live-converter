@@ -1,0 +1,13 @@
+[package]
+name = "ime-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ime-cli"
+path = "src/main.rs"
+
+[dependencies]
+common = { path = "../common" }
+anyhow = "1.0"
+crossterm = "0.28"
