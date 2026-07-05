@@ -103,10 +103,45 @@ cargo run --release -p ime-cli
 | **Space** | 現在の変換を確定して空白を入れる（非変換中は通常の空白） |
 | **Shift+Space** | **LLMで校正**（誤字・文法を修正。下記） |
 | Backspace | 直近の変換単語（文節）ごと削除 |
-| → | 先頭文節を部分確定 |
+| → | 先頭文節を部分確定（正しい前半を固定して続きを打てる） |
+| **Esc** | 末尾から一文節ずつひらがなに戻す（押すたびに前へ）。戻すものが無ければ取消 |
 | Enter / 句読点 | 確定（学習に記録） |
 | 半角/全角 | 変換ON/OFF |
 | Ctrl+Space | 変換機能の緊急ON/OFF |
+
+## 常時バックグラウンドで起動する
+
+キーボードフックはユーザーセッションで動く必要があるため、Windows サービス
+ではなく **ログオン時に常駐**させます。`--background` を付けると標準入力を
+読まずに常駐します（対話コマンドは使えません）。
+
+### 自動起動を登録（推奨: 非表示・ログオン時）
+
+```powershell
+# 先にビルドしておく
+cargo build --release
+
+# 管理者権限の PowerShell で登録（次回ログオンから非表示で自動起動）
+powershell -ExecutionPolicy Bypass -File scripts\install-autostart.ps1
+
+# 今すぐ開始する場合
+Start-ScheduledTask -TaskName IMELiveConverter
+```
+
+- 黒いコンソールは出ません（`scripts\run-hidden.vbs` 経由で非表示起動）。
+- 最上位の権限で動くので、管理者権限のアプリ上でも変換が効きます。
+- **停止/解除**: `powershell -ExecutionPolicy Bypass -File scripts\uninstall-autostart.ps1`
+- 一時的に手動で試すだけなら: `wscript scripts\run-hidden.vbs`（停止はタスクマネージャーで `conversion-service.exe` を終了）
+
+### 学習がおかしくなったら（誤変換の学習を掃除）
+
+誤変換のまま確定を続けると、その誤りを学習して悪化することがあります
+（再汚染を防ぐガードは入っていますが、過去の汚染は下記で掃除できます）。
+
+```powershell
+python scripts\clean-learning-db.py            # 掃除
+python scripts\clean-learning-db.py --dry-run  # 何が消えるか確認だけ
+```
 
 ## ローカルLLM校正（任意）
 

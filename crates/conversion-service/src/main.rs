@@ -157,6 +157,9 @@ enum Command {
 }
 
 fn main() -> Result<()> {
+    // --background / -b: 標準入力を読まず、常駐（ログオン時自動起動向け）
+    let background = std::env::args().any(|a| a == "--background" || a == "-b");
+
     println!("IME Live Converter を起動しています...");
     println!();
 
@@ -197,50 +200,60 @@ fn main() -> Result<()> {
         println!("警告: 辞書が見つかりません。ひらがな変換のみ動作します。");
     }
 
-    print_help();
-    println!("対話モードで動作中。'q' で終了、'h' でヘルプ。");
-    println!();
+    if background {
+        println!("バックグラウンドモードで常駐します（終了はプロセスを停止）。");
+    } else {
+        print_help();
+        println!("対話モードで動作中。'q' で終了、'h' でヘルプ。");
+        println!();
+    }
 
     // コマンド受信用チャネル
     let (tx, rx) = mpsc::channel::<Command>();
-    
-    // 入力スレッドを開始
-    let input_thread = thread::spawn(move || {
-        let stdin = io::stdin();
-        let reader = stdin.lock();
-        
-        for line in reader.lines() {
-            if let Ok(input) = line {
-                let cmd = input.trim().to_lowercase();
-                let command = match cmd.as_str() {
-                    "q" | "quit" | "exit" => Some(Command::Quit),
-                    "h" | "help" => Some(Command::Help),
-                    "t" | "toggle" => Some(Command::Toggle),
-                    "s" | "status" => Some(Command::Status),
-                    _ if cmd.starts_with("d ") || cmd.starts_with("dict ") => {
-                        let path = cmd.split_whitespace().skip(1).collect::<Vec<_>>().join(" ");
-                        Some(Command::LoadDict(path))
-                    }
-                    "" => None,
-                    _ => {
-                        println!("不明なコマンド: {}", cmd);
-                        None
-                    }
-                };
-                
-                if let Some(cmd) = command {
-                    if tx.send(cmd).is_err() {
-                        break;
-                    }
-                }
-                print!("> ");
-                let _ = io::stdout().flush();
-            }
-        }
-    });
+    // 元の tx を main 側で保持し、入力スレッドが終了（標準入力EOF）しても
+    // rx が切断されて常駐が勝手に終わらないようにする。
+    let _keep_tx = tx.clone();
 
-    print!("> ");
-    let _ = io::stdout().flush();
+    // 対話モードのみ標準入力を読むスレッドを起動する。
+    // バックグラウンドでは標準入力が無い（あるいは即EOF）ため起動しない。
+    if !background {
+        thread::spawn(move || {
+            let stdin = io::stdin();
+            let reader = stdin.lock();
+
+            for line in reader.lines() {
+                if let Ok(input) = line {
+                    let cmd = input.trim().to_lowercase();
+                    let command = match cmd.as_str() {
+                        "q" | "quit" | "exit" => Some(Command::Quit),
+                        "h" | "help" => Some(Command::Help),
+                        "t" | "toggle" => Some(Command::Toggle),
+                        "s" | "status" => Some(Command::Status),
+                        _ if cmd.starts_with("d ") || cmd.starts_with("dict ") => {
+                            let path = cmd.split_whitespace().skip(1).collect::<Vec<_>>().join(" ");
+                            Some(Command::LoadDict(path))
+                        }
+                        "" => None,
+                        _ => {
+                            println!("不明なコマンド: {}", cmd);
+                            None
+                        }
+                    };
+
+                    if let Some(cmd) = command {
+                        if tx.send(cmd).is_err() {
+                            break;
+                        }
+                    }
+                    print!("> ");
+                    let _ = io::stdout().flush();
+                }
+            }
+        });
+
+        print!("> ");
+        let _ = io::stdout().flush();
+    }
 
     // メインスレッドでメッセージループを実行
     let running = Arc::new(AtomicBool::new(true));
@@ -303,9 +316,6 @@ fn main() -> Result<()> {
     // フックをアンインストール
     dll.uninstall();
     println!("\nキーボードフックをアンインストールしました");
-
-    // 入力スレッドは自然終了を待たない（ブロックするため）
-    drop(input_thread);
 
     Ok(())
 }
