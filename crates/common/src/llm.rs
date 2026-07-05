@@ -46,9 +46,9 @@ impl LlmConfig {
     pub fn from_env() -> Self {
         let url = std::env::var("IME_LLM_URL")
             .unwrap_or_else(|_| "http://localhost:11434/api/generate".to_string());
-        // 既定は日本語特化モデル(ime-jp = 日本語版 Gemma 2 2B)。
-        // qwen 等の多言語モデルより かな漢字変換の精度が高い。
-        let model = std::env::var("IME_LLM_MODEL").unwrap_or_else(|_| "ime-jp".to_string());
+        // 既定は日本語特化モデル(elyza-jp = Llama-3-ELYZA-JP-8B)。
+        // 誤字・文法の校正力が Gemma 2B より高い（その分やや遅い）。
+        let model = std::env::var("IME_LLM_MODEL").unwrap_or_else(|_| "elyza-jp".to_string());
         // 初回はモデルのメモリ読込に十数秒かかるため既定を長めに取る
         let timeout_ms = std::env::var("IME_LLM_TIMEOUT_MS")
             .ok()
@@ -233,10 +233,23 @@ pub fn llm_correct(
     let text = json.get("response")?.as_str()?;
 
     let cleaned = clean_output(text);
-    if cleaned.is_empty() || is_all_hiragana(&cleaned) {
-        return None; // 失敗・平仮名エコーは下書きを維持
+    if cleaned.is_empty() || is_all_hiragana(&cleaned) || looks_like_meta(&cleaned) {
+        return None; // 失敗・平仮名エコー・指示文の混入は下書きを維持
     }
     Some(cleaned)
+}
+
+/// LLMの出力が「答え」でなく指示文・前置きの漏れかを判定する
+///
+/// モデルが稀に「# 指示に従い…修正します。」のような前置きを出すため、
+/// それを検出して破棄する（適用すると変な文が入ってしまう）。
+fn looks_like_meta(s: &str) -> bool {
+    s.starts_with('#')
+        || s.contains("指示")
+        || s.contains("下書き")
+        || s.contains("修正します")
+        || s.contains("以下")
+        || s.contains("```")
 }
 
 /// 変換候補の中から、文脈上最も自然なものをLLMに選ばせる（rerank）
@@ -344,14 +357,19 @@ fn is_all_hiragana(s: &str) -> bool {
 /// モデルは時々引用符・前置き・改行を付けるので、最初の行の
 /// 中身だけを取り出す。
 fn clean_output(text: &str) -> String {
-    let mut first_line = text.trim().lines().next().unwrap_or("").trim();
+    // 前置き行（#... や「以下…」等）を飛ばし、最初の中身らしい行を採用
+    let mut line = text
+        .trim()
+        .lines()
+        .map(|l| l.trim())
+        .find(|l| !l.is_empty() && !l.starts_with('#') && !l.contains("以下"))
+        .unwrap_or("");
     // モデルが「→ 結果」と矢印を残す場合は矢印以降を採用
-    if let Some(pos) = first_line.rfind('→') {
-        first_line = first_line[pos + '→'.len_utf8()..].trim();
+    if let Some(pos) = line.rfind('→') {
+        line = line[pos + '→'.len_utf8()..].trim();
     }
     // 前後の引用符・記号を剥がす
-    first_line
-        .trim_matches(|c| matches!(c, '「' | '」' | '『' | '』' | '"' | '\'' | '`' | ' ' | '　'))
+    line.trim_matches(|c| matches!(c, '「' | '」' | '『' | '』' | '"' | '\'' | '`' | ' ' | '　'))
         .to_string()
 }
 
