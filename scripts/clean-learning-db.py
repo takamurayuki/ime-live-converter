@@ -32,10 +32,21 @@ def is_short_katakana(surf: str) -> bool:
     )
 
 
+# 接尾辞など、単独ユニグラムだと誤変換を招く (読み, 表記) の組。
+# 例: せい→性 が強いと「しんせい」が「しん性」に割れる。
+# つながり（可能→性）はバイグラムで保持されるので単独学習だけ消す。
+SUFFIX_UNIGRAMS = {
+    ("せい", "性"), ("てき", "的"), ("ちゅう", "中"), ("さい", "際"),
+    ("しょう", "賞"), ("か", "化"), ("しゃ", "者"),
+}
+
+
 def is_polluted_unigram(reading: str, surface: str) -> bool:
     if len(reading) == 1 and reading != surface:
         return True
     if len(reading) <= 3 and surface == katakana(reading):
+        return True
+    if (reading, surface) in SUFFIX_UNIGRAMS:
         return True
     return False
 

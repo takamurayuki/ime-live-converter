@@ -386,12 +386,19 @@ impl LiveConversionState {
             return;
         };
         // ユニグラム（読み→表記）
-        for (reading, surface, _pos) in segments {
+        for (reading, surface, pos) in segments {
             if reading == surface {
                 continue; // ひらがなそのままは学習しない
             }
             if !is_learnable_pair(reading, surface) {
                 continue; // 助詞の漢字化・英字ゴミ等は学習しない
+            }
+            // 接尾辞（性・的・化 等）は単独ユニグラムとして学習しない。
+            // 「可能性」→ 可能+性 のように複合語の一部で出るため、単独で
+            // 学習すると「せい→性」が強まり「しんせい」が「しん性」に割れる。
+            // 語のつながりは下のバイグラム（可能→性）で捕捉する。
+            if pos.contains("接尾") {
+                continue;
             }
             let _ = learning.record_commit(reading, surface, None);
             let freq = learning.find_frequency(reading, surface).unwrap_or(1);
