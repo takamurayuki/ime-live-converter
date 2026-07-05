@@ -234,7 +234,20 @@ pub fn llm_correct(
     if cleaned.is_empty() || is_all_hiragana(&cleaned) || looks_like_meta(&cleaned) {
         return None; // 失敗・平仮名エコー・指示文の混入は下書きを維持
     }
+    // ハルシネーション対策: 校正がカタカナを増やしたら破棄する。
+    // 良い校正は誤字・文法を直すだけでカタカナを足さない。「天気」→「テン気」
+    // のように下書きに無いカタカナを生む出力は悪化なので下書きを維持する。
+    if count_katakana(&cleaned) > count_katakana(draft) {
+        return None;
+    }
     Some(cleaned)
+}
+
+/// カタカナ文字数を数える（校正がカタカナを増やす=ハルシネーション判定用）
+fn count_katakana(s: &str) -> usize {
+    s.chars()
+        .filter(|&c| ('\u{30A1}'..='\u{30FA}').contains(&c))
+        .count()
 }
 
 /// LLMの出力が「答え」でなく指示文・前置きの漏れかを判定する
@@ -427,5 +440,25 @@ mod tests {
         // モデルが「→ 結果」と矢印を残す場合は矢印以降を採用
         assert_eq!(clean_output("→ 今日は晴れ"), "今日は晴れ");
         assert_eq!(clean_output("入力 → 今日は晴れ"), "今日は晴れ");
+    }
+
+    #[test]
+    fn test_clean_output_strips_emoji() {
+        // 絵文字・装飾記号を除去（📖 等の幻覚対策）
+        assert_eq!(clean_output("私📖は本を読む"), "私は本を読む");
+        assert_eq!(clean_output("今日は晴れ✨"), "今日は晴れ");
+    }
+
+    #[test]
+    fn test_clean_output_skips_meta_line() {
+        // #で始まる前置き行は飛ばして次の中身を採用
+        assert_eq!(clean_output("# 指示\n今日は晴れ"), "今日は晴れ");
+    }
+
+    #[test]
+    fn test_count_katakana() {
+        assert_eq!(count_katakana("テン気"), 2);
+        assert_eq!(count_katakana("天気"), 0);
+        assert_eq!(count_katakana("ラーメン"), 3); // ー は対象外だが ラメン=3
     }
 }
