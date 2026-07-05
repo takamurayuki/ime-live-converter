@@ -200,6 +200,12 @@ pub struct ViterbiConverter {
     /// 繋がりを覚える。N-best候補の再ランクに使い、学習した繋がりを
     /// 最も多く含む変換を「正しい」として選ぶ。
     pub learned_assoc: HashMap<(String, String), i32>,
+    /// 学習したひらがな優先: 読み → コスト減額
+    ///
+    /// ユーザーが Esc でひらがなに戻した読みを覚え、次回からその読みを
+    /// ひらがなのまま出しやすくする（例: 「したい」を「慕い」にしない）。
+    /// ラティスにその読みのひらがなノードを低コストで追加して実現する。
+    pub learned_hiragana: HashMap<String, i32>,
 }
 
 /// 品詞が内容語（助詞・助動詞・記号・未知語でない）か判定する
@@ -240,6 +246,9 @@ const COMMON_WORD_SEED: &[(&str, &str)] = &[
     ("しゅつりょく", "出力"), ("もじ", "文字"), ("たんご", "単語"), ("ぶんしょう", "文章"),
     ("けんさく", "検索"), ("せってい", "設定"), ("がめん", "画面"), ("そうさ", "操作"),
     ("もんだい", "問題"), ("ないよう", "内容"), ("かいけつ", "解決"),
+    // 長い動詞は辞書コストが高く、安いカタカナ断片(カン 等)+助詞の分割に
+    // 負けやすい。よく使う動詞を優先しておく。
+    ("かんがえる", "考える"), ("かんがえた", "考えた"),
 ];
 
 /// 頻出語プリセットのボーナス（moderate。実学習で上書きされる）
@@ -294,6 +303,7 @@ impl ViterbiConverter {
             learned_unigram: HashMap::new(),
             learned_bigram: HashMap::new(),
             learned_assoc: HashMap::new(),
+            learned_hiragana: HashMap::new(),
         };
         conv.seed_common_words();
         conv
@@ -312,6 +322,10 @@ impl ViterbiConverter {
         //  中程度プリセット止まりにする）
         self.learned_unigram
             .insert(("を".to_string(), "を".to_string()), 8000);
+        // 「考える」は辞書コストが高く(7049)、単独だと安いカタカナ断片
+        // 「カン」+助詞の分割に負けるため強めに優先する。
+        self.learned_unigram
+            .insert(("かんがえる".to_string(), "考える".to_string()), 4000);
     }
 
     /// 学習データをすべてクリア（頻出語プリセットは残す）
@@ -319,7 +333,15 @@ impl ViterbiConverter {
         self.learned_unigram.clear();
         self.learned_bigram.clear();
         self.learned_assoc.clear();
+        self.learned_hiragana.clear();
         self.seed_common_words();
+    }
+
+    /// ひらがな優先（Escで戻した読み）を頻度から設定する
+    pub fn learn_hiragana(&mut self, reading: &str, freq: u32) {
+        // ひらがなノードを既存語より確実に勝たせるため強めに効かせる
+        let bonus = (frequency_to_bonus(freq)).max(COMMON_WORD_SEED_BONUS);
+        self.learned_hiragana.insert(reading.to_string(), bonus);
     }
 
     /// ユニグラム（読み→表記）の学習を頻度から設定する
@@ -539,7 +561,45 @@ impl ViterbiConverter {
             }
         }
 
+        // 学習したひらがな優先（Escで戻した読み）のノードを追加する。
+        // 入力中に該当する読みが現れたら、その範囲にひらがなノードを
+        // 低コストで足し、既存語（例: 慕い）より優先させる。
+        self.add_learned_hiragana_nodes(&mut lattice, input);
+
         lattice
+    }
+
+    /// 学習したひらがな優先の読みに対応するひらがなノードを追加する
+    fn add_learned_hiragana_nodes(&self, lattice: &mut Lattice, input: &str) {
+        if self.learned_hiragana.is_empty() {
+            return;
+        }
+        for (reading, bonus) in &self.learned_hiragana {
+            if reading.is_empty() {
+                continue;
+            }
+            // input 中の全出現位置に対してノードを追加
+            let mut from = 0usize;
+            while let Some(rel) = input[from..].find(reading.as_str()) {
+                let start = from + rel;
+                let end = start + reading.len();
+                // ひらがな表記は基準コストから学習ボーナス分を引いて優先
+                let cost = (5000 - bonus).clamp(-30000, i16::MAX as i32) as i16;
+                lattice.add_word(
+                    start,
+                    end,
+                    WordEntry {
+                        surface: reading.clone(),
+                        reading: reading.clone(),
+                        left_id: self.katakana_pos_id,
+                        right_id: self.katakana_pos_id,
+                        cost,
+                        pos: "名詞-一般-*-*".to_string(),
+                    },
+                );
+                from = start + reading.chars().next().unwrap().len_utf8();
+            }
+        }
     }
 
     /// カタカナ候補ノードをラティスに追加（未知語連続位置からの span のみ）
@@ -1395,6 +1455,30 @@ mod tests {
         });
         let converter = ViterbiConverter::new(dict);
         assert_eq!(converter.convert_to_string("を"), "を");
+    }
+
+    #[test]
+    fn test_learned_hiragana_preference() {
+        // Escで戻した読みを学習すると、その読みがひらがなで出るようになる
+        let mut dict = Dictionary::new();
+        dict.matrix = crate::dictionary::ConnectionMatrix::new(10, 10);
+        for i in 0..10 {
+            for j in 0..10 {
+                dict.matrix.set(i, j, 200);
+            }
+        }
+        // 「したい」に漢字「慕い」だけ登録（安め）
+        dict.add_word(WordEntry {
+            surface: "慕い".into(), reading: "したい".into(),
+            left_id: 1, right_id: 1, cost: 4000, pos: "名詞-一般".into(),
+        });
+        let mut converter = ViterbiConverter::new(dict);
+        // 学習前は漢字
+        assert_eq!(converter.convert_to_string("したい"), "慕い");
+        // ひらがな優先を学習
+        converter.learn_hiragana("したい", 1);
+        // 学習後はひらがな
+        assert_eq!(converter.convert_to_string("したい"), "したい");
     }
 
     #[test]

@@ -310,6 +310,11 @@ impl LiveConversionState {
                 conv.learn_assoc(&prev, &content, freq);
             }
         }
+        if let Ok(prefs) = learning.all_hiragana_prefs() {
+            for (reading, freq) in prefs {
+                conv.learn_hiragana(&reading, freq);
+            }
+        }
         debug_log!(
             "学習ロード: unigram={}, bigram={}, assoc={}",
             conv.learned_unigram.len(),
@@ -915,6 +920,27 @@ impl LiveConversionState {
         let mut segments = std::mem::take(&mut self.committed_segments);
         segments.extend(self.segment_remaining());
         self.learn_from_segments(&segments);
+
+        // Escでひらがなに戻した末尾は「この読みはひらがな優先」として学習。
+        // 次回から その読みをひらがなのまま出しやすくする（例: したい）。
+        if self.kana_tail_len > 0 {
+            let total = self.hiragana_buffer.chars().count();
+            let keep = total.saturating_sub(self.kana_tail_len);
+            let tail: String = self.hiragana_buffer.chars().skip(keep).collect();
+            if !tail.is_empty() {
+                let freq = if let Some(learning) = self.learning.as_ref() {
+                    let _ = learning.record_hiragana_pref(&tail);
+                    learning.find_hiragana_pref(&tail).unwrap_or(1)
+                } else {
+                    0
+                };
+                if freq > 0 {
+                    if let Some(conv) = self.converter.as_mut() {
+                        conv.learn_hiragana(&tail, freq);
+                    }
+                }
+            }
+        }
 
         // 直近の確定テキストを文脈として蓄積（LLM変換に渡す。末尾60文字）
         let committed: String = segments.iter().map(|(_, s, _)| s.as_str()).collect();

@@ -119,6 +119,17 @@ impl LearningRepository {
             [],
         )?;
 
+        // ひらがな優先テーブル（Escでひらがなに戻した読みを覚える）
+        // 例: 「したい」を「慕い」にせずひらがなのまま出すため。
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS hiragana_pref (
+                reading TEXT NOT NULL,
+                frequency INTEGER NOT NULL DEFAULT 1,
+                UNIQUE(reading)
+            )",
+            [],
+        )?;
+
         // インデックス作成
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_user_dict_reading ON user_dictionary(reading)",
@@ -350,6 +361,44 @@ impl LearningRepository {
         let rows = stmt
             .query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, u32>(2)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    // ============ ひらがな優先（Escで戻した読み） ============
+
+    /// ひらがな優先を記録（頻度+1）
+    pub fn record_hiragana_pref(&self, reading: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO hiragana_pref (reading, frequency) VALUES (?1, 1)
+             ON CONFLICT(reading) DO UPDATE SET frequency = frequency + 1",
+            params![reading],
+        )?;
+        Ok(())
+    }
+
+    /// ひらがな優先の頻度を取得
+    pub fn find_hiragana_pref(&self, reading: &str) -> Result<u32> {
+        let freq: Option<u32> = self
+            .conn
+            .query_row(
+                "SELECT frequency FROM hiragana_pref WHERE reading = ?1",
+                params![reading],
+                |row| row.get(0),
+            )
+            .ok();
+        Ok(freq.unwrap_or(0))
+    }
+
+    /// 全ひらがな優先（読み, 頻度）を取得（起動時の一括ロード用）
+    pub fn all_hiragana_prefs(&self) -> Result<Vec<(String, u32)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT reading, frequency FROM hiragana_pref")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
