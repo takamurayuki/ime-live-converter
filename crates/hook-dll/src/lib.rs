@@ -245,8 +245,6 @@ struct LiveConversionState {
     committed_segments: Vec<(String, String, String)>,
     /// 直近に確定したテキスト（LLM変換へ渡す前後文脈。末尾数十文字を保持）
     recent_context: String,
-    /// かなモード（Escで有効化）。ONの間は漢字変換せず、ひらがなのまま表示する。
-    kana_mode: bool,
     /// 入力世代。入力・確定・取消のたびに増える。非同期のLLM結果が
     /// 発火時と同じ世代のときだけ適用し、古い結果が別の位置に誤って
     /// 差し込まれる（前の入力が壊れる）のを防ぐ。
@@ -276,7 +274,6 @@ impl LiveConversionState {
             cand_suffix_reading: String::new(),
             committed_segments: Vec::new(),
             recent_context: String::new(),
-            kana_mode: false,
             generation: 0,
             learning: None,
             enabled: true,
@@ -512,10 +509,7 @@ impl LiveConversionState {
     fn update_conversion(&mut self) -> Option<ConversionAction> {
         // ひらがなバッファのみを漢字変換
         // ローマ字バッファはそのまま末尾に追加
-        let converted_hiragana = if self.kana_mode {
-            // かなモード（Escで有効化）: 漢字変換せずひらがなのまま
-            self.hiragana_buffer.clone()
-        } else if let Some(converter) = &self.converter {
+        let converted_hiragana = if let Some(converter) = &self.converter {
             if !self.hiragana_buffer.is_empty() {
                 // 文脈（内容語の繋がり）を考慮して尤もらしい変換を選ぶ
                 let converted = converter.convert_context_aware_to_string(&self.hiragana_buffer);
@@ -614,6 +608,34 @@ impl LiveConversionState {
             (self.candidate_index + 1) % len
         };
         self.select_candidate(next)
+    }
+
+    /// 直近（最後）に変換された文節だけをひらがなに戻す（Escキー）
+    ///
+    /// 文全体ではなく、一番最後の“変換された”文節をその読み（ひらがな）に
+    /// 差し替える。前半・後半は変換済みのまま保つ。戻す対象が無い
+    /// （全てひらがな）場合は `None`（呼び出し側は取消にフォールバック）。
+    fn revert_last_segment_to_kana(&mut self) -> Option<ConversionAction> {
+        if !self.enabled || self.hiragana_buffer.is_empty() {
+            return None;
+        }
+        let (candidates, seg_reading, seg_surfaces, prefix_s, prefix_r, suffix_s, suffix_r) =
+            self.build_candidates();
+        if candidates.is_empty() {
+            return None;
+        }
+        // 対象文節の「ひらがな読み」に一致する候補を選ぶ
+        let idx = seg_surfaces.iter().position(|s| *s == seg_reading)?;
+        self.candidates = candidates;
+        self.cand_seg_reading = seg_reading;
+        self.cand_seg_surfaces = seg_surfaces;
+        self.cand_prefix_surface = prefix_s;
+        self.cand_prefix_reading = prefix_r;
+        self.cand_suffix_surface = suffix_s;
+        self.cand_suffix_reading = suffix_r;
+        // select_candidate は変化が無ければ None を返す。
+        // = 対象文節が既にひらがな（戻すものが無い）ということ。
+        self.select_candidate(idx)
     }
 
     /// 候補一覧を組み立てる（直近＝最後の文節の同音語をコスト＋学習頻度順に）
@@ -850,7 +872,6 @@ impl LiveConversionState {
         self.conversion_result.clear();
         self.last_sent_length = 0;
         self.committed_segments.clear();
-        self.kana_mode = false;
         self.generation = self.generation.wrapping_add(1);
         self.clear_candidates();
 
@@ -870,7 +891,6 @@ impl LiveConversionState {
         self.conversion_result.clear();
         self.last_sent_length = 0;
         self.committed_segments.clear();
-        self.kana_mode = false;
         self.generation = self.generation.wrapping_add(1);
         self.clear_candidates();
 
@@ -1829,14 +1849,12 @@ pub extern "system" fn LowLevelKeyboardProc(
                     }
 
                     // Escape:
-                    //   1回目 → 漢字変換を解除してひらがな表示に戻す（かなモード）
-                    //   2回目（既にかなモード）→ 入力を取り消す
+                    //   直近（最後）に変換された文節だけをひらがなに戻す。
+                    //   戻す対象が無い（全てひらがな）ときは入力を取り消す。
                     if vk_code == VK_ESCAPE.0 as u32 && context.is_composing() {
-                        let action = if context.kana_mode {
-                            context.cancel()
-                        } else {
-                            context.kana_mode = true;
-                            context.update_conversion()
+                        let action = match context.revert_last_segment_to_kana() {
+                            Some(a) => Some(a),        // 直近の文節をかなに戻した
+                            None => context.cancel(),  // 戻すものが無い → 取消
                         };
                         drop(context);
                         if let Some(action) = action {
