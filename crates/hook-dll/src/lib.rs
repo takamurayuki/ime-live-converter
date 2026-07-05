@@ -245,6 +245,10 @@ struct LiveConversionState {
     committed_segments: Vec<(String, String, String)>,
     /// 直近に確定したテキスト（LLM変換へ渡す前後文脈。末尾数十文字を保持）
     recent_context: String,
+    /// Escで「かなに戻した」末尾の読み文字数。update_conversion は末尾の
+    /// この文字数分を変換せずひらがなのまま表示する。Escを押すたびに
+    /// 一つ前の文節分だけ増え、前の変換も順にひらがなへ戻す。
+    kana_tail_len: usize,
     /// 入力世代。入力・確定・取消のたびに増える。非同期のLLM結果が
     /// 発火時と同じ世代のときだけ適用し、古い結果が別の位置に誤って
     /// 差し込まれる（前の入力が壊れる）のを防ぐ。
@@ -274,6 +278,7 @@ impl LiveConversionState {
             cand_suffix_reading: String::new(),
             committed_segments: Vec::new(),
             recent_context: String::new(),
+            kana_tail_len: 0,
             generation: 0,
             learning: None,
             enabled: true,
@@ -350,6 +355,18 @@ impl LiveConversionState {
             out.push((self.cand_seg_reading.clone(), seg_surface, "名詞-一般".to_string()));
             for e in conv.convert(&self.cand_suffix_reading) {
                 out.push((e.reading.clone(), e.surface.clone(), e.pos.clone()));
+            }
+        } else if self.kana_tail_len > 0 {
+            // Escで戻した末尾はかなのまま（学習しない）、前半だけ変換して学習
+            let total = self.hiragana_buffer.chars().count();
+            let keep = total.saturating_sub(self.kana_tail_len);
+            let prefix: String = self.hiragana_buffer.chars().take(keep).collect();
+            for e in conv.convert(&prefix) {
+                out.push((e.reading.clone(), e.surface.clone(), e.pos.clone()));
+            }
+            let tail: String = self.hiragana_buffer.chars().skip(keep).collect();
+            if !tail.is_empty() {
+                out.push((tail.clone(), tail, "名詞-一般".to_string()));
             }
         } else {
             for e in conv.convert(&self.hiragana_buffer) {
@@ -447,6 +464,13 @@ impl LiveConversionState {
             return None;
         }
 
+        // Escでひらがなに戻した内容は「確定済み」として扱う。
+        // 新しい入力が来たらそこまでを確定し、戻したかなを再変換しない。
+        // （表示済みテキストはそのまま。内部状態だけ確定して新規入力を始める）
+        if self.kana_tail_len > 0 {
+            self.commit();
+        }
+
         // バッファが変わるので候補リストは無効化し、世代を進める
         self.clear_candidates();
         self.generation = self.generation.wrapping_add(1);
@@ -477,6 +501,7 @@ impl LiveConversionState {
 
         self.clear_candidates();
         self.generation = self.generation.wrapping_add(1);
+        self.kana_tail_len = 0;
 
         if !self.romaji_buffer.is_empty() {
             // 入力途中のローマ字は1文字ずつ削除
@@ -510,13 +535,23 @@ impl LiveConversionState {
         // ひらがなバッファのみを漢字変換
         // ローマ字バッファはそのまま末尾に追加
         let converted_hiragana = if let Some(converter) = &self.converter {
-            if !self.hiragana_buffer.is_empty() {
-                // 文脈（内容語の繋がり）を考慮して尤もらしい変換を選ぶ
-                let converted = converter.convert_context_aware_to_string(&self.hiragana_buffer);
-                debug_log!("漢字変換結果: '{}' → '{}'", self.hiragana_buffer, converted);
-                converted
-            } else {
+            if self.hiragana_buffer.is_empty() {
                 String::new()
+            } else if self.kana_tail_len > 0 {
+                // Escで戻した末尾はひらがなのまま、前半だけ変換する
+                let total = self.hiragana_buffer.chars().count();
+                let keep = total.saturating_sub(self.kana_tail_len);
+                let prefix: String = self.hiragana_buffer.chars().take(keep).collect();
+                let tail: String = self.hiragana_buffer.chars().skip(keep).collect();
+                let conv = if prefix.is_empty() {
+                    String::new()
+                } else {
+                    converter.convert_context_aware_to_string(&prefix)
+                };
+                format!("{}{}", conv, tail)
+            } else {
+                // 文脈（内容語の繋がり）を考慮して尤もらしい変換を選ぶ
+                converter.convert_context_aware_to_string(&self.hiragana_buffer)
             }
         } else {
             // 辞書がない場合はひらがなのまま
@@ -610,32 +645,38 @@ impl LiveConversionState {
         self.select_candidate(next)
     }
 
-    /// 直近（最後）に変換された文節だけをひらがなに戻す（Escキー）
+    /// Escで、まだ変換されている末尾の文節を一つ、ひらがなに戻す
     ///
-    /// 文全体ではなく、一番最後の“変換された”文節をその読み（ひらがな）に
-    /// 差し替える。前半・後半は変換済みのまま保つ。戻す対象が無い
-    /// （全てひらがな）場合は `None`（呼び出し側は取消にフォールバック）。
-    fn revert_last_segment_to_kana(&mut self) -> Option<ConversionAction> {
+    /// 呼ぶたびに末尾から一文節ずつ戻していく（累積）。戻す対象が
+    /// 残っていれば表示を更新するアクションを返し、全てひらがなに
+    /// 戻し終えていれば `None`（呼び出し側は取消にフォールバック）。
+    fn extend_kana_revert(&mut self) -> Option<ConversionAction> {
         if !self.enabled || self.hiragana_buffer.is_empty() {
             return None;
         }
-        let (candidates, seg_reading, seg_surfaces, prefix_s, prefix_r, suffix_s, suffix_r) =
-            self.build_candidates();
-        if candidates.is_empty() {
-            return None;
+        let total = self.hiragana_buffer.chars().count();
+        if self.kana_tail_len >= total {
+            return None; // すべてひらがなに戻し済み
         }
-        // 対象文節の「ひらがな読み」に一致する候補を選ぶ
-        let idx = seg_surfaces.iter().position(|s| *s == seg_reading)?;
-        self.candidates = candidates;
-        self.cand_seg_reading = seg_reading;
-        self.cand_seg_surfaces = seg_surfaces;
-        self.cand_prefix_surface = prefix_s;
-        self.cand_prefix_reading = prefix_r;
-        self.cand_suffix_surface = suffix_s;
-        self.cand_suffix_reading = suffix_r;
-        // select_candidate は変化が無ければ None を返す。
-        // = 対象文節が既にひらがな（戻すものが無い）ということ。
-        self.select_candidate(idx)
+        // まだ変換されている前半 = 先頭から (total - kana_tail_len) 文字
+        let keep = total - self.kana_tail_len;
+        let prefix: String = self.hiragana_buffer.chars().take(keep).collect();
+        let Some(converter) = self.converter.as_ref() else {
+            return None;
+        };
+        let entries = converter.convert(&prefix);
+        // 前半の「最後の変換された文節」以降を、ひらがな末尾に加える
+        let revert_len: usize = if let Some(idx) =
+            entries.iter().rposition(|e| e.surface != e.reading)
+        {
+            entries[idx..].iter().map(|e| e.reading.chars().count()).sum()
+        } else {
+            // 変換済み文節が無ければ残り全部をかなに
+            keep
+        };
+        self.kana_tail_len = (self.kana_tail_len + revert_len.max(1)).min(total);
+        self.clear_candidates();
+        self.update_conversion()
     }
 
     /// 候補一覧を組み立てる（直近＝最後の文節の同音語をコスト＋学習頻度順に）
@@ -673,21 +714,33 @@ impl LiveConversionState {
         // 対象は「最後の“変換された”文節」。表層==読み（＝ひらがなのまま）の
         // 文節は変換とみなさず飛ばす。主に 平仮名→漢字/カタカナ を拾うため。
         // 変換済みが1つも無ければ最後の文節を対象にする。
-        let idx = entries
+        let end = entries
             .iter()
             .rposition(|e| e.surface != e.reading)
             .unwrap_or(entries.len() - 1);
-        let seg_reading = entries[idx].reading.clone();
+        // 隣接する1文字漢字は分割された複合語のことが多いので、対象を
+        // 左へ広げて連続する1文字漢字の文節をまとめて変換対象にする
+        //（例: 変+換 が別文節でも「へんかん」全体を対象にする）。
+        let mut start = end;
+        while start > 0
+            && is_single_kanji_entry(&entries[start])
+            && is_single_kanji_entry(&entries[start - 1])
+        {
+            start -= 1;
+        }
+        // 対象span [start..=end] の結合読み
+        let seg_reading: String =
+            entries[start..=end].iter().map(|e| e.reading.as_str()).collect();
 
-        // 前半（対象文節より前）と後半（対象文節より後ろ＝末尾の平仮名など）
+        // 前半（対象より前）と後半（対象より後ろ＝末尾の平仮名など）
         let prefix_surface: String =
-            entries[..idx].iter().map(|e| e.surface.as_str()).collect();
+            entries[..start].iter().map(|e| e.surface.as_str()).collect();
         let prefix_reading: String =
-            entries[..idx].iter().map(|e| e.reading.as_str()).collect();
+            entries[..start].iter().map(|e| e.reading.as_str()).collect();
         let suffix_surface: String =
-            entries[idx + 1..].iter().map(|e| e.surface.as_str()).collect();
+            entries[end + 1..].iter().map(|e| e.surface.as_str()).collect();
         let suffix_reading: String =
-            entries[idx + 1..].iter().map(|e| e.reading.as_str()).collect();
+            entries[end + 1..].iter().map(|e| e.reading.as_str()).collect();
 
         // 対象文節の同音語を集め、「実際の使いやすさ」を近似したキーで並べる
         // 並び順: 学習頻度が高い順 → 実効コストが低い順
@@ -872,6 +925,7 @@ impl LiveConversionState {
         self.conversion_result.clear();
         self.last_sent_length = 0;
         self.committed_segments.clear();
+        self.kana_tail_len = 0;
         self.generation = self.generation.wrapping_add(1);
         self.clear_candidates();
 
@@ -891,6 +945,7 @@ impl LiveConversionState {
         self.conversion_result.clear();
         self.last_sent_length = 0;
         self.committed_segments.clear();
+        self.kana_tail_len = 0;
         self.generation = self.generation.wrapping_add(1);
         self.clear_candidates();
 
@@ -914,6 +969,17 @@ impl LiveConversionState {
 struct ConversionAction {
     delete_count: usize,
     insert_text: String,
+}
+
+/// 単語エントリが「1文字の漢字」か（隣接漢字の結合判定に使う）
+fn is_single_kanji_entry(e: &common::WordEntry) -> bool {
+    let mut chars = e.surface.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) => {
+            ('\u{4E00}'..='\u{9FFF}').contains(&c) || ('\u{3400}'..='\u{4DBF}').contains(&c)
+        }
+        _ => false,
+    }
 }
 
 /// 1文字の漢字表記に対するコストペナルティ
@@ -1849,11 +1915,11 @@ pub extern "system" fn LowLevelKeyboardProc(
                     }
 
                     // Escape:
-                    //   直近（最後）に変換された文節だけをひらがなに戻す。
-                    //   戻す対象が無い（全てひらがな）ときは入力を取り消す。
+                    //   末尾から一文節ずつひらがなに戻す（押すたびに前へ）。
+                    //   全て戻し終えていたら入力を取り消す。
                     if vk_code == VK_ESCAPE.0 as u32 && context.is_composing() {
-                        let action = match context.revert_last_segment_to_kana() {
-                            Some(a) => Some(a),        // 直近の文節をかなに戻した
+                        let action = match context.extend_kana_revert() {
+                            Some(a) => Some(a),        // 末尾の文節をかなに戻した
                             None => context.cancel(),  // 戻すものが無い → 取消
                         };
                         drop(context);
