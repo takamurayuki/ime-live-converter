@@ -1344,6 +1344,17 @@ fn is_learnable_pair(reading: &str, surface: &str) -> bool {
     if surface.chars().any(|c| c.is_ascii_alphanumeric()) {
         return false;
     }
+    let reading_len = reading.chars().count();
+    // 1文字の読み→別表記は曖昧すぎる断片（例: じ→時）。誤変換の
+    // 学習ループを招くので学習しない。
+    if reading_len == 1 && surface != reading {
+        return false;
+    }
+    // 短い読みを「その読みのカタカナ化」として学習しない（例: かん→カン）。
+    // これはカタカナ・フォールバックの断片で、誤変換を強化してしまう。
+    if reading_len <= 3 && surface == common::hiragana_to_katakana(reading) {
+        return false;
+    }
     true
 }
 
