@@ -326,6 +326,14 @@ impl ViterbiConverter {
         // 「カン」+助詞の分割に負けるため強めに優先する。
         self.learned_unigram
             .insert(("かんがえる".to_string(), "考える".to_string()), 4000);
+
+        // 既定でひらがな優先にする読み。漢字表記(慕い)が稀で、ひらがな
+        // (助動詞「〜したい」)の方が圧倒的に多い。ユーザーが Esc で戻さ
+        // なくても最初からひらがなで出るようにする。
+        //（「たい」等の短い読みは「対象」などを壊すため入れない）
+        self.learned_hiragana
+            .entry("したい".to_string())
+            .or_insert(COMMON_WORD_SEED_BONUS);
     }
 
     /// 学習データをすべてクリア（頻出語プリセットは残す）
@@ -551,13 +559,24 @@ impl ViterbiConverter {
                 );
             }
 
-            // カタカナ候補ノード（辞書未ヒット位置のみ生成）
-            // 「未知語の連続のみ」をカタカナ化するため、辞書ヒット位置からは span を作らない。
-            // この方針は辞書ヒット(例: は, きょう)が連続した助詞・名詞を保護する。
-            // 副作用: 「ねくすと」のように先頭ひらがな(ね)が助詞として辞書ヒットしている場合
-            // 「ネクスト」全体を一括カタカナ化できず「ねクスト」になる。
-            if self.enable_katakana_fallback && !has_dict_hit {
-                self.add_katakana_nodes(&mut lattice, &chars, &byte_positions, char_idx);
+            // カタカナ候補ノードを生成する。全ひらがなの範囲について
+            // カタカナ表記を候補として出し、最終的な採否は Viterbi のコストに
+            // 委ねる。開始位置が辞書ヒットの場合はペナルティを付け、通常語を
+            // 不当にカタカナ化しないようにする（例: きょうは→キョウハ は抑止、
+            // ぶらうざ→ブラウザ は許容。宇/座 等の高コスト漢字に勝つ）。
+            if self.enable_katakana_fallback {
+                let start_penalty = if has_dict_hit {
+                    self.katakana_dict_start_penalty
+                } else {
+                    0
+                };
+                self.add_katakana_nodes(
+                    &mut lattice,
+                    &chars,
+                    &byte_positions,
+                    char_idx,
+                    start_penalty,
+                );
             }
         }
 
@@ -602,36 +621,37 @@ impl ViterbiConverter {
         }
     }
 
-    /// カタカナ候補ノードをラティスに追加（未知語連続位置からの span のみ）
+    /// カタカナ候補ノードをラティスに追加する
     ///
-    /// 追加ルール:
-    /// - span の開始位置は辞書ヒットなし（呼び元で保証）
-    /// - span 内部（開始位置を除く、最終位置以外）に辞書ヒットがあれば
-    ///   それ以上 span を延長しない。
-    ///   例: 「らすと」(と は助詞)では「ラスト」3文字(と は末尾)は許可、
-    ///   「らすとを」4文字(と が中間)は不許可。
+    /// start_idx から始まる、全ひらがなの範囲（min_len..=max_len）について
+    /// カタカナ表記の候補ノードを足す。採否は Viterbi のコストが決める。
+    /// `start_penalty` は開始位置が辞書ヒットのとき通常語を守るための上乗せ。
     fn add_katakana_nodes(
         &self,
         lattice: &mut Lattice,
         chars: &[char],
         byte_positions: &[usize],
         start_idx: usize,
+        start_penalty: i32,
     ) {
         let max_len = self.katakana_max_len.min(chars.len() - start_idx);
         if max_len < self.katakana_min_len {
             return;
         }
 
+        // 途中に「安い辞書語」（助詞・常用語）が現れたら、それ以上カタカナを
+        // 伸ばさない（例: きょうは→今日は を守る）。逆に高コストの稀な漢字
+        // （宇・座 等）なら伸ばして良い（例: ぶらうざ→ブラウザ）。
+        // しきい値: 助詞(〜3900)は停止、内容漢字(5000〜)は継続。
+        const INTERIOR_STOP_MAX_COST: i16 = 4500;
         let mut stop_after_this_len = false;
         for len in self.katakana_min_len..=max_len {
             let end_idx = start_idx + len;
 
+            // 範囲が全てひらがな（長音符含む）でなければそれ以上伸ばせない
             if !is_all_hiragana(&chars[start_idx..end_idx]) {
                 break;
             }
-
-            // 前のループで「最後の位置が辞書ヒット」を観測していたら
-            // 今回の span はその位置を中間に含むことになるので打ち切り
             if stop_after_this_len {
                 break;
             }
@@ -641,7 +661,8 @@ impl ViterbiConverter {
             let reading: String = chars[start_idx..end_idx].iter().collect();
             let surface = hiragana_to_katakana(&reading);
 
-            let cost = self.katakana_base_cost + (len as i32) * self.katakana_step_cost;
+            let cost =
+                self.katakana_base_cost + (len as i32) * self.katakana_step_cost + start_penalty;
             let entry = WordEntry {
                 surface,
                 reading,
@@ -652,12 +673,21 @@ impl ViterbiConverter {
             };
             lattice.add_word(start_byte, end_byte, entry);
 
-            // この span の最後の位置(end_idx-1)が辞書ヒットなら、次の span は
-            // それを中間に持つため、これ以上は延長しない
+            // この span の最後の文字が「安い辞書語の開始」なら、次に伸ばすと
+            // その語を分断してしまうので停止する。
             let last_pos = end_idx - 1;
             let bp = byte_positions[last_pos];
-            if !self.dictionary.common_prefix_search(&lattice.input[bp..]).is_empty() {
-                stop_after_this_len = true;
+            let cheapest: Option<i16> = self
+                .dictionary
+                .common_prefix_search(&lattice.input[bp..])
+                .iter()
+                .flat_map(|(_, ws)| ws.iter())
+                .map(|e| e.cost)
+                .min();
+            if let Some(c) = cheapest {
+                if c <= INTERIOR_STOP_MAX_COST {
+                    stop_after_this_len = true;
+                }
             }
         }
     }
@@ -1395,6 +1425,7 @@ mod tests {
         dict.add_word(WordEntry { surface: "駅".into(), reading: "えき".into(), left_id: 1, right_id: 1, cost: 5000, pos: "名詞-一般".into() });
         dict.add_word(WordEntry { surface: "の".into(), reading: "の".into(), left_id: 2, right_id: 2, cost: 3000, pos: "助詞-連体化".into() });
         let mut converter = ViterbiConverter::new(dict);
+        converter.enable_katakana_fallback = false; // 連想の検証にカタカナ候補は不要
 
         // 学習: 新聞…記者 / 駅…汽車（助詞「の」を挟んだ内容語連想）
         converter.learn_assoc("新聞", "記者", 5);
@@ -1467,18 +1498,19 @@ mod tests {
                 dict.matrix.set(i, j, 200);
             }
         }
-        // 「したい」に漢字「慕い」だけ登録（安め）
+        // 「こい」に漢字「恋」だけ登録（プリセット外の読みを使う）
         dict.add_word(WordEntry {
-            surface: "慕い".into(), reading: "したい".into(),
+            surface: "恋".into(), reading: "こい".into(),
             left_id: 1, right_id: 1, cost: 4000, pos: "名詞-一般".into(),
         });
         let mut converter = ViterbiConverter::new(dict);
+        converter.enable_katakana_fallback = false; // カタカナ候補を除外して判定を明確に
         // 学習前は漢字
-        assert_eq!(converter.convert_to_string("したい"), "慕い");
+        assert_eq!(converter.convert_to_string("こい"), "恋");
         // ひらがな優先を学習
-        converter.learn_hiragana("したい", 1);
+        converter.learn_hiragana("こい", 1);
         // 学習後はひらがな
-        assert_eq!(converter.convert_to_string("したい"), "したい");
+        assert_eq!(converter.convert_to_string("こい"), "こい");
     }
 
     #[test]
