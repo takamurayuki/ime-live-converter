@@ -930,12 +930,15 @@ impl LiveConversionState {
             if !tail.is_empty() {
                 let freq = if let Some(learning) = self.learning.as_ref() {
                     let _ = learning.record_hiragana_pref(&tail);
+                    // その読みの漢字/カタカナ学習を忘れる（ひらがなを勝たせる）
+                    let _ = learning.forget_reading(&tail);
                     learning.find_hiragana_pref(&tail).unwrap_or(1)
                 } else {
                     0
                 };
                 if freq > 0 {
                     if let Some(conv) = self.converter.as_mut() {
+                        conv.forget_reading(&tail);
                         conv.learn_hiragana(&tail, freq);
                     }
                 }

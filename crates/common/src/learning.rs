@@ -391,6 +391,18 @@ impl LearningRepository {
         Ok(freq.unwrap_or(0))
     }
 
+    /// 指定した読みの変換履歴（ひらがな以外の表記）を削除する
+    ///
+    /// Esc でひらがなに戻したとき、その読みで学習済みの漢字/カタカナ表記の
+    /// 記録を消し、ひらがなが選ばれるようにする。
+    pub fn forget_reading(&self, reading: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM conversion_history WHERE reading = ?1 AND surface <> ?1",
+            params![reading],
+        )?;
+        Ok(())
+    }
+
     /// 全ひらがな優先（読み, 頻度）を取得（起動時の一括ロード用）
     pub fn all_hiragana_prefs(&self) -> Result<Vec<(String, u32)>> {
         let mut stmt = self

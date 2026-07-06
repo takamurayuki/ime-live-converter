@@ -347,9 +347,18 @@ impl ViterbiConverter {
 
     /// ひらがな優先（Escで戻した読み）を頻度から設定する
     pub fn learn_hiragana(&mut self, reading: &str, freq: u32) {
-        // ひらがなノードを既存語より確実に勝たせるため強めに効かせる
-        let bonus = (frequency_to_bonus(freq)).max(COMMON_WORD_SEED_BONUS);
+        // ひらがなノードを既存語より優先させるが、強すぎると周囲の分割を
+        // 乱すため中程度に抑える（Escで漢字学習は忘れるので過剰に強くしない）。
+        let bonus = frequency_to_bonus(freq).clamp(COMMON_WORD_SEED_BONUS, 3000);
         self.learned_hiragana.insert(reading.to_string(), bonus);
+    }
+
+    /// 指定した読みの「漢字/カタカナ変換」の学習を忘れる（メモリ側）
+    ///
+    /// Esc でひらがなに戻したとき、その読みで過去に学習した表記の
+    /// 優先を打ち消し、ひらがなが勝てるようにする。
+    pub fn forget_reading(&mut self, reading: &str) {
+        self.learned_unigram.retain(|(r, _), _| r != reading);
     }
 
     /// ユニグラム（読み→表記）の学習を頻度から設定する
@@ -529,9 +538,10 @@ impl ViterbiConverter {
                     for entry in entries.iter() {
                         lattice.add_word(byte_pos, end_pos, entry.clone());
                         let idx = lattice.nodes.len() - 1;
-                        // 1文字漢字の単独語 / カタカナ固有名詞には実効コストを上乗せ
+                        // 1文字漢字の単独語 / カタカナ固有名詞 / 記号には実効コストを上乗せ
                         let penalty = single_kanji_penalty(&entry.surface, self.single_kanji_penalty)
-                            + katakana_proper_noun_penalty(&entry.surface, &entry.pos);
+                            + katakana_proper_noun_penalty(&entry.surface, &entry.pos)
+                            + symbol_penalty(&entry.surface, &entry.pos);
                         // 学習したユニグラムはコストを減額（優先度を上げる）
                         let bonus = self
                             .learned_unigram
@@ -639,12 +649,23 @@ impl ViterbiConverter {
             return;
         }
 
-        // 途中に「安い辞書語」（助詞・常用語）が現れたら、それ以上カタカナを
-        // 伸ばさない（例: きょうは→今日は を守る）。逆に高コストの稀な漢字
-        // （宇・座 等）なら伸ばして良い（例: ぶらうざ→ブラウザ）。
-        // しきい値: 助詞(〜3900)は停止、内容漢字(5000〜)は継続。
+        // カタカナ範囲が内部に「安い辞書語」（助詞・常用語）の開始位置を
+        // 含むなら、その語を分断することになるので、その長さ以降は出さない。
+        // 例: 「だと」→ 内部(index1)の「と」が安い(＆/と)ので ダト を出さない。
+        // 逆に「ぶらうざ」→ 内部の ら/う/ざ は高コストの稀漢字なので ブラウザ
+        // を出してよい（きょうは→内部の は が安いので キョウハ は出さない）。
         const INTERIOR_STOP_MAX_COST: i16 = 4500;
-        let mut stop_after_this_len = false;
+        // lattice を可変借用する add_word と競合しないよう入力を控えておく
+        let input_owned = lattice.input.clone();
+        let cheapest_at = |char_pos: usize| -> Option<i16> {
+            let bp = byte_positions[char_pos];
+            self.dictionary
+                .common_prefix_search(&input_owned[bp..])
+                .iter()
+                .flat_map(|(_, ws)| ws.iter())
+                .map(|e| e.cost)
+                .min()
+        };
         for len in self.katakana_min_len..=max_len {
             let end_idx = start_idx + len;
 
@@ -652,7 +673,11 @@ impl ViterbiConverter {
             if !is_all_hiragana(&chars[start_idx..end_idx]) {
                 break;
             }
-            if stop_after_this_len {
+            // 内部（開始位置を除く）に安い辞書語があれば、この長さ以降は打ち切り
+            let has_cheap_interior = (start_idx + 1..end_idx).any(|p| {
+                cheapest_at(p).map_or(false, |c| c <= INTERIOR_STOP_MAX_COST)
+            });
+            if has_cheap_interior {
                 break;
             }
 
@@ -672,23 +697,6 @@ impl ViterbiConverter {
                 pos: "カタカナ".to_string(),
             };
             lattice.add_word(start_byte, end_byte, entry);
-
-            // この span の最後の文字が「安い辞書語の開始」なら、次に伸ばすと
-            // その語を分断してしまうので停止する。
-            let last_pos = end_idx - 1;
-            let bp = byte_positions[last_pos];
-            let cheapest: Option<i16> = self
-                .dictionary
-                .common_prefix_search(&lattice.input[bp..])
-                .iter()
-                .flat_map(|(_, ws)| ws.iter())
-                .map(|e| e.cost)
-                .min();
-            if let Some(c) = cheapest {
-                if c <= INTERIOR_STOP_MAX_COST {
-                    stop_after_this_len = true;
-                }
-            }
         }
     }
 
@@ -811,12 +819,13 @@ impl ViterbiConverter {
     }
 }
 
-/// カタカナ表記の固有名詞に対するコストペナルティ
+/// カタカナ表記の辞書エントリに対するコストペナルティ
 ///
-/// IPA辞書はカタカナの固有名詞（ホン・ヲ 等）を低コストで持っており、
-/// 「ほん」→「ホン」のように一般語（本）を押しのけてしまう。カタカナは
-/// 未知語のフォールバックで別途生成されるので、辞書のカタカナ固有名詞は
-/// 実効コストを上げて一般語を優先させる。
+/// IPA辞書はカタカナ表記（ネコ・イヌ・ヤマ・ホン・ヲ 等）を低コストで
+/// 持っており、「ねこ」→「ネコ」のように一般漢字語（猫）を押しのけてしまう。
+/// 本来必要なカタカナ（外来語）は未知語のフォールバックで別途生成される
+/// ので、辞書のカタカナ表記は実効コストを上げて漢字/かなを優先させる。
+/// フォールバックで生成したカタカナ(pos=カタカナ)は対象外。
 fn katakana_proper_noun_penalty(surface: &str, pos: &str) -> i32 {
     if !pos.contains("固有名詞") {
         return 0;
@@ -827,6 +836,27 @@ fn katakana_proper_noun_penalty(surface: &str, pos: &str) -> i32 {
         });
     if all_katakana {
         3000
+    } else {
+        0
+    }
+}
+
+/// 記号（＆＠ 等）表記へのコストペナルティ
+///
+/// IPA辞書は「と」→「＆」のように、かな読みに ASCII/全角記号を低コストで
+/// 割り当てていることがある。かなを記号へ変換するのはほぼ誤りなので、
+/// 記号品詞かつ ASCII/全角英数記号の表記に強いペナルティを付ける。
+/// 句読点（、。「」等）は CJK 記号域なので対象外。
+fn symbol_penalty(surface: &str, pos: &str) -> i32 {
+    if !pos.starts_with("記号") {
+        return 0;
+    }
+    let is_ascii_symbol = !surface.is_empty()
+        && surface.chars().all(|c| {
+            ('\u{0021}'..='\u{007E}').contains(&c) || ('\u{FF01}'..='\u{FF5E}').contains(&c)
+        });
+    if is_ascii_symbol {
+        5000
     } else {
         0
     }
