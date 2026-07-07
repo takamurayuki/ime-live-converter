@@ -1040,12 +1040,45 @@ fn single_kanji_penalty(surface: &str) -> i32 {
 // ============ 候補一覧ウィンドウ ============
 
 /// 候補一覧ウィンドウの WndProc
+/// 最前面維持タイマーのID
+const TOPMOST_TIMER_ID: usize = 1;
+
 extern "system" fn candidate_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if msg == WM_PAINT {
-        unsafe { paint_candidates(hwnd) };
-        return LRESULT(0);
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SetWindowPos, WINDOWPOS, WM_TIMER, WM_WINDOWPOSCHANGING, SWP_NOACTIVATE, SWP_NOMOVE,
+        SWP_NOSIZE, SWP_NOZORDER,
+    };
+    match msg {
+        WM_PAINT => {
+            unsafe { paint_candidates(hwnd) };
+            LRESULT(0)
+        }
+        // Z順が変更されるたびに「最前面(HWND_TOPMOST)」を強制し、他ウィンドウに
+        // 前面を奪われないようにする（環境によって背面に回るのを防ぐ）。
+        WM_WINDOWPOSCHANGING => {
+            unsafe {
+                let wp = lparam.0 as *mut WINDOWPOS;
+                if !wp.is_null() {
+                    (*wp).hwndInsertAfter = HWND_TOPMOST;
+                    (*wp).flags &= !SWP_NOZORDER;
+                }
+            }
+            LRESULT(0)
+        }
+        // 表示中は定期的に最前面へ再指定（他アプリが後から前面化しても復帰）
+        WM_TIMER => {
+            unsafe {
+                let _ = SetWindowPos(
+                    hwnd,
+                    HWND_TOPMOST,
+                    0, 0, 0, 0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
+            LRESULT(0)
+        }
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
-    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
 /// 候補一覧を描画
@@ -1294,6 +1327,14 @@ fn place_popup(max_len_chars: usize, line_count: i32) {
             0, 0, 0, 0,
             SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
         );
+        // 表示中は定期的に最前面へ戻すタイマーを起動（他アプリに前面を
+        // 奪われても復帰させる。環境依存の背面化対策）
+        let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(
+            hwnd,
+            TOPMOST_TIMER_ID,
+            200,
+            None,
+        );
         let _ = InvalidateRect(hwnd, None, true);
     }
 }
@@ -1312,6 +1353,7 @@ fn hide_candidate_window() {
         };
         if was_visible {
             if let Some(hwnd) = CANDIDATE_HWND {
+                let _ = windows::Win32::UI::WindowsAndMessaging::KillTimer(hwnd, TOPMOST_TIMER_ID);
                 let _ = ShowWindow(hwnd, SW_HIDE);
             }
         }
