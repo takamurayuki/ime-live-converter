@@ -85,6 +85,19 @@ def main() -> int:
                 if not dry:
                     con.execute(f"DELETE FROM {tbl} WHERE {a}=? AND {b}=?", (x, y))
 
+    # ひらがな優先(Escで戻した読み)の断片汚染: 1文字の読み(て・い 等)は
+    # 語頭を未変換にして「ていけい→てい系」のように壊すので削除する。
+    try:
+        for (reading,) in con.execute(
+            "SELECT reading FROM hiragana_pref WHERE length(reading)=1"
+        ).fetchall():
+            print(f"  [hiragana_pref] {reading}")
+            removed += 1
+            if not dry:
+                con.execute("DELETE FROM hiragana_pref WHERE reading=?", (reading,))
+    except sqlite3.OperationalError:
+        pass  # 旧DBには hiragana_pref が無い
+
     if not dry:
         con.commit()
     print(f"\n{'検出' if dry else '削除'}: {removed} 件  ({db_path})")

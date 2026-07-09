@@ -255,6 +255,9 @@ const COMMON_WORD_SEED: &[(&str, &str)] = &[
 /// 頻出語プリセットのボーナス（moderate。実学習で上書きされる）
 const COMMON_WORD_SEED_BONUS: i32 = 1500;
 
+/// バイグラム学習ボーナスの上限（接続コスト規模に合わせ、断片パスの暴走を防ぐ）
+const BIGRAM_BONUS_CAP: i32 = 2500;
+
 
 /// 使用頻度をコスト減額（ボーナス）に変換する
 ///
@@ -374,8 +377,13 @@ impl ViterbiConverter {
 
     /// バイグラム（前の表記→次の表記）の学習を頻度から設定する
     pub fn learn_bigram(&mut self, prev_surface: &str, surface: &str, freq: u32) {
+        // バイグラムは接続コスト（通常 0〜8000 程度）の減額に使う。単語コスト
+        // 用の frequency_to_bonus は最大 20000 と大きすぎ、「て→い」等の高頻度
+        // 活用バイグラムが接続を大きくマイナスにして断片パス（てい系 等）を
+        // 生む。接続コストの規模に収まる上限に抑える。
+        let bonus = frequency_to_bonus(freq).min(BIGRAM_BONUS_CAP);
         self.learned_bigram
-            .insert((prev_surface.to_string(), surface.to_string()), frequency_to_bonus(freq));
+            .insert((prev_surface.to_string(), surface.to_string()), bonus);
     }
 
     /// 内容語連想（前の内容語→次の内容語）の学習を頻度から設定する

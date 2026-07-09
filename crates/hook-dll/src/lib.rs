@@ -927,7 +927,9 @@ impl LiveConversionState {
             let total = self.hiragana_buffer.chars().count();
             let keep = total.saturating_sub(self.kana_tail_len);
             let tail: String = self.hiragana_buffer.chars().skip(keep).collect();
-            if !tail.is_empty() {
+            // 1文字（て・い 等の断片）は学習しない。単一かなをひらがな優先に
+            // すると「ていけい→てい系」のように語頭が未変換になって壊れる。
+            if tail.chars().count() >= 2 {
                 let freq = if let Some(learning) = self.learning.as_ref() {
                     let _ = learning.record_hiragana_pref(&tail);
                     // その読みの漢字/カタカナ学習を忘れる（ひらがなを勝たせる）
