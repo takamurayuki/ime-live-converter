@@ -391,6 +391,53 @@ impl LearningRepository {
         Ok(freq.unwrap_or(0))
     }
 
+    // ============ 予測変換 ============
+
+    /// 前方一致予測: 読みが prefix で始まる確定履歴を頻度順に返す
+    ///
+    /// 「かい」→ 会議/会社/開発 のように、打った読みで始まる過去に確定した
+    /// 語を候補にする。prefix と完全一致する語（＝補完にならない）と、
+    /// ひらがなそのままの語は除く。
+    pub fn predict_by_prefix(&self, prefix: &str, limit: usize) -> Result<Vec<(String, String, u32)>> {
+        if prefix.is_empty() {
+            return Ok(Vec::new());
+        }
+        // LIKE のワイルドカードをエスケープ
+        let escaped = prefix.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        let pattern = format!("{}%", escaped);
+        let mut stmt = self.conn.prepare(
+            "SELECT reading, surface, MAX(frequency) as f FROM conversion_history
+             WHERE reading LIKE ?1 ESCAPE '\\' AND reading <> ?2 AND surface <> reading
+             GROUP BY surface
+             ORDER BY f DESC, length(reading) ASC
+             LIMIT ?3",
+        )?;
+        let rows = stmt
+            .query_map(params![pattern, prefix, limit as i64], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, u32>(2)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// 次単語予測: prev_surface の直後に確定された表記を頻度順に返す
+    pub fn predict_next(&self, prev_surface: &str, limit: usize) -> Result<Vec<(String, u32)>> {
+        if prev_surface.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT surface, frequency FROM word_bigram
+             WHERE prev_surface = ?1
+             ORDER BY frequency DESC LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![prev_surface, limit as i64], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, u32>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// 指定した読みの変換履歴（ひらがな以外の表記）を削除する
     ///
     /// Esc でひらがなに戻したとき、その読みで学習済みの漢字/カタカナ表記の
@@ -529,6 +576,32 @@ mod tests {
         assert_eq!(history.len(), 1); // ユニークなエントリは1つ
         assert_eq!(history[0].frequency, 3); // 頻度は3
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_predict_by_prefix() -> Result<()> {
+        let repo = LearningRepository::in_memory()?;
+        for _ in 0..3 { repo.record_commit("かいぎ", "会議", None)?; }
+        for _ in 0..5 { repo.record_commit("かいしゃ", "会社", None)?; }
+        repo.record_commit("かいはつ", "開発", None)?;
+        // 「かい」で前方一致 → 頻度順（会社5 > 会議3 > 開発1）
+        let r = repo.predict_by_prefix("かい", 10)?;
+        let surfaces: Vec<&str> = r.iter().map(|(_, s, _)| s.as_str()).collect();
+        assert_eq!(surfaces, vec!["会社", "会議", "開発"]);
+        // 完全一致（補完にならない）は除外
+        let r2 = repo.predict_by_prefix("かいぎ", 10)?;
+        assert!(r2.iter().all(|(rd, _, _)| rd != "かいぎ"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_predict_next() -> Result<()> {
+        let repo = LearningRepository::in_memory()?;
+        for _ in 0..4 { repo.record_bigram("会議", "資料")?; }
+        repo.record_bigram("会議", "室")?;
+        let r = repo.predict_next("会議", 10)?;
+        assert_eq!(r.first().map(|(s, _)| s.as_str()), Some("資料")); // 頻度順で先頭
         Ok(())
     }
 

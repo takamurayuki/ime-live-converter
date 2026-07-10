@@ -245,6 +245,11 @@ struct LiveConversionState {
     committed_segments: Vec<(String, String, String)>,
     /// 直近に確定したテキスト（LLM変換へ渡す前後文脈。末尾数十文字を保持）
     recent_context: String,
+    /// 予測変換の候補（読み, 表記）。読みが空なら「次単語予測（追記）」。
+    /// 打鍵中は前方一致補完、確定直後は次単語予測を入れる。番号キーで選ぶ。
+    predictions: Vec<(String, String)>,
+    /// 直近に確定した表記（次単語予測・バイグラム記録に使う）
+    last_committed: String,
     /// Escで「かなに戻した」末尾の読み文字数。update_conversion は末尾の
     /// この文字数分を変換せずひらがなのまま表示する。Escを押すたびに
     /// 一つ前の文節分だけ増え、前の変換も順にひらがなへ戻す。
@@ -278,6 +283,8 @@ impl LiveConversionState {
             cand_suffix_reading: String::new(),
             committed_segments: Vec::new(),
             recent_context: String::new(),
+            predictions: Vec::new(),
+            last_committed: String::new(),
             kana_tail_len: 0,
             generation: 0,
             learning: None,
@@ -321,6 +328,104 @@ impl LiveConversionState {
             conv.learned_bigram.len(),
             conv.learned_assoc.len()
         );
+    }
+
+    /// 予測変換の候補を更新する
+    ///
+    /// - 打鍵中（hiragana_buffer あり）: 読みが前方一致する確定履歴を補完候補に
+    /// - 確定直後（buffer 空・last_committed あり）: 次単語をバイグラムから予測
+    fn update_predictions(&mut self) {
+        self.predictions.clear();
+        let Some(learning) = self.learning.as_ref() else {
+            return;
+        };
+        if !self.hiragana_buffer.is_empty() {
+            if let Ok(list) = learning.predict_by_prefix(&self.hiragana_buffer, 6) {
+                for (reading, surface, _f) in list {
+                    self.predictions.push((reading, surface));
+                }
+            }
+        } else if !self.last_committed.is_empty() {
+            if let Ok(list) = learning.predict_next(&self.last_committed, 6) {
+                for (surface, _f) in list {
+                    // 1文字ひらがなの断片（さ・し 等）は予測から除く
+                    let frag = surface.chars().count() == 1
+                        && surface.chars().all(|c| ('\u{3041}'..='\u{3096}').contains(&c));
+                    if !frag {
+                        self.predictions.push((String::new(), surface));
+                    }
+                }
+            }
+        }
+    }
+
+    /// 予測候補を選んで確定する（番号キー）
+    ///
+    /// 前方一致補完: 現在の表示を予測語の表記に置き換えて確定。
+    /// 次単語予測(読み空): 現在の表示の後ろに追記して確定。
+    fn commit_prediction(&mut self, index: usize) -> Option<ConversionAction> {
+        if !self.enabled || index >= self.predictions.len() {
+            return None;
+        }
+        let (reading, surface) = self.predictions[index].clone();
+        // 前方一致は現在表示を置換、次単語は追記
+        let delete_count = if reading.is_empty() {
+            0
+        } else {
+            self.conversion_result.chars().count()
+        };
+        let action = ConversionAction {
+            delete_count,
+            insert_text: surface.clone(),
+        };
+
+        // 学習（確定として記録）
+        if let Some(learning) = self.learning.as_ref() {
+            if !reading.is_empty() && is_learnable_pair(&reading, &surface) {
+                let _ = learning.record_commit(&reading, &surface, None);
+                let freq = learning.find_frequency(&reading, &surface).unwrap_or(1);
+                if let Some(conv) = self.converter.as_mut() {
+                    conv.learn_unigram(&reading, &surface, freq);
+                }
+            }
+            if !self.last_committed.is_empty() {
+                let _ = learning.record_bigram(&self.last_committed, &surface);
+                let freq = learning
+                    .find_bigram_frequency(&self.last_committed, &surface)
+                    .unwrap_or(1);
+                if let Some(conv) = self.converter.as_mut() {
+                    conv.learn_bigram(&self.last_committed, &surface, freq);
+                }
+            }
+        }
+
+        // 文脈・状態を更新して確定扱いにする
+        self.recent_context.push_str(&surface);
+        let chars: Vec<char> = self.recent_context.chars().collect();
+        if chars.len() > 60 {
+            self.recent_context = chars[chars.len() - 60..].iter().collect();
+        }
+        self.last_committed = surface;
+        self.romaji_buffer.clear();
+        self.hiragana_buffer.clear();
+        self.conversion_result.clear();
+        self.last_sent_length = 0;
+        self.committed_segments.clear();
+        self.kana_tail_len = 0;
+        self.generation = self.generation.wrapping_add(1);
+        self.clear_candidates();
+        // 確定後は次単語予測を用意
+        self.update_predictions();
+        Some(action)
+    }
+
+    /// 予測候補の表示用文字列（番号付き）
+    fn prediction_display(&self) -> Vec<String> {
+        self.predictions
+            .iter()
+            .enumerate()
+            .map(|(i, (_, s))| format!("{}:{}", i + 1, s))
+            .collect()
     }
 
     /// 候補一覧の状態をすべてクリア
@@ -956,6 +1061,10 @@ impl LiveConversionState {
                 self.recent_context = chars[chars.len() - 60..].iter().collect();
             }
         }
+        // 次単語予測のため、最後の文節の表記を覚える
+        if let Some((_, s, _)) = segments.last() {
+            self.last_committed = s.clone();
+        }
 
         // バッファをクリア（表示済みテキストはそのまま確定扱い）
         self.romaji_buffer.clear();
@@ -966,6 +1075,8 @@ impl LiveConversionState {
         self.kana_tail_len = 0;
         self.generation = self.generation.wrapping_add(1);
         self.clear_candidates();
+        // 確定直後は次単語予測を用意する
+        self.update_predictions();
 
         action
     }
@@ -1273,6 +1384,16 @@ fn show_candidate_window(items: &[String], selected: usize) {
     }
     let max_len = items.iter().map(|s| s.chars().count()).max().unwrap_or(1);
     place_popup(max_len, items.len() as i32);
+}
+
+/// 予測変換の候補をカーソル付近に表示する（番号キーで選択）
+fn show_prediction_popup(items: &[String]) {
+    if items.is_empty() {
+        hide_candidate_window();
+        return;
+    }
+    // 予測はどれも「選択中」ではないので usize::MAX でハイライトなし
+    show_candidate_window(items, usize::MAX);
 }
 
 /// LLM変換中のステータスをカーソル付近に表示する（変換エフェクト）
@@ -1875,6 +1996,29 @@ pub extern "system" fn LowLevelKeyboardProc(
                         }
                     }
 
+                    // 数字キー 1-9: 予測変換の表示中（同音候補一覧は出ていない）は
+                    // 番号で予測語を確定する（前方一致補完・次単語予測）。
+                    if (0x31..=0x39).contains(&vk_code)
+                        && !is_shift_pressed()
+                        && candidate_window_visible()
+                        && context.candidates.is_empty()
+                        && !context.predictions.is_empty()
+                    {
+                        let index = (vk_code - 0x31) as usize;
+                        if index < context.predictions.len() {
+                            let action = context.commit_prediction(index);
+                            // 確定後の次単語予測を用意（commit_prediction 内で更新済み）
+                            let preds = context.prediction_display();
+                            drop(context);
+                            hide_candidate_window();
+                            if let Some(action) = action {
+                                execute_action(action);
+                            }
+                            show_prediction_popup(&preds);
+                            return LRESULT(1);
+                        }
+                    }
+
                     // Shift+英字 = その1文字だけ英大文字を直接入力（かな変換しない）。
                     //   頭字語(API)や「PCで」のような直後のかな入力が予測どおり動く。
                     //   小文字始まりの英単語を続けたい場合は 半角/全角 で英数モードへ。
@@ -1914,23 +2058,29 @@ pub extern "system" fn LowLevelKeyboardProc(
                                 actions.push(action);
                             }
                         }
+                        // 予測変換を更新して表示（番号キーで選べる）
+                        context.update_predictions();
+                        let preds = context.prediction_display();
                         // ロックを解放してからアクションを実行
                         drop(context);
-                        hide_candidate_window();
                         for action in actions {
                             execute_action(action);
                         }
+                        show_prediction_popup(&preds);
                         // 元のキー入力を抑制
                         return LRESULT(1);
                     }
 
                     // バックスペース
                     if vk_code == VK_BACK.0 as u32 && context.is_composing() {
-                        if let Some(action) = context.backspace() {
-                            drop(context);
+                        let action = context.backspace();
+                        context.update_predictions();
+                        let preds = context.prediction_display();
+                        drop(context);
+                        if let Some(action) = action {
                             execute_action(action);
                         }
-                        hide_candidate_window();
+                        show_prediction_popup(&preds);
                         return LRESULT(1);
                     }
 
@@ -1997,11 +2147,14 @@ pub extern "system" fn LowLevelKeyboardProc(
 
                     // Enter: 確定のみ（IME標準動作: 変換中のEnterは改行しない）
                     if vk_code == VK_RETURN.0 as u32 && context.is_composing() {
-                        if let Some(action) = context.commit() {
-                            drop(context);
+                        // 確定後は次単語予測を表示（commit 内で更新済み）
+                        let action = context.commit();
+                        let preds = context.prediction_display();
+                        drop(context);
+                        if let Some(action) = action {
                             execute_action(action);
                         }
-                        hide_candidate_window();
+                        show_prediction_popup(&preds);
                         return LRESULT(1);
                     }
 
