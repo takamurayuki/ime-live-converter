@@ -524,21 +524,17 @@ impl LiveConversionState {
         let Some(learning) = self.learning.as_ref() else {
             return;
         };
-        if !self.hiragana_buffer.is_empty() {
-            if let Ok(list) = learning.predict_by_prefix(&self.hiragana_buffer, 6) {
-                for (reading, surface, _f) in list {
+        // 前方一致補完のみ。次単語予測（bigram）は無関係な語が出やすくノイズに
+        // なるため使わない。2文字以上打ってから、頻度2以上・打った読みより長い
+        // （＝実際に補完になる）履歴だけを候補にして、無関係な予測を抑える。
+        let prefix_len = self.hiragana_buffer.chars().count();
+        if prefix_len < 2 {
+            return;
+        }
+        if let Ok(list) = learning.predict_by_prefix(&self.hiragana_buffer, 5) {
+            for (reading, surface, freq) in list {
+                if freq >= 2 && reading.chars().count() > prefix_len {
                     self.predictions.push((reading, surface));
-                }
-            }
-        } else if !self.last_committed.is_empty() {
-            if let Ok(list) = learning.predict_next(&self.last_committed, 6) {
-                for (surface, _f) in list {
-                    // 1文字ひらがなの断片（さ・し 等）は予測から除く
-                    let frag = surface.chars().count() == 1
-                        && surface.chars().all(|c| ('\u{3041}'..='\u{3096}').contains(&c));
-                    if !frag {
-                        self.predictions.push((String::new(), surface));
-                    }
                 }
             }
         }
@@ -1566,14 +1562,14 @@ fn show_candidate_window(items: &[String], selected: usize) {
     place_popup(max_len, items.len() as i32);
 }
 
-/// 予測変換の候補をカーソル付近に表示する（番号キーで選択）
+/// 予測変換の候補をカーソル付近に表示する（Tabで先頭確定・番号で選択）
 fn show_prediction_popup(items: &[String]) {
     if items.is_empty() {
         hide_candidate_window();
         return;
     }
-    // 予測はどれも「選択中」ではないので usize::MAX でハイライトなし
-    show_candidate_window(items, usize::MAX);
+    // 先頭をハイライトして「Tabでこれを確定できる」ことを示す
+    show_candidate_window(items, 0);
 }
 
 /// LLM変換中のステータスをカーソル付近に表示する（変換エフェクト）
@@ -2304,6 +2300,27 @@ pub extern "system" fn LowLevelKeyboardProc(
                     let is_next_key = vk_code == VK_TAB.0 as u32
                         || vk_code == VK_DOWN.0 as u32;
                     let is_prev_key = vk_code == VK_UP.0 as u32;
+
+                    // Tab: 予測変換が表示中（同音候補一覧は未表示）なら、先頭の
+                    // 予測を確定する（番号を押さずに補完できる＝快適）。Shift無し。
+                    if vk_code == VK_TAB.0 as u32
+                        && !is_shift_pressed()
+                        && context.is_composing()
+                        && candidate_window_visible()
+                        && context.candidates.is_empty()
+                        && !context.predictions.is_empty()
+                    {
+                        let action = context.commit_prediction(0);
+                        let preds = context.prediction_display();
+                        drop(context);
+                        hide_candidate_window();
+                        if let Some(action) = action {
+                            execute_action(action);
+                        }
+                        show_prediction_popup(&preds);
+                        return LRESULT(1);
+                    }
+
                     if (is_next_key || is_prev_key) && context.is_composing() {
                         let backwards = is_prev_key || is_shift_pressed();
                         let action = context.cycle_candidate(backwards);
