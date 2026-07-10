@@ -1,32 +1,31 @@
-<#
-    ログオン時に IME Live Converter を「非表示・常駐」で自動起動する
-    スケジュールタスクを登録する。
-
-    ポイント:
-      - キーボードフックはユーザーセッションで動く必要があるため、Windows
-        サービス(セッション0)ではなく「ログオン時タスク」で常駐させる。
-      - 最上位の権限(Highest)で実行し、管理者権限で動くアプリ上でも
-        変換が効くようにする（UACプロンプトは出ない）。
-      - 実体は run-hidden.vbs 経由で起動し、黒いコンソールを出さない。
-
-    使い方（管理者権限の PowerShell で）:
-        powershell -ExecutionPolicy Bypass -File scripts\install-autostart.ps1
-
-    解除:
-        powershell -ExecutionPolicy Bypass -File scripts\uninstall-autostart.ps1
-#>
+# Register a logon scheduled task that starts the IME hidden and resident.
+#
+# Notes:
+#   - The keyboard hook must run in the user session, so we use a logon task
+#     (not a Windows service in session 0).
+#   - Runs with Highest privileges so conversion works over elevated apps too
+#     (no UAC prompt).
+#   - Launched via run-hidden.vbs so no console window appears.
+#
+# Usage (run in an ELEVATED PowerShell):
+#     powershell -ExecutionPolicy Bypass -File scripts\install-autostart.ps1
+#
+# Uninstall:
+#     powershell -ExecutionPolicy Bypass -File scripts\uninstall-autostart.ps1
+#
+# NOTE: ASCII-only so Windows PowerShell 5.1 parses it regardless of code page.
 $ErrorActionPreference = "Stop"
 
 $taskName = "IMELiveConverter"
-$root = Split-Path -Parent $PSScriptRoot          # プロジェクトルート
+$root = Split-Path -Parent $PSScriptRoot
 $vbs  = Join-Path $PSScriptRoot "run-hidden.vbs"
 $exe  = Join-Path $root "target\release\conversion-service.exe"
 
 if (-not (Test-Path $exe)) {
-    throw "先に 'cargo build --release' でビルドしてください: $exe"
+    throw "Build first: cargo build --release ($exe not found)"
 }
 if (-not (Test-Path $vbs)) {
-    throw "ランチャが見つかりません: $vbs"
+    throw "Launcher not found: $vbs"
 }
 
 $action = New-ScheduledTaskAction -Execute "wscript.exe" `
@@ -41,6 +40,6 @@ $settings = New-ScheduledTaskSettingsSet `
 Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
     -Principal $principal -Settings $settings -Force | Out-Null
 
-Write-Host "登録しました: タスク '$taskName'（次回ログオンから自動起動）。"
-Write-Host "今すぐ開始する:  Start-ScheduledTask -TaskName $taskName"
-Write-Host "状態を確認する:  Get-ScheduledTask -TaskName $taskName"
+Write-Host "Registered task '$taskName' (auto-starts at next logon)."
+Write-Host "Start now:     Start-ScheduledTask -TaskName $taskName"
+Write-Host "Check status:  Get-ScheduledTask -TaskName $taskName"
