@@ -56,6 +56,40 @@ static mut LLM_FIRED: bool = false;
 /// 値は (x, キャレット上端y, キャレット下端y)（画面座標）。
 static UIA_ANCHOR: Mutex<Option<(i32, i32, i32)>> = Mutex::new(None);
 
+/// デバッグログ有効判定（IME_DEBUG_LOG=1 のときのみ）
+///
+/// このログはシステム全体のキー入力を平文でファイルに残すため
+/// （パスワード入力も含まれ得る）、既定では完全に無効。
+/// 調査時のみ `IME_DEBUG_LOG=1` で起動して有効化すること。
+fn debug_log_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("IME_DEBUG_LOG").map(|v| v == "1").unwrap_or(false)
+    })
+}
+
+// デバッグログ（UTF-8 BOM付きで出力、IME_DEBUG_LOG=1 のときのみ）
+#[allow(unused_macros)]
+macro_rules! debug_log {
+    ($($arg:tt)*) => {
+        if crate::debug_log_enabled() {
+            use std::io::Write;
+            let path = "C:\\Projects\\ime-live-converter\\hook_debug.log";
+            let needs_bom = !std::path::Path::new(path).exists();
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                if needs_bom {
+                    let _ = file.write_all(&[0xEF, 0xBB, 0xBF]);
+                }
+                let _ = writeln!(file, "[IME] {}", format!($($arg)*));
+            }
+        }
+    };
+}
+
 /// UI Automation でフォーカス入力欄の位置を定期取得するスレッドを開始
 ///
 /// クロスプロセスの同期 COM 呼び出しはブロックしうるため、フック
@@ -106,19 +140,30 @@ unsafe fn console_caret_screen_pos(hwnd_fg: HWND) -> Option<(i32, i32, i32)> {
     if hwnd_fg.0.is_null() {
         return None;
     }
-    // 既に自分のコンソールがある（対話モード）ならアタッチできないのでスキップ
-    if !GetConsoleWindow().0.is_null() {
-        return None;
-    }
     // フォアグラウンドがクラシックコンソール窓か（クラス名で判定）
     let mut cls = [0u16; 64];
     let n = GetClassNameW(hwnd_fg, &mut cls);
-    if n <= 0 || String::from_utf16_lossy(&cls[..n as usize]) != "ConsoleWindowClass" {
+    let class = if n > 0 {
+        String::from_utf16_lossy(&cls[..n as usize])
+    } else {
+        String::new()
+    };
+    if class != "ConsoleWindowClass" {
+        return None; // コンソール窓でない（ログは出さない：他アプリで頻発するため）
+    }
+    debug_log!("console: 窓検出 class='{}'", class);
+    // 既に自分のコンソールがある（対話モード）ならアタッチできないのでスキップ
+    if !GetConsoleWindow().0.is_null() {
+        debug_log!("console: 自プロセスにコンソールあり→スキップ（--background で起動してください）");
         return None;
     }
     let mut pid = 0u32;
     GetWindowThreadProcessId(hwnd_fg, Some(&mut pid));
-    if pid == 0 || AttachConsole(pid).is_err() {
+    if pid == 0 {
+        return None;
+    }
+    if AttachConsole(pid).is_err() {
+        debug_log!("console: AttachConsole 失敗 pid={}", pid);
         return None;
     }
     let result = (|| {
@@ -129,6 +174,7 @@ unsafe fn console_caret_screen_pos(hwnd_fg: HWND) -> Option<(i32, i32, i32)> {
         let mut font = CONSOLE_FONT_INFO::default();
         let ok2 = GetCurrentConsoleFont(conout, false, &mut font).is_ok();
         if !ok1 || !ok2 || font.dwFontSize.X <= 0 || font.dwFontSize.Y <= 0 {
+            debug_log!("console: 情報取得失敗 sbi={} font={} size={}x{}", ok1, ok2, font.dwFontSize.X, font.dwFontSize.Y);
             return None;
         }
         let cw = font.dwFontSize.X as i32;
@@ -138,9 +184,13 @@ unsafe fn console_caret_screen_pos(hwnd_fg: HWND) -> Option<(i32, i32, i32)> {
         let row = (csbi.dwCursorPosition.Y - csbi.srWindow.Top) as i32;
         // コンソール窓クライアント原点（画面座標）
         let mut origin = POINT { x: 0, y: 0 };
-        let _ = ClientToScreen(GetConsoleWindow(), &mut origin);
+        let _ = ClientToScreen(hwnd_fg, &mut origin);
         let x = origin.x + col * cw;
         let top = origin.y + row * ch;
+        debug_log!(
+            "console: cursor cell=({},{}) font={}x{} origin=({},{}) -> ({},{},{})",
+            col, row, cw, ch, origin.x, origin.y, x, top, top + ch
+        );
         Some((x, top, top + ch))
     })();
     let _ = FreeConsole();
@@ -264,38 +314,6 @@ const CANDIDATE_LINE_HEIGHT: i32 = 24;
 
 /// デバッグログが有効か（環境変数 IME_DEBUG_LOG=1 でオプトイン）
 ///
-/// このログはシステム全体のキー入力を平文でファイルに残すため
-/// （パスワード入力も含まれ得る）、既定では完全に無効。
-/// 調査時のみ `IME_DEBUG_LOG=1` で起動して有効化すること。
-fn debug_log_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("IME_DEBUG_LOG").map(|v| v == "1").unwrap_or(false)
-    })
-}
-
-// デバッグログ（UTF-8 BOM付きで出力、IME_DEBUG_LOG=1 のときのみ）
-#[allow(unused_macros)]
-macro_rules! debug_log {
-    ($($arg:tt)*) => {
-        if crate::debug_log_enabled() {
-            use std::io::Write;
-            // ファイルオープン時にBOMを追加
-            let path = "C:\\Projects\\ime-live-converter\\hook_debug.log";
-            let needs_bom = !std::path::Path::new(path).exists();
-            if let Ok(mut file) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-            {
-                if needs_bom {
-                    let _ = file.write_all(&[0xEF, 0xBB, 0xBF]); // UTF-8 BOM
-                }
-                let _ = writeln!(file, "[IME] {}", format!($($arg)*));
-            }
-        }
-    };
-}
 
 /// ライブ変換の状態
 struct LiveConversionState {
