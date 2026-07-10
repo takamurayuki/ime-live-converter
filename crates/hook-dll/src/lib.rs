@@ -521,21 +521,37 @@ impl LiveConversionState {
     /// - 確定直後（buffer 空・last_committed あり）: 次単語をバイグラムから予測
     fn update_predictions(&mut self) {
         self.predictions.clear();
-        let Some(learning) = self.learning.as_ref() else {
+        if self.learning.is_none() {
             return;
-        };
-        // 前方一致補完のみ。次単語予測（bigram）は無関係な語が出やすくノイズに
-        // なるため使わない。2文字以上打ってから、頻度2以上・打った読みより長い
-        // （＝実際に補完になる）履歴だけを候補にして、無関係な予測を抑える。
+        }
         let prefix_len = self.hiragana_buffer.chars().count();
         if prefix_len < 2 {
             return;
         }
-        if let Ok(list) = learning.predict_by_prefix(&self.hiragana_buffer, 5) {
-            for (reading, surface, freq) in list {
-                if freq >= 2 && reading.chars().count() > prefix_len {
-                    self.predictions.push((reading, surface));
-                }
+        // あいまい変換（もしかして）: 誤字脱字を1編集で補正した候補を先頭に。
+        // 性能のため短めの読みだけ（fuzzyは変種ごとにViterbiを回すため）。
+        let fuzzy = if prefix_len <= 10 {
+            self.converter
+                .as_ref()
+                .and_then(|c| c.fuzzy_suggest(&self.hiragana_buffer))
+        } else {
+            None
+        };
+        // 前方一致補完のみ。次単語予測（bigram）は無関係な語が出やすくノイズに
+        // なるため使わない。2文字以上打ってから、頻度2以上・打った読みより長い
+        // （＝実際に補完になる）履歴だけを候補にして、無関係な予測を抑える。
+        let prefix_list = self
+            .learning
+            .as_ref()
+            .and_then(|l| l.predict_by_prefix(&self.hiragana_buffer, 5).ok())
+            .unwrap_or_default();
+
+        if let Some((reading, surface)) = fuzzy {
+            self.predictions.push((reading, surface));
+        }
+        for (reading, surface, freq) in prefix_list {
+            if freq >= 2 && reading.chars().count() > prefix_len {
+                self.predictions.push((reading, surface));
             }
         }
     }

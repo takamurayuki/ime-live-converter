@@ -261,6 +261,55 @@ const BIGRAM_BONUS_CAP: i32 = 2500;
 /// ユニグラム学習ボーナスの上限（短い語が長い語を分断するのを防ぐ）
 const UNIGRAM_BONUS_CAP: i32 = 6000;
 
+/// あいまい変換（もしかして）の採用しきい値。置換系（同じ長さ）はやや緩め。
+const FUZZY_MARGIN: i32 = 1200;
+/// 削除系（文字を捨てる）は誤補正しやすいので厳しめ。
+const FUZZY_MARGIN_DEL: i32 = 4500;
+
+/// 読みの1編集で誤字脱字の補正候補（変種）を生成する
+///
+/// - 取り違えやすいかなの相互置換（は↔わ・を↔お・へ↔え・づ↔ず・ぢ↔じ、
+///   および 大きいかな↔小さいかな つ↔っ・や↔ゃ 等）
+/// - 1文字削除（余分に打ってしまった打鍵）
+fn fuzzy_variants(reading: &str) -> Vec<(String, bool)> {
+    let chars: Vec<char> = reading.chars().collect();
+    let n = chars.len();
+    let mut out = Vec::new();
+    if n < 2 || n > 16 {
+        return out;
+    }
+    // 相互に取り違えやすいペア（どちらの向きも試す）
+    const SWAPS: &[(char, char)] = &[
+        ('わ', 'は'), ('お', 'を'), ('え', 'へ'), ('づ', 'ず'), ('ぢ', 'じ'),
+        // 促音・拗音（大きく打ってしまう誤り）
+        ('つ', 'っ'), ('や', 'ゃ'), ('ゆ', 'ゅ'), ('よ', 'ょ'),
+        ('あ', 'ぁ'), ('い', 'ぃ'), ('う', 'ぅ'), ('お', 'ぉ'),
+    ];
+    for i in 0..n {
+        for &(a, b) in SWAPS {
+            let repl = if chars[i] == a {
+                Some(b)
+            } else if chars[i] == b {
+                Some(a)
+            } else {
+                None
+            };
+            if let Some(r) = repl {
+                let mut v = chars.clone();
+                v[i] = r;
+                out.push((v.into_iter().collect(), false)); // 置換（同じ長さ）
+            }
+        }
+    }
+    // 1文字削除（余分な打鍵の除去）
+    for i in 0..n {
+        let mut v = chars.clone();
+        v.remove(i);
+        out.push((v.into_iter().collect(), true)); // 削除
+    }
+    out
+}
+
 
 /// 使用頻度をコスト減額（ボーナス）に変換する
 ///
@@ -505,6 +554,46 @@ impl ViterbiConverter {
             .iter()
             .map(|e| e.surface.as_str())
             .collect()
+    }
+
+    /// 誤字脱字を1編集で補正した「もしかして」候補を返す
+    ///
+    /// 打った読みの1文字を、取り違えやすいかな（は↔わ・を↔お・大↔小 等）に
+    /// 置換／1文字削除した変種を試し、元より明確に安く（＝もっともらしく）
+    /// 変換できるものがあれば (補正後の読み, 補正後の表記) を返す。
+    /// 例: わたしわ → 私は、がつこう → 学校、しよる → しょる/所……。
+    pub fn fuzzy_suggest(&self, reading: &str) -> Option<(String, String)> {
+        let n = reading.chars().count();
+        if n < 2 || n > 16 {
+            return None;
+        }
+        let (_, base_cost) = self.convert_with_cost(reading);
+        let base_surface = self.convert_context_aware_to_string(reading);
+        // 各変種の「改善スコア = 元コスト - 変種コスト - しきい値」を比べ、
+        // 最も改善が大きいものを採用。削除（文字を捨てる）は誤補正しやすいので
+        // しきい値を高くして、明確に良いときだけ採る。
+        let mut best: Option<(String, i32)> = None;
+        for (variant, is_del) in fuzzy_variants(reading) {
+            if variant == reading {
+                continue;
+            }
+            let (_, cost) = self.convert_with_cost(&variant);
+            if cost >= i32::MAX / 2 {
+                continue;
+            }
+            let margin = if is_del { FUZZY_MARGIN_DEL } else { FUZZY_MARGIN };
+            let score = base_cost - cost - margin;
+            if score > 0 && best.as_ref().map_or(true, |(_, s)| score > *s) {
+                best = Some((variant, score));
+            }
+        }
+        let (variant, _) = best?;
+        let surface = self.convert_context_aware_to_string(&variant);
+        // 補正結果が元と同じ、または全てひらがな（＝改善になっていない）なら出さない
+        if surface == base_surface || surface.chars().all(|c| ('\u{3041}'..='\u{3096}').contains(&c)) {
+            return None;
+        }
+        Some((variant, surface))
     }
 
     /// 単語の実効コスト（1文字漢字ペナルティ・学習ユニグラムを反映）
@@ -1574,6 +1663,19 @@ mod tests {
         });
         let converter = ViterbiConverter::new(dict);
         assert_eq!(converter.convert_to_string("を"), "を");
+    }
+
+    #[test]
+    fn test_fuzzy_suggest() {
+        let converter = ViterbiConverter::new(create_test_dictionary());
+        // きよう(拗音の打ち間違い) → きょう → 今日 を提案
+        let r = converter.fuzzy_suggest("きようは");
+        assert!(r.is_some(), "誤字補正が出るべき");
+        let (reading, surface) = r.unwrap();
+        assert_eq!(reading, "きょうは");
+        assert!(surface.contains("今日"), "補正後に今日を含むべき: {}", surface);
+        // 正しい入力は補正しない（過補正しない）
+        assert!(converter.fuzzy_suggest("きょうは").is_none());
     }
 
     #[test]
