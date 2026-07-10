@@ -157,6 +157,14 @@ enum Command {
 }
 
 fn main() -> Result<()> {
+    // --debug: フック側のデバッグログ(IME_DEBUG_LOG)を確実に有効化する。
+    //   DLL は同一プロセスの環境変数を読むので、ロード前にここで設定する。
+    //   （VBS の環境変数設定が子へ伝わらないケースの回避）
+    if std::env::args().any(|a| a == "--debug") {
+        std::env::set_var("IME_DEBUG_LOG", "1");
+        println!("デバッグログ有効: C:\\Projects\\ime-live-converter\\hook_debug.log");
+    }
+
     // --background / -b: 標準入力を読まず、常駐（ログオン時自動起動向け）
     let background = std::env::args().any(|a| a == "--background" || a == "-b");
 

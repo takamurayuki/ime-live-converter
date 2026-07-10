@@ -17,7 +17,6 @@ If Not fso.FileExists(exe) Then
     WScript.Quit 1
 End If
 
-' 子プロセスに引き継がれるよう、WSHプロセスの環境変数に設定
-sh.Environment("PROCESS")("IME_DEBUG_LOG") = "1"
+' --debug でプロセス内から確実にログ有効化（環境変数の受け渡しに依存しない）
 sh.CurrentDirectory = root
-sh.Run """" & exe & """ --background", 0, False
+sh.Run """" & exe & """ --background --debug", 0, False

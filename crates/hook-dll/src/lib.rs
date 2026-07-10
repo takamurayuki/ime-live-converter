@@ -2292,6 +2292,7 @@ pub extern "system" fn LowLevelKeyboardProc(
 #[no_mangle]
 pub extern "C" fn install_hook() -> bool {
     unsafe {
+        debug_log!("install_hook: デバッグログ有効（IME_DEBUG_LOG=1）");
         // コンテキストを初期化
         let mut state = LiveConversionState::new();
         // 学習DBをオープン（CLIと共有。失敗しても変換は継続できる）
