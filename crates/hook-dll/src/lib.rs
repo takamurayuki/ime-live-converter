@@ -130,6 +130,10 @@ fn start_uia_poller() {
                     console_caret_screen_pos(hwnd_fg).is_some(),
                     pos
                 );
+                // UIA が取れていないなら、原因を1回詳しくログ
+                if uia.is_none() {
+                    uia_diag(&auto);
+                }
             }
 
             if let Ok(mut c) = UIA_ANCHOR.lock() {
@@ -258,7 +262,7 @@ unsafe fn uia_caret_from_textpattern(
     if let Ok(p2) = elem.GetCurrentPatternAs::<IUIAutomationTextPattern2>(UIA_TextPattern2Id) {
         let mut is_active = windows::Win32::Foundation::BOOL::default();
         if let Ok(range) = p2.GetCaretRange(&mut is_active) {
-            if let Some(pos) = rect_from_text_range(&range) {
+            if let Some(pos) = rect_with_expand(&range) {
                 return Some(pos);
             }
         }
@@ -271,7 +275,64 @@ unsafe fn uia_caret_from_textpattern(
         return None;
     }
     let range = selection.GetElement(0).ok()?;
-    rect_from_text_range(&range)
+    rect_with_expand(&range)
+}
+
+/// UIA のカーソル取得がなぜ失敗するかを1回だけ詳しくログする（診断用）
+unsafe fn uia_diag(auto: &windows::Win32::UI::Accessibility::IUIAutomation) {
+    use windows::Win32::UI::Accessibility::{
+        IUIAutomationTextPattern, IUIAutomationTextPattern2, UIA_TextPattern2Id, UIA_TextPatternId,
+    };
+    let elem = match auto.GetFocusedElement() {
+        Ok(e) => e,
+        Err(e) => {
+            debug_log!("uia診断: GetFocusedElement 失敗 {:?}", e);
+            return;
+        }
+    };
+    let name = elem.CurrentName().map(|b| b.to_string()).unwrap_or_default();
+    let ct = elem.CurrentControlType().map(|c| c.0).unwrap_or(-1);
+    let has_tp2 = elem
+        .GetCurrentPatternAs::<IUIAutomationTextPattern2>(UIA_TextPattern2Id)
+        .is_ok();
+    let has_tp = elem
+        .GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId)
+        .is_ok();
+    debug_log!(
+        "uia診断: name='{}' ctrlType={} TextPattern2={} TextPattern={}",
+        name, ct, has_tp2, has_tp
+    );
+    if let Ok(p2) = elem.GetCurrentPatternAs::<IUIAutomationTextPattern2>(UIA_TextPattern2Id) {
+        let mut a = windows::Win32::Foundation::BOOL::default();
+        match p2.GetCaretRange(&mut a) {
+            Ok(r) => debug_log!(
+                "uia診断: GetCaretRange ok active={} rect={:?}",
+                a.as_bool(),
+                rect_with_expand(&r)
+            ),
+            Err(e) => debug_log!("uia診断: GetCaretRange err {:?}", e),
+        }
+    }
+    if let Ok(p) = elem.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId) {
+        if let Ok(sel) = p.GetSelection() {
+            debug_log!("uia診断: selection len={:?}", sel.Length());
+        }
+    }
+}
+
+/// テキスト範囲から矩形を取り出す。空範囲（0幅キャレット）で取れない場合は
+/// 文字単位に広げて再取得する（Windows Terminal のカーソル等）。
+unsafe fn rect_with_expand(
+    range: &windows::Win32::UI::Accessibility::IUIAutomationTextRange,
+) -> Option<(i32, i32, i32)> {
+    use windows::Win32::UI::Accessibility::TextUnit_Character;
+    if let Some(pos) = rect_from_text_range(range) {
+        return Some(pos);
+    }
+    // 空範囲 → 複製して1文字分に広げてから矩形を取る
+    let expanded = range.Clone().ok()?;
+    let _ = expanded.ExpandToEnclosingUnit(TextUnit_Character);
+    rect_from_text_range(&expanded)
 }
 
 /// テキスト範囲の境界矩形の末尾から (x, 上端y, 下端y) を取り出す
