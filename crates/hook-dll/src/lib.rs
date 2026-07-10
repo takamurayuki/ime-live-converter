@@ -419,13 +419,9 @@ impl LiveConversionState {
         Some(action)
     }
 
-    /// 予測候補の表示用文字列（番号付き）
+    /// 予測候補の表示用文字列（番号は描画側で付くので表記のみ）
     fn prediction_display(&self) -> Vec<String> {
-        self.predictions
-            .iter()
-            .enumerate()
-            .map(|(i, (_, s))| format!("{}:{}", i + 1, s))
-            .collect()
+        self.predictions.iter().map(|(_, s)| s.clone()).collect()
     }
 
     /// 候補一覧の状態をすべてクリア
@@ -1433,6 +1429,16 @@ fn place_popup(max_len_chars: usize, line_count: i32) {
         } else {
             (0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN))
         };
+
+        // 真下に出すと画面下端で見切れる場合は、入力位置の真上へ回す
+        // （オートコンプリートのように「真下 or 真上」で入力の近くに保つ）。
+        if !anchor_bottom && y + height > bottom {
+            // anchor_y はキャレット下端+4。1行分ほど戻してキャレットの真上に置く
+            let above = anchor_y - height - (CANDIDATE_LINE_HEIGHT + 8);
+            if above >= top {
+                y = above;
+            }
+        }
 
         x = x.clamp(left, (right - width).max(left));
         y = y.clamp(top, (bottom - height).max(top));
