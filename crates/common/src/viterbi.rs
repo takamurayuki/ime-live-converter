@@ -258,6 +258,9 @@ const COMMON_WORD_SEED_BONUS: i32 = 1500;
 /// バイグラム学習ボーナスの上限（接続コスト規模に合わせ、断片パスの暴走を防ぐ）
 const BIGRAM_BONUS_CAP: i32 = 2500;
 
+/// ユニグラム学習ボーナスの上限（短い語が長い語を分断するのを防ぐ）
+const UNIGRAM_BONUS_CAP: i32 = 6000;
+
 
 /// 使用頻度をコスト減額（ボーナス）に変換する
 ///
@@ -334,6 +337,10 @@ impl ViterbiConverter {
         // 負ける（うしろ→ウシ炉）ため強めに優先する。
         self.learned_unigram
             .insert(("うしろ".to_string(), "後ろ".to_string()), 4000);
+        // 「文章」は「文書(ぶんしょ,超低コスト1432)＋う」の分割に負けやすい
+        // （ぶんしょう→文書雨/文書う）ため強めに優先する。
+        self.learned_unigram
+            .insert(("ぶんしょう".to_string(), "文章".to_string()), 9000);
 
         // 既定でひらがな優先にする読み。漢字表記(慕い)が稀で、ひらがな
         // (助動詞「〜したい」)の方が圧倒的に多い。ユーザーが Esc で戻さ
@@ -371,8 +378,12 @@ impl ViterbiConverter {
 
     /// ユニグラム（読み→表記）の学習を頻度から設定する
     pub fn learn_unigram(&mut self, reading: &str, surface: &str, freq: u32) {
+        // ボーナスが大きすぎると、短い語（ぶんしょ→文書）が長い語（ぶんしょう
+        // →文章）を分断してしまう（文書＋う に割れる）。同音語を選ぶには十分
+        // だが分割を壊さない程度に上限を設ける。
+        let bonus = frequency_to_bonus(freq).min(UNIGRAM_BONUS_CAP);
         self.learned_unigram
-            .insert((reading.to_string(), surface.to_string()), frequency_to_bonus(freq));
+            .insert((reading.to_string(), surface.to_string()), bonus);
     }
 
     /// バイグラム（前の表記→次の表記）の学習を頻度から設定する
