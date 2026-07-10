@@ -400,6 +400,19 @@ impl ViterbiConverter {
     /// 新聞の記者」のように、助詞を挟んで離れた前後の語の関係から
     /// 尤もらしい変換を選ぶ（学習が無ければ通常の1-bestのまま）。
     pub fn convert_context_aware(&self, reading: &str) -> Vec<WordEntry> {
+        // 入力が助詞1文字だけ（は・と・も 等）のときはひらがなのままにする。
+        // 接続コストの都合で単独だと漢字（刃・賭・藻）に負けるのを防ぐ。
+        // 文中の助詞や長い語には影響しない（reading 全体が1助詞のときのみ）。
+        if is_lone_particle(reading) {
+            return vec![WordEntry {
+                surface: reading.to_string(),
+                reading: reading.to_string(),
+                left_id: self.dictionary.bos_id,
+                right_id: self.dictionary.eos_id,
+                cost: 0,
+                pos: "助詞-係助詞-*-*".to_string(),
+            }];
+        }
         let base = self.convert(reading);
         self.rerank_by_assoc(base)
     }
@@ -852,6 +865,18 @@ fn katakana_proper_noun_penalty(surface: &str, pos: &str) -> i32 {
     } else {
         0
     }
+}
+
+/// 入力全体が助詞1文字か（単独助詞をひらがなのままにする判定）
+///
+/// これらは単独で打つと接続コストの都合で同音漢字（刃・賭・藻・戸 等）に
+/// 負けやすいが、助詞としてはひらがなが正しい。文中では通常の変換に任せる
+/// ため、reading 全体がちょうど1つの助詞のときだけ真を返す。
+fn is_lone_particle(reading: &str) -> bool {
+    matches!(
+        reading,
+        "は" | "を" | "が" | "に" | "へ" | "と" | "も" | "の" | "で" | "や"
+    )
 }
 
 /// 記号（＆＠ 等）表記へのコストペナルティ
