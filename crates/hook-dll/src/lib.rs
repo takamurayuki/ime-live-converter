@@ -1958,30 +1958,58 @@ fn trigger_llm_conversion() {
         let cfg = common::LlmConfig::from_env();
         // 読み＋下書き＋参考候補を渡し、誤字・文法を直させる（厳密に正しい文へ）
         let corrected = common::llm_correct(&cfg, &reading, &draft, &candidates, &context);
-        hide_candidate_window();
 
         let Some(corrected) = corrected else {
             debug_log!("LLM校正 応答なし（下書きを維持）");
+            flash_llm_status("校正: 応答なし");
             return;
         };
         debug_log!("LLM校正 結果: '{}'", corrected);
 
-        // 校正結果を反映（読みが変わっていなければ）
-        unsafe {
-            let Some(mtx) = &LIVE_CONTEXT else { return };
-            let Ok(mut ctx) = mtx.lock() else { return };
-            // 発火時から入力世代が変わっていたら破棄（その間に入力・確定・
-            // 取消があった → 適用すると別位置に差し込まれ前の入力を壊す）
-            if !ctx.enabled || ctx.generation != gen || ctx.hiragana_buffer != reading {
-                debug_log!("LLM校正: 世代不一致のため破棄");
-                return;
+        // 校正結果を反映（読みが変わっていなければ）。3状態に分ける:
+        //   適用した / 変化なし（既に正しい）/ 世代不一致で破棄
+        enum Outcome {
+            Applied(ConversionAction),
+            NoChange,
+            Discarded,
+        }
+        let outcome = unsafe {
+            match &LIVE_CONTEXT {
+                Some(mtx) => match mtx.lock() {
+                    Ok(mut ctx) => {
+                        // 発火時から入力世代が変わっていたら破棄（その間に入力・
+                        // 確定・取消があった → 適用すると前の入力を壊す）
+                        if !ctx.enabled || ctx.generation != gen || ctx.hiragana_buffer != reading {
+                            debug_log!("LLM校正: 世代不一致のため破棄");
+                            Outcome::Discarded
+                        } else {
+                            match ctx.apply_new_result(corrected) {
+                                Some(a) => Outcome::Applied(a),
+                                None => Outcome::NoChange,
+                            }
+                        }
+                    }
+                    Err(_) => Outcome::Discarded,
+                },
+                None => Outcome::Discarded,
             }
-            if let Some(action) = ctx.apply_new_result(corrected) {
-                drop(ctx);
+        };
+        match outcome {
+            Outcome::Applied(action) => {
                 execute_action(action);
+                hide_candidate_window();
             }
+            Outcome::NoChange => flash_llm_status("校正: 変更なし"),
+            Outcome::Discarded => hide_candidate_window(),
         }
     });
+}
+
+/// 短いステータスを表示して 1.2 秒後に消す（校正の「変更なし/応答なし」通知）
+fn flash_llm_status(text: &str) {
+    show_llm_status(text);
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    hide_candidate_window();
 }
 
 fn execute_action(action: ConversionAction) {
@@ -2447,16 +2475,23 @@ pub extern "C" fn install_hook() -> bool {
             let cfg = common::LlmConfig::from_env();
             if common::llm::ollama_available(&cfg) {
                 println!("LLM: 利用可能 (model={}) — モデルを準備中…", cfg.model);
-                // モデルをメモリに載せておく（初回のTab長押し変換を高速化）
                 if common::warm_up(&cfg) {
-                    println!("LLM: 準備完了 — Tab長押しでLLM変換できます");
+                    println!("LLM: 準備完了 — Shift+SpaceでLLM校正できます");
                 } else {
-                    println!("LLM: ウォームアップに失敗（初回変換は時間がかかる場合があります）");
+                    println!("LLM: ウォームアップに失敗（初回校正は時間がかかる場合があります）");
                 }
             } else {
                 println!(
-                    "LLM: 未接続 — Tab長押し変換は無効です（`docker compose up -d` で起動できます）"
+                    "LLM: 未接続 — LLM校正は無効です（`docker compose up -d` で起動できます）"
                 );
+            }
+            // モデルを温め続ける（keep_alive=-1 だが Ollama 再起動等に備え定期的に
+            // 軽い warm_up を投げてコールドロードを避ける＝校正を常に高速に）
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(600));
+                if common::llm::ollama_available(&cfg) {
+                    let _ = common::warm_up(&cfg);
+                }
             }
         });
         INITIAL_CHECK_DONE = false;

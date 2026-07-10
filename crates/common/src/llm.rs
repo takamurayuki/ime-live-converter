@@ -103,7 +103,7 @@ impl LlmBackend for OllamaBackend {
             // 変換は決定的にしたいので温度は低め
             "options": { "temperature": 0.1 },
             // モデルをメモリに保持して次回変換を高速化（IME用途）
-            "keep_alive": "30m"
+            "keep_alive": -1
         });
 
         let agent = ureq::AgentBuilder::new().timeout(self.cfg.timeout).build();
@@ -150,7 +150,7 @@ pub fn warm_up(cfg: &LlmConfig) -> bool {
         "prompt": "あ",
         "stream": false,
         "options": { "num_predict": 1, "temperature": 0.0 },
-        "keep_alive": "30m"
+        "keep_alive": -1
     });
     let agent = ureq::AgentBuilder::new()
         .timeout(cfg.timeout.max(std::time::Duration::from_secs(60)))
@@ -202,7 +202,7 @@ pub fn llm_correct(
         String::new()
     } else {
         let mut s = String::from("参考候補: ");
-        for c in candidates.iter().take(3) {
+        for c in candidates.iter().take(2) {
             s.push_str(&format!("{} / ", c));
         }
         s.push('\n');
@@ -212,18 +212,21 @@ pub fn llm_correct(
     let predict = (reading.chars().count() as i64 + 16).clamp(24, 96);
     let prompt = format!(
         "次の日本語の下書きから、誤字・文法（は/へ/を、送り仮名 等）だけを直し、\
-         正しい一文にしてください。意味・語順・語尾は変えない。読みに無い語を足さない。\
-         既に正しければそのまま。出力は一文のみ。\n\
+         正しい一文にしてください。意味・語順・語尾・文体は変えない。読みに無い語を\
+         足さない。句点(。)や です/ます を勝手に付け足さない。既に正しければそのまま。\
+         出力は下書きと同じ長さの一文のみ。\n\
          例: 今日わ会議がある → 今日は会議がある\n\
          例: 資料お作る → 資料を作る\n\
+         例: 会議の資料を作る → 会議の資料を作る\n\
          {ctx}{cand_block}下書き: {draft} → "
     );
     let body = serde_json::json!({
         "model": cfg.model,
         "prompt": prompt,
         "stream": false,
-        "options": { "temperature": 0.0, "num_predict": predict },
-        "keep_alive": "30m"
+        // num_ctx を小さくして処理を軽くする（プロンプトは短いので十分）
+        "options": { "temperature": 0.0, "num_predict": predict, "num_ctx": 512 },
+        "keep_alive": -1
     });
     let agent = ureq::AgentBuilder::new().timeout(cfg.timeout).build();
     let resp = agent.post(&cfg.url).send_json(body).ok()?;
@@ -297,7 +300,7 @@ pub fn llm_rerank(cfg: &LlmConfig, reading: &str, context: &str, candidates: &[S
         "prompt": prompt,
         "stream": false,
         "options": { "temperature": 0.0, "num_predict": 4 },
-        "keep_alive": "30m"
+        "keep_alive": -1
     });
 
     let agent = ureq::AgentBuilder::new().timeout(cfg.timeout).build();
