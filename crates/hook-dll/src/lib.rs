@@ -75,13 +75,76 @@ fn start_uia_poller() {
             };
 
         loop {
-            let pos = uia_focused_anchor(&auto);
+            // UIA でカーソルが取れなければ、クラシックコンソール(conhost)向けに
+            // コンソールAPIでカーソル位置を取得する（PowerShell窓 等）。
+            let pos = uia_focused_anchor(&auto)
+                .or_else(|| console_caret_screen_pos(GetForegroundWindow()));
             if let Ok(mut c) = UIA_ANCHOR.lock() {
                 *c = pos;
             }
             std::thread::sleep(std::time::Duration::from_millis(150));
         }
     });
+}
+
+/// クラシックコンソール(conhost)のカーソル画面座標 (x, 上端y, 下端y) を取得する
+///
+/// UIA が効かない旧来のコンソール窓（PowerShell/cmd を直接起動）向け。対象
+/// コンソールに AttachConsole し、GetConsoleScreenBufferInfo でカーソルの
+/// セル位置を取り、フォントサイズとクライアント原点から画面ピクセルへ変換する。
+///
+/// 自プロセスが既にコンソールを持つ（対話起動）場合は AttachConsole が失敗/
+/// 破壊的になるためスキップする（--background 常駐時は安全）。
+unsafe fn console_caret_screen_pos(hwnd_fg: HWND) -> Option<(i32, i32, i32)> {
+    use windows::Win32::System::Console::{
+        AttachConsole, FreeConsole, GetConsoleScreenBufferInfo, GetConsoleWindow,
+        GetCurrentConsoleFont, GetStdHandle, CONSOLE_FONT_INFO, CONSOLE_SCREEN_BUFFER_INFO,
+        STD_OUTPUT_HANDLE,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::GetClassNameW;
+
+    if hwnd_fg.0.is_null() {
+        return None;
+    }
+    // 既に自分のコンソールがある（対話モード）ならアタッチできないのでスキップ
+    if !GetConsoleWindow().0.is_null() {
+        return None;
+    }
+    // フォアグラウンドがクラシックコンソール窓か（クラス名で判定）
+    let mut cls = [0u16; 64];
+    let n = GetClassNameW(hwnd_fg, &mut cls);
+    if n <= 0 || String::from_utf16_lossy(&cls[..n as usize]) != "ConsoleWindowClass" {
+        return None;
+    }
+    let mut pid = 0u32;
+    GetWindowThreadProcessId(hwnd_fg, Some(&mut pid));
+    if pid == 0 || AttachConsole(pid).is_err() {
+        return None;
+    }
+    let result = (|| {
+        // AttachConsole 後、標準出力ハンドルが対象コンソールの画面バッファを指す
+        let conout = GetStdHandle(STD_OUTPUT_HANDLE).ok()?;
+        let mut csbi = CONSOLE_SCREEN_BUFFER_INFO::default();
+        let ok1 = GetConsoleScreenBufferInfo(conout, &mut csbi).is_ok();
+        let mut font = CONSOLE_FONT_INFO::default();
+        let ok2 = GetCurrentConsoleFont(conout, false, &mut font).is_ok();
+        if !ok1 || !ok2 || font.dwFontSize.X <= 0 || font.dwFontSize.Y <= 0 {
+            return None;
+        }
+        let cw = font.dwFontSize.X as i32;
+        let ch = font.dwFontSize.Y as i32;
+        // カーソルの「可視ウィンドウ内」相対セル
+        let col = (csbi.dwCursorPosition.X - csbi.srWindow.Left) as i32;
+        let row = (csbi.dwCursorPosition.Y - csbi.srWindow.Top) as i32;
+        // コンソール窓クライアント原点（画面座標）
+        let mut origin = POINT { x: 0, y: 0 };
+        let _ = ClientToScreen(GetConsoleWindow(), &mut origin);
+        let x = origin.x + col * cw;
+        let top = origin.y + row * ch;
+        Some((x, top, top + ch))
+    })();
+    let _ = FreeConsole();
+    result
 }
 
 /// フォーカス中の UIA 要素の入力位置を返す
