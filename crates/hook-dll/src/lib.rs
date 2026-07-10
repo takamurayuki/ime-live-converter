@@ -2366,7 +2366,23 @@ pub extern "system" fn LowLevelKeyboardProc(
 
                     // Enter: 確定のみ（IME標準動作: 変換中のEnterは改行しない）
                     if vk_code == VK_RETURN.0 as u32 && context.is_composing() {
-                        // 確定後は次単語予測を表示（commit 内で更新済み）
+                        // 予測変換（もしかして/補完）が表示中なら、Enter で先頭
+                        // （ハイライト中）の予測を確定する。Tab/番号と同じ動作。
+                        if candidate_window_visible()
+                            && context.candidates.is_empty()
+                            && !context.predictions.is_empty()
+                        {
+                            let action = context.commit_prediction(0);
+                            let preds = context.prediction_display();
+                            drop(context);
+                            hide_candidate_window();
+                            if let Some(action) = action {
+                                execute_action(action);
+                            }
+                            show_prediction_popup(&preds);
+                            return LRESULT(1);
+                        }
+                        // それ以外は通常の確定（確定後は次単語予測を表示）
                         let action = context.commit();
                         let preds = context.prediction_display();
                         drop(context);
