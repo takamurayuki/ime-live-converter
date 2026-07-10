@@ -1353,16 +1353,18 @@ fn caret_screen_pos() -> (i32, i32, bool) {
             }
 
             // 3. フォアグラウンドウィンドウの下部・左寄り（入力行付近）
+            //    ターミナル等はキャレットを公開せずここに来る。入力は最下行に
+            //    あることが多いので、その1行分ほど上を基点にして、ポップアップ
+            //    （anchor_bottom=true でこの y が下端）が入力行に被らないようにする。
             let mut rc = RECT::default();
             if GetWindowRect(hwnd_fg, &mut rc).is_ok() && rc.bottom > rc.top {
                 let x = rc.left + 24;
-                // 下端の少し上を「入力行の位置」とみなし、候補はその上に出す
-                let y = rc.bottom - 12;
+                let y = rc.bottom - (CANDIDATE_LINE_HEIGHT + 16);
                 return (x, y, true);
             }
         }
         // 取得できない場合は画面左下寄りに固定表示（少なくとも見える）
-        (80, GetSystemMetrics(SM_CYSCREEN) - 12, true)
+        (80, GetSystemMetrics(SM_CYSCREEN) - (CANDIDATE_LINE_HEIGHT + 16), true)
     }
 }
 
