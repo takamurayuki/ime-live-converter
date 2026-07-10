@@ -110,28 +110,51 @@ unsafe fn uia_focused_anchor(
     Some((r.left + 2, r.top, r.bottom))
 }
 
-/// TextPattern の選択範囲からカーソルの画面座標 (x, 上端y, 下端y) を取得する
+/// フォーカス要素からカーソルの画面座標 (x, 上端y, 下端y) を取得する
+///
+/// まず TextPattern2 の GetCaretRange でカーソルを直接取得する（Windows
+/// Terminal など対応アプリで正確）。取れなければ TextPattern の選択範囲末尾を
+/// カーソル位置とみなす。
 unsafe fn uia_caret_from_textpattern(
     elem: &windows::Win32::UI::Accessibility::IUIAutomationElement,
 ) -> Option<(i32, i32, i32)> {
-    use windows::Win32::System::Ole::{
-        SafeArrayAccessData, SafeArrayDestroy, SafeArrayGetLBound, SafeArrayGetUBound,
-        SafeArrayUnaccessData,
+    use windows::Win32::UI::Accessibility::{
+        IUIAutomationTextPattern, IUIAutomationTextPattern2, UIA_TextPattern2Id, UIA_TextPatternId,
     };
-    use windows::Win32::UI::Accessibility::{IUIAutomationTextPattern, UIA_TextPatternId};
 
-    let pattern: IUIAutomationTextPattern =
-        elem.GetCurrentPatternAs(UIA_TextPatternId).ok()?;
+    // 1. TextPattern2::GetCaretRange（キャレットを直接取得）
+    if let Ok(p2) = elem.GetCurrentPatternAs::<IUIAutomationTextPattern2>(UIA_TextPattern2Id) {
+        let mut is_active = windows::Win32::Foundation::BOOL::default();
+        if let Ok(range) = p2.GetCaretRange(&mut is_active) {
+            if let Some(pos) = rect_from_text_range(&range) {
+                return Some(pos);
+            }
+        }
+    }
+
+    // 2. TextPattern の選択範囲末尾（＝カーソル）
+    let pattern: IUIAutomationTextPattern = elem.GetCurrentPatternAs(UIA_TextPatternId).ok()?;
     let selection = pattern.GetSelection().ok()?;
     if selection.Length().ok()? < 1 {
         return None;
     }
     let range = selection.GetElement(0).ok()?;
+    rect_from_text_range(&range)
+}
+
+/// テキスト範囲の境界矩形の末尾から (x, 上端y, 下端y) を取り出す
+unsafe fn rect_from_text_range(
+    range: &windows::Win32::UI::Accessibility::IUIAutomationTextRange,
+) -> Option<(i32, i32, i32)> {
+    use windows::Win32::System::Ole::{
+        SafeArrayAccessData, SafeArrayDestroy, SafeArrayGetLBound, SafeArrayGetUBound,
+        SafeArrayUnaccessData,
+    };
+
     let psa = range.GetBoundingRectangles().ok()?;
     if psa.is_null() {
         return None;
     }
-
     // SAFEARRAY of f64: 4個ずつ (left, top, width, height) の矩形群
     let result = (|| {
         let lb = SafeArrayGetLBound(psa, 1).ok()?;
@@ -143,7 +166,7 @@ unsafe fn uia_caret_from_textpattern(
         let mut pdata: *mut core::ffi::c_void = std::ptr::null_mut();
         SafeArrayAccessData(psa, &mut pdata).ok()?;
         let data = std::slice::from_raw_parts(pdata as *const f64, count);
-        // 最後の矩形（選択末尾＝カーソル位置）の上端・下端
+        // 最後の矩形（範囲末尾＝カーソル位置）の上端・下端
         let base = count - 4;
         let left = data[base];
         let top = data[base + 1];
