@@ -53,7 +53,8 @@ static mut LLM_FIRED: bool = false;
 /// UI Automation で取得したフォーカス入力欄の位置キャッシュ (x, y)
 /// バックグラウンドスレッドが更新し、ポップアップ表示時に参照する。
 /// ブラウザ・ターミナル等 Win32 キャレットを公開しないアプリ向け。
-static UIA_ANCHOR: Mutex<Option<(i32, i32)>> = Mutex::new(None);
+/// 値は (x, キャレット上端y, キャレット下端y)（画面座標）。
+static UIA_ANCHOR: Mutex<Option<(i32, i32, i32)>> = Mutex::new(None);
 
 /// UI Automation でフォーカス入力欄の位置を定期取得するスレッドを開始
 ///
@@ -90,7 +91,7 @@ fn start_uia_poller() {
 /// 要素の矩形（大きすぎる要素は除外）にフォールバックする。
 unsafe fn uia_focused_anchor(
     auto: &windows::Win32::UI::Accessibility::IUIAutomation,
-) -> Option<(i32, i32)> {
+) -> Option<(i32, i32, i32)> {
     let elem = auto.GetFocusedElement().ok()?;
 
     // 1. TextPattern で選択（＝カーソル）位置を取得
@@ -106,13 +107,13 @@ unsafe fn uia_focused_anchor(
     if (r.bottom - r.top) > 200 {
         return None;
     }
-    Some((r.left + 2, r.bottom + 2))
+    Some((r.left + 2, r.top, r.bottom))
 }
 
-/// TextPattern の選択範囲からカーソルの画面座標（左下）を取得する
+/// TextPattern の選択範囲からカーソルの画面座標 (x, 上端y, 下端y) を取得する
 unsafe fn uia_caret_from_textpattern(
     elem: &windows::Win32::UI::Accessibility::IUIAutomationElement,
-) -> Option<(i32, i32)> {
+) -> Option<(i32, i32, i32)> {
     use windows::Win32::System::Ole::{
         SafeArrayAccessData, SafeArrayDestroy, SafeArrayGetLBound, SafeArrayGetUBound,
         SafeArrayUnaccessData,
@@ -142,12 +143,12 @@ unsafe fn uia_caret_from_textpattern(
         let mut pdata: *mut core::ffi::c_void = std::ptr::null_mut();
         SafeArrayAccessData(psa, &mut pdata).ok()?;
         let data = std::slice::from_raw_parts(pdata as *const f64, count);
-        // 最後の矩形（選択末尾＝カーソル位置）の左下
+        // 最後の矩形（選択末尾＝カーソル位置）の上端・下端
         let base = count - 4;
         let left = data[base];
         let top = data[base + 1];
         let height = data[base + 3];
-        let pos = (left as i32 + 2, (top + height) as i32 + 2);
+        let pos = (left as i32 + 2, top as i32, (top + height) as i32);
         let _ = SafeArrayUnaccessData(psa);
         Some(pos)
     })();
@@ -1319,10 +1320,10 @@ unsafe fn ensure_candidate_window() -> Option<HWND> {
 /// クロスプロセスの同期 COM 呼び出しはフックスレッドをブロックして
 /// 候補ウィンドウの描画を止めてしまうため使わない。
 ///
-/// 戻り値の2つ目 `anchor_bottom` が true のとき、その y は
-/// 「候補ウィンドウの下端をここに合わせたい（＝入力行の上に出す）」
-/// を意味する。
-fn caret_screen_pos() -> (i32, i32, bool) {
+/// 戻り値は (x, キャレット上端y, キャレット下端y)（画面座標）。
+/// place_popup がこの上下端を見て、真下に余白があれば下、無ければ真上に出す
+/// （既存IMEと同様の出し分け）。
+fn caret_screen_pos() -> (i32, i32, i32) {
     unsafe {
         let hwnd_fg = GetForegroundWindow();
         if !hwnd_fg.0.is_null() {
@@ -1331,40 +1332,37 @@ fn caret_screen_pos() -> (i32, i32, bool) {
                 cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
                 ..Default::default()
             };
-            // 1. テキストキャレットが取れて、かつ非ゼロサイズならその真下
-            //    （メモ帳・多くの Win32 エディタ）
+            // 1. テキストキャレット（メモ帳・多くの Win32 エディタ）
             if GetGUIThreadInfo(tid, &mut gti).is_ok()
                 && !gti.hwndCaret.0.is_null()
                 && (gti.rcCaret.bottom > gti.rcCaret.top || gti.rcCaret.right > gti.rcCaret.left)
             {
-                let mut pt = POINT {
-                    x: gti.rcCaret.left,
-                    y: gti.rcCaret.bottom,
-                };
-                let _ = ClientToScreen(gti.hwndCaret, &mut pt);
-                return (pt.x, pt.y + 4, false);
+                let mut top = POINT { x: gti.rcCaret.left, y: gti.rcCaret.top };
+                let mut bot = POINT { x: gti.rcCaret.left, y: gti.rcCaret.bottom };
+                let _ = ClientToScreen(gti.hwndCaret, &mut top);
+                let _ = ClientToScreen(gti.hwndCaret, &mut bot);
+                return (top.x, top.y, bot.y);
             }
 
             // 2. UI Automation で取得した入力欄の位置（ブラウザ・ターミナル等）
             if let Ok(cache) = UIA_ANCHOR.lock() {
-                if let Some((x, y)) = *cache {
-                    return (x, y, false);
+                if let Some((x, t, b)) = *cache {
+                    return (x, t, b);
                 }
             }
 
-            // 3. フォアグラウンドウィンドウの下部・左寄り（入力行付近）
-            //    ターミナル等はキャレットを公開せずここに来る。入力は最下行に
-            //    あることが多いので、その1行分ほど上を基点にして、ポップアップ
-            //    （anchor_bottom=true でこの y が下端）が入力行に被らないようにする。
+            // 3. フォアグラウンドウィンドウの最下行を「入力行」とみなす。
+            //    ターミナル等はキャレットを公開せずここに来る。最下行を
+            //    1行分の高さのキャレットとして扱い、その上に出す。
             let mut rc = RECT::default();
             if GetWindowRect(hwnd_fg, &mut rc).is_ok() && rc.bottom > rc.top {
                 let x = rc.left + 24;
-                let y = rc.bottom - (CANDIDATE_LINE_HEIGHT + 16);
-                return (x, y, true);
+                return (x, rc.bottom - CANDIDATE_LINE_HEIGHT, rc.bottom);
             }
         }
         // 取得できない場合は画面左下寄りに固定表示（少なくとも見える）
-        (80, GetSystemMetrics(SM_CYSCREEN) - (CANDIDATE_LINE_HEIGHT + 16), true)
+        let h = GetSystemMetrics(SM_CYSCREEN);
+        (80, h - CANDIDATE_LINE_HEIGHT, h)
     }
 }
 
@@ -1412,16 +1410,12 @@ fn place_popup(max_len_chars: usize, line_count: i32) {
 
         let width = ((max_len_chars + 4) * 16 + 24).min(640) as i32;
         let height = 8 + line_count * CANDIDATE_LINE_HEIGHT;
-        let (mut x, anchor_y, anchor_bottom) = caret_screen_pos();
-
-        // anchor_bottom: 入力行の上に出したい → y は候補ウィンドウの下端
-        // それ以外（キャレット）: y は候補ウィンドウの上端（キャレットの下）
-        let mut y = if anchor_bottom { anchor_y - height } else { anchor_y };
+        let (mut x, caret_top, caret_bottom) = caret_screen_pos();
 
         // 基点が乗っているモニターの作業領域を取得してクランプする
         // （SM_CXSCREEN は主モニターのみなので、マルチモニターだと
         //  副モニターの座標が主モニター右端に丸められ「右上」に飛ぶ）
-        let mon = MonitorFromPoint(POINT { x, y: anchor_y }, MONITOR_DEFAULTTONEAREST);
+        let mon = MonitorFromPoint(POINT { x, y: caret_bottom }, MONITOR_DEFAULTTONEAREST);
         let mut mi = MONITORINFO {
             cbSize: std::mem::size_of::<MONITORINFO>() as u32,
             ..Default::default()
@@ -1432,15 +1426,15 @@ fn place_popup(max_len_chars: usize, line_count: i32) {
             (0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN))
         };
 
-        // 真下に出すと画面下端で見切れる場合は、入力位置の真上へ回す
-        // （オートコンプリートのように「真下 or 真上」で入力の近くに保つ）。
-        if !anchor_bottom && y + height > bottom {
-            // anchor_y はキャレット下端+4。1行分ほど戻してキャレットの真上に置く
-            let above = anchor_y - height - (CANDIDATE_LINE_HEIGHT + 8);
-            if above >= top {
-                y = above;
-            }
-        }
+        // 既存IMEと同様: キャレットの真下に余白があれば下、無ければ真上に出す。
+        // これで入力文字（カーソル）にリストが被らない。
+        let below_top = caret_bottom + 2;
+        let above_top = caret_top - height - 2;
+        let mut y = if below_top + height <= bottom {
+            below_top
+        } else {
+            above_top
+        };
 
         x = x.clamp(left, (right - width).max(left));
         y = y.clamp(top, (bottom - height).max(top));
