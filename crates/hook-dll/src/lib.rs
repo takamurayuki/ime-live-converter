@@ -108,11 +108,30 @@ fn start_uia_poller() {
                 Err(_) => return,
             };
 
+        let mut last_hwnd: isize = 0;
         loop {
+            let hwnd_fg = GetForegroundWindow();
+            let uia = uia_focused_anchor(&auto);
             // UIA でカーソルが取れなければ、クラシックコンソール(conhost)向けに
             // コンソールAPIでカーソル位置を取得する（PowerShell窓 等）。
-            let pos = uia_focused_anchor(&auto)
-                .or_else(|| console_caret_screen_pos(GetForegroundWindow()));
+            let pos = uia.or_else(|| console_caret_screen_pos(hwnd_fg));
+
+            // 診断: フォアグラウンド窓が変わったら、そのクラス名と取得結果をログ
+            let cur = hwnd_fg.0 as isize;
+            if cur != last_hwnd {
+                last_hwnd = cur;
+                let mut cls = [0u16; 128];
+                let n = windows::Win32::UI::WindowsAndMessaging::GetClassNameW(hwnd_fg, &mut cls);
+                let class = String::from_utf16_lossy(&cls[..n.max(0) as usize]);
+                debug_log!(
+                    "位置診断: fg class='{}' uia={} console={} pos={:?}",
+                    class,
+                    uia.is_some(),
+                    console_caret_screen_pos(hwnd_fg).is_some(),
+                    pos
+                );
+            }
+
             if let Ok(mut c) = UIA_ANCHOR.lock() {
                 *c = pos;
             }
