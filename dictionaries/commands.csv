@@ -1,0 +1,46 @@
+# コマンドモードの定番コマンド辞書
+#
+# 形式:  コマンド<TAB>簡易説明     （TAB 区切り。説明は省略可。# 行はコメント）
+# ここに書いたコマンドはコマンドモードの候補として最初から表示されます。
+# 実際にターミナルで実行したコマンドは自動で学習され、よく使うものほど上に出ます。
+# 追加・編集したら常駐を再起動してください（scripts/rebuild-and-run.ps1）。
+#
+# --- Git ---
+git status	変更状況を表示
+git add .	全変更をステージ
+git commit -m ""	メッセージ付きでコミット
+git push	リモートへ反映
+git pull	リモートから取得
+git log --oneline	履歴を1行で表示
+git diff	差分を表示
+git branch	ブランチ一覧
+git checkout -b 	新しいブランチを作成して切替
+git restore .	作業ツリーの変更を破棄
+git stash	変更を一時退避
+# --- Cargo / Rust ---
+cargo build --release	リリースビルド
+cargo test --workspace	全テスト実行
+cargo run --release	リリース実行
+cargo check	型チェックのみ（速い）
+cargo clippy	静的解析
+cargo fmt	コード整形
+# --- ファイル操作 (PowerShell) ---
+ls	ファイル一覧
+cd 	ディレクトリ移動
+cat 	ファイル内容を表示
+mkdir 	ディレクトリ作成
+rm 	ファイル削除
+cp 	コピー
+mv 	移動・改名
+pwd	現在のディレクトリ
+# --- このプロジェクト ---
+powershell -ExecutionPolicy Bypass -File scripts\rebuild-and-run.ps1	停止→ビルド→常駐起動
+Get-Process conversion-service | Stop-Process -Force	常駐IMEを停止
+# --- npm / Node ---
+npm install	依存をインストール
+npm run dev	開発サーバ起動
+npm run build	本番ビルド
+# --- Docker ---
+docker ps	起動中コンテナ一覧
+docker compose up -d	バックグラウンドで起動
+docker compose down	停止・削除
