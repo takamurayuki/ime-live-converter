@@ -156,6 +156,29 @@ enum Command {
     LoadDict(String),
 }
 
+/// 既に別インスタンスが起動しているか（名前付きミューテックスで判定）。
+/// 自インスタンスが所有者ならハンドルをプロセス寿命まで保持する。
+fn already_running() -> bool {
+    use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS};
+    use windows::Win32::System::Threading::CreateMutexW;
+    use windows::core::w;
+    unsafe {
+        match CreateMutexW(None, true, w!("Global\\ImeLiveConverterSingleInstance")) {
+            Ok(h) => {
+                if windows::Win32::Foundation::GetLastError() == ERROR_ALREADY_EXISTS {
+                    let _ = CloseHandle(h);
+                    true
+                } else {
+                    // 所有ハンドル h は CloseHandle しない限り開いたまま
+                    // （HANDLE は Copy で Drop を持たないため、放置でプロセス終了まで保持される）
+                    false
+                }
+            }
+            Err(_) => false,
+        }
+    }
+}
+
 fn main() -> Result<()> {
     // --debug: フック側のデバッグログ(IME_DEBUG_LOG)を確実に有効化する。
     //   DLL は同一プロセスの環境変数を読むので、ロード前にここで設定する。
@@ -170,6 +193,13 @@ fn main() -> Result<()> {
 
     println!("IME Live Converter を起動しています...");
     println!();
+
+    // 二重起動を防ぐ（2つ動くとフックが2回入力を注入し、二重入力・文字化けになる）。
+    // 名前付きミューテックスで単一インスタンスを保証する。
+    if already_running() {
+        eprintln!("既に IME Live Converter が起動しています。二重起動を防止しました。");
+        return Ok(());
+    }
 
     // DLLをロード
     let dll_path = find_dll_path()?;
