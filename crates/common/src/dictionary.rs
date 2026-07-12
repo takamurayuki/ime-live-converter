@@ -58,6 +58,24 @@ impl TrieNode {
         node.entries.push(entry);
     }
 
+    /// 読み＋表記が一致するエントリを削除する（単語登録の削除用）。消したら true。
+    pub fn remove(&mut self, reading: &str, surface: &str) -> bool {
+        let mut node = self;
+        for ch in reading.chars() {
+            match node.children.get_mut(&ch) {
+                Some(child) => node = child,
+                None => return false,
+            }
+        }
+        let before = node.entries.len();
+        node.entries.retain(|e| e.surface != surface);
+        let removed = node.entries.len() != before;
+        if node.entries.is_empty() {
+            node.is_end = false;
+        }
+        removed
+    }
+
     /// 読みで検索（完全一致）
     pub fn search(&self, reading: &str) -> Option<&Vec<WordEntry>> {
         let mut node = self;
@@ -72,6 +90,57 @@ impl TrieNode {
         } else {
             None
         }
+    }
+
+    /// あいまい検索: 編集距離 max_dist 以内の「実在する読み」をすべて返す。
+    /// 戻り値: (読み, 編集距離)。Trie の枝刈り付き Levenshtein DP なので、
+    /// 全語走査せず候補周辺だけを辿る（辞書全体でも十分速い）。
+    ///
+    /// 誤字補正で「存在しない読みを組み立てる」のを避けるために使う。
+    /// 実在語だけを候補に出せるので、一致率（1 - 距離/長さ）でランク付けできる。
+    pub fn fuzzy_search(&self, target: &str, max_dist: usize) -> Vec<(String, usize)> {
+        let chars: Vec<char> = target.chars().collect();
+        let n = chars.len();
+        // 初期行: 空プレフィックスに対する編集距離 0,1,2,...,n
+        let first_row: Vec<usize> = (0..=n).collect();
+        let mut results = Vec::new();
+        let mut prefix = String::new();
+        for (&ch, child) in &self.children {
+            child.fuzzy_walk(ch, &chars, &first_row, max_dist, &mut prefix, &mut results);
+        }
+        results
+    }
+
+    /// fuzzy_search の再帰ヘルパー（現在ノード＝文字 ch を消費した後の状態）。
+    fn fuzzy_walk(
+        &self,
+        ch: char,
+        chars: &[char],
+        prev_row: &[usize],
+        max_dist: usize,
+        prefix: &mut String,
+        results: &mut Vec<(String, usize)>,
+    ) {
+        let n = chars.len();
+        let mut cur = vec![0usize; n + 1];
+        cur[0] = prev_row[0] + 1;
+        for i in 1..=n {
+            let cost = if chars[i - 1] == ch { 0 } else { 1 };
+            cur[i] = (prev_row[i] + 1)
+                .min(cur[i - 1] + 1)
+                .min(prev_row[i - 1] + cost);
+        }
+        prefix.push(ch);
+        if self.is_end && cur[n] <= max_dist {
+            results.push((prefix.clone(), cur[n]));
+        }
+        // 行の最小値が max_dist を超えたら、この枝以降は絶対に距離内に入らない
+        if cur.iter().min().copied().unwrap_or(usize::MAX) <= max_dist {
+            for (&c, child) in &self.children {
+                child.fuzzy_walk(c, chars, &cur, max_dist, prefix, results);
+            }
+        }
+        prefix.pop();
     }
 
     /// プレフィックス検索（すべてのマッチを返す）
@@ -164,6 +233,11 @@ impl Dictionary {
         self.trie.insert(&reading, entry);
     }
 
+    /// 読み＋表記が一致する単語を削除する（単語登録の削除用）。消したら true。
+    pub fn remove_word(&mut self, reading: &str, surface: &str) -> bool {
+        self.trie.remove(reading, surface)
+    }
+
     /// 読みで単語を検索
     pub fn lookup(&self, reading: &str) -> Option<&Vec<WordEntry>> {
         self.trie.search(reading)
@@ -172,6 +246,11 @@ impl Dictionary {
     /// プレフィックス検索
     pub fn common_prefix_search(&self, text: &str) -> Vec<(usize, &Vec<WordEntry>)> {
         self.trie.common_prefix_search(text)
+    }
+
+    /// 編集距離 max_dist 以内の実在する読みを返す（(読み, 距離)）。
+    pub fn fuzzy_readings(&self, target: &str, max_dist: usize) -> Vec<(String, usize)> {
+        self.trie.fuzzy_search(target, max_dist)
     }
 }
 

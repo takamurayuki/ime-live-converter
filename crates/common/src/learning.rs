@@ -130,6 +130,39 @@ impl LearningRepository {
             [],
         )?;
 
+        // コマンド履歴テーブル（コマンドモード）
+        // ターミナルで実行したコマンド行を記録し、次回の前方一致補完に使う。
+        // description は commands.csv 由来の簡易説明（学習コマンドは空）。
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS command_history (
+                command TEXT PRIMARY KEY,
+                frequency INTEGER NOT NULL DEFAULT 1,
+                description TEXT NOT NULL DEFAULT '',
+                last_used_at TEXT NOT NULL DEFAULT ''
+            )",
+            [],
+        )?;
+
+        // エイリアステーブル（コマンドモード）
+        // alias を打つと expansion（実コマンド or スクリプトパス）を挿入する。
+        // is_script=1 はフォルダから選んだスクリプトファイル。
+        // auto_run=1 は Enter で即実行、0 は挿入のみ（git commit -m "" 等の編集用）。
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS command_alias (
+                alias TEXT PRIMARY KEY,
+                expansion TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                is_script INTEGER NOT NULL DEFAULT 0,
+                auto_run INTEGER NOT NULL DEFAULT 1
+            )",
+            [],
+        )?;
+        // 既存DBへの列追加（無ければ足す。あればエラーを無視）
+        let _ = self.conn.execute(
+            "ALTER TABLE command_alias ADD COLUMN auto_run INTEGER NOT NULL DEFAULT 1",
+            [],
+        );
+
         // インデックス作成
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_user_dict_reading ON user_dictionary(reading)",
@@ -275,6 +308,28 @@ impl LearningRepository {
         );
 
         Ok(result.unwrap_or(0))
+    }
+
+    /// 誤学習をリセットする: 指定した (reading, surface) の確定履歴を削除する。
+    ///
+    /// 候補一覧で Delete したとき、その変換の学習だけを消すために使う。読み全体
+    /// ではなく (reading, surface) の組だけを消すので、同じ読みの他の正しい学習は
+    /// 残る（app_name はまたいで全て消す）。あわせて、その表記が絡むバイグラム
+    /// （前後どちらでも）も消して誤変換の波及を断つ。履歴を消した行があれば true。
+    pub fn forget_commit(&self, reading: &str, surface: &str) -> Result<bool> {
+        if reading.is_empty() || surface.is_empty() {
+            return Ok(false);
+        }
+        let n = self.conn.execute(
+            "DELETE FROM conversion_history WHERE reading = ?1 AND surface = ?2",
+            params![reading, surface],
+        )?;
+        // この表記が絡むバイグラム（prev/next どちらでも）も消す
+        let _ = self.conn.execute(
+            "DELETE FROM word_bigram WHERE prev_surface = ?1 OR surface = ?1",
+            params![surface],
+        );
+        Ok(n > 0)
     }
 
     /// 全ユニグラム（読み→表記の頻度合計）を取得
@@ -463,6 +518,208 @@ impl LearningRepository {
         Ok(rows)
     }
 
+    // ============ コマンド履歴（コマンドモード） ============
+
+    /// 実行したコマンドを記録する（頻度+1）。既存の説明は保持する。
+    /// 短すぎる/空のコマンドは無視する（ノイズ防止）。
+    pub fn record_command(&self, command: &str) -> Result<()> {
+        let cmd = command.trim();
+        if cmd.chars().count() < 2 {
+            return Ok(());
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO command_history (command, frequency, description, last_used_at)
+             VALUES (?1, 1, '', ?2)
+             ON CONFLICT(command) DO UPDATE SET
+                frequency = frequency + 1,
+                last_used_at = ?2",
+            params![cmd, now],
+        )?;
+        Ok(())
+    }
+
+    /// commands.csv 由来の定番コマンドと説明を登録する（頻度は増やさない）。
+    /// 既に履歴にある場合は説明だけ更新し、頻度はそのまま。
+    pub fn seed_command(&self, command: &str, description: &str) -> Result<()> {
+        let cmd = command.trim();
+        if cmd.is_empty() {
+            return Ok(());
+        }
+        self.conn.execute(
+            "INSERT INTO command_history (command, frequency, description, last_used_at)
+             VALUES (?1, 0, ?2, '')
+             ON CONFLICT(command) DO UPDATE SET description = ?2",
+            params![cmd, description.trim()],
+        )?;
+        Ok(())
+    }
+
+    /// 前方一致でコマンド候補を返す（頻度順、次に短い順）。
+    /// 戻り値: (command, description, frequency)。
+    /// prefix と完全一致する行は補完にならないため除外する。
+    pub fn predict_command(&self, prefix: &str, limit: usize) -> Result<Vec<(String, String, u32)>> {
+        if prefix.is_empty() {
+            return Ok(Vec::new());
+        }
+        let escaped = prefix.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        let pattern = format!("{}%", escaped);
+        let mut stmt = self.conn.prepare(
+            "SELECT command, description, frequency FROM command_history
+             WHERE command LIKE ?1 ESCAPE '\\' AND command <> ?2
+             ORDER BY frequency DESC, length(command) ASC
+             LIMIT ?3",
+        )?;
+        let rows = stmt
+            .query_map(params![pattern, prefix, limit as i64], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, u32>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// 登録済みコマンドを全件返す（command, description, frequency）。設定画面用。
+    /// 作成順（rowid 昇順）で返す。
+    pub fn all_commands(&self) -> Result<Vec<(String, String, u32)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT command, description, frequency FROM command_history
+             ORDER BY rowid ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, u32>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// コマンドの説明を登録/更新する（無ければ freq0 で作成、有れば説明のみ更新）。
+    pub fn upsert_command(&self, command: &str, description: &str) -> Result<()> {
+        let c = command.trim();
+        if c.is_empty() {
+            return Ok(());
+        }
+        self.conn.execute(
+            "INSERT INTO command_history (command, frequency, description, last_used_at)
+             VALUES (?1, 0, ?2, '')
+             ON CONFLICT(command) DO UPDATE SET description = ?2",
+            params![c, description.trim()],
+        )?;
+        Ok(())
+    }
+
+    /// コマンドを削除する。
+    pub fn delete_command(&self, command: &str) -> Result<bool> {
+        let rows = self.conn.execute(
+            "DELETE FROM command_history WHERE command = ?1",
+            params![command.trim()],
+        )?;
+        Ok(rows > 0)
+    }
+
+    // ============ エイリアス（コマンドモード） ============
+
+    /// エイリアスを登録/更新する。alias を打つと expansion が挿入される。
+    /// auto_run=true は Enter で即実行、false は挿入のみ（編集してから実行）。
+    pub fn add_alias(
+        &self,
+        alias: &str,
+        expansion: &str,
+        description: &str,
+        is_script: bool,
+        auto_run: bool,
+    ) -> Result<()> {
+        let a = alias.trim();
+        let e = expansion.trim();
+        if a.is_empty() || e.is_empty() {
+            return Ok(());
+        }
+        self.conn.execute(
+            "INSERT INTO command_alias (alias, expansion, description, is_script, auto_run)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(alias) DO UPDATE SET
+                expansion = ?2, description = ?3, is_script = ?4, auto_run = ?5",
+            params![a, e, description.trim(), is_script as i64, auto_run as i64],
+        )?;
+        Ok(())
+    }
+
+    /// エイリアスの auto_run（Enterで即実行するか）だけを更新する。
+    pub fn set_alias_auto_run(&self, alias: &str, auto_run: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE command_alias SET auto_run = ?2 WHERE alias = ?1",
+            params![alias.trim(), auto_run as i64],
+        )?;
+        Ok(())
+    }
+
+    /// エイリアスを削除する。
+    pub fn delete_alias(&self, alias: &str) -> Result<bool> {
+        let rows = self
+            .conn
+            .execute("DELETE FROM command_alias WHERE alias = ?1", params![alias.trim()])?;
+        Ok(rows > 0)
+    }
+
+    /// 全エイリアスを返す（alias, expansion, description, is_script, auto_run）。設定画面用。
+    /// 作成順（rowid 昇順）で返す。
+    pub fn all_aliases(&self) -> Result<Vec<(String, String, String, bool, bool)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT alias, expansion, description, is_script, auto_run
+             FROM command_alias ORDER BY rowid ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)? != 0,
+                    r.get::<_, i64>(4)? != 0,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// 前方一致でエイリアスを返す（alias, expansion, description, auto_run）。候補用。
+    pub fn predict_alias(
+        &self,
+        prefix: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, String, String, bool)>> {
+        if prefix.is_empty() {
+            return Ok(Vec::new());
+        }
+        let escaped = prefix.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        let pattern = format!("{}%", escaped);
+        let mut stmt = self.conn.prepare(
+            "SELECT alias, expansion, description, auto_run FROM command_alias
+             WHERE alias LIKE ?1 ESCAPE '\\'
+             ORDER BY length(alias) ASC, alias ASC
+             LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![pattern, limit as i64], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)? != 0,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// 読みの変換履歴を取得（頻度順）
     pub fn find_history(&self, reading: &str) -> Result<Vec<ConversionHistoryEntry>> {
         let mut stmt = self.conn.prepare(
@@ -538,6 +795,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_alias_roundtrip() -> Result<()> {
+        let repo = LearningRepository::in_memory()?;
+        repo.add_alias("gs", "git status", "変更状況", false, true)?;
+        repo.add_alias("gc", "git commit -m \"\"", "コミット", false, false)?;
+        // 前方一致で出る
+        let hits = repo.predict_alias("gs", 5)?;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, "gs");
+        assert_eq!(hits[0].1, "git status");
+        assert!(hits[0].3, "gs は即実行");
+        // 編集用は auto_run=false
+        let hits = repo.predict_alias("gc", 5)?;
+        assert!(!hits[0].3, "gc は挿入のみ");
+        // 更新（同じ alias）
+        repo.add_alias("gs", "git switch", "ブランチ切替", false, true)?;
+        let hits = repo.predict_alias("gs", 5)?;
+        assert_eq!(hits[0].1, "git switch");
+        // 一覧
+        assert_eq!(repo.all_aliases()?.len(), 2);
+        // 削除
+        assert!(repo.delete_alias("gs")?);
+        assert!(repo.predict_alias("gs", 5)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn test_user_dictionary() -> Result<()> {
         let repo = LearningRepository::in_memory()?;
 
@@ -576,6 +859,26 @@ mod tests {
         assert_eq!(history.len(), 1); // ユニークなエントリは1つ
         assert_eq!(history[0].frequency, 3); // 頻度は3
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_forget_commit_resets_learning() -> Result<()> {
+        let repo = LearningRepository::in_memory()?;
+        // 同じ読みに2つの表記を学習（「けん」→県/件）
+        for _ in 0..5 { repo.record_commit("けん", "県", None)?; }
+        repo.record_commit("けん", "件", None)?;
+        assert_eq!(repo.find_frequency("けん", "県")?, 5);
+        assert_eq!(repo.find_frequency("けん", "件")?, 1);
+
+        // 誤学習「県」だけをリセット
+        let removed = repo.forget_commit("けん", "県")?;
+        assert!(removed);
+        assert_eq!(repo.find_frequency("けん", "県")?, 0); // 消えた
+        assert_eq!(repo.find_frequency("けん", "件")?, 1); // 他は残る
+
+        // 存在しない組は false
+        assert!(!repo.forget_commit("けん", "県")?);
         Ok(())
     }
 
