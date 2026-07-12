@@ -11,4 +11,3 @@ flate2 = "1.0"
 anyhow = "1.0"
 rusqlite = { version = "0.31", features = ["bundled"] }
 chrono = "0.4"
-ureq = { version = "2.10", default-features = false, features = ["json"] }

@@ -4,5 +4,3 @@ ime-learning.db
 hook_debug.log
 # IPA辞書から生成されるバイナリ辞書（README の手順で再生成可能）
 dictionaries/system.dic
-# 環境固有のLLM設定（.env.example をコピーして使う）
-.env

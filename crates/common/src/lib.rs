@@ -7,7 +7,6 @@ pub mod typo;
 pub mod converter;
 pub mod learning;
 pub mod rerank;
-pub mod llm;
 
 pub use dictionary::{Dictionary, WordEntry, TrieNode, ConnectionMatrix, CharCategory, PosId};
 pub use viterbi::{ViterbiConverter, LiveConversionContext, Lattice, LatticeNode, IncrementalViterbi};
@@ -17,7 +16,6 @@ pub use typo::{TypoCorrector, TypoCandidate};
 pub use converter::{LiveConverter, ConversionResult};
 pub use learning::{LearningRepository, UserDictEntry, ConversionHistoryEntry};
 pub use rerank::{CandidateReranker, NoopReranker};
-pub use llm::{llm_convert, llm_convert_with, llm_correct, llm_rerank, warm_up, LlmBackend, LlmConfig, OllamaBackend};
 
 use std::collections::HashMap;
 
