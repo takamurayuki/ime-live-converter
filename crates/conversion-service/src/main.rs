@@ -21,6 +21,7 @@ type UninstallHookFn = extern "C" fn() -> bool;
 type LoadDictionaryFn = extern "C" fn(*const u8, usize) -> bool;
 type SetEnabledFn = extern "C" fn(bool);
 type IsEnabledFn = extern "C" fn() -> bool;
+type TryHandleDialogMessageFn = extern "C" fn(*const MSG) -> bool;
 
 /// DLLハンドラ
 struct HookDll {
@@ -31,6 +32,7 @@ struct HookDll {
     load_dictionary: LoadDictionaryFn,
     set_enabled: SetEnabledFn,
     is_enabled: IsEnabledFn,
+    try_handle_dialog_message: TryHandleDialogMessageFn,
 }
 
 impl HookDll {
@@ -69,6 +71,11 @@ impl HookDll {
                     .ok_or_else(|| anyhow::anyhow!("is_enabled関数が見つかりません"))?
             );
 
+            let try_handle_dialog_message = std::mem::transmute::<_, TryHandleDialogMessageFn>(
+                GetProcAddress(module, windows::core::s!("try_handle_dialog_message"))
+                    .ok_or_else(|| anyhow::anyhow!("try_handle_dialog_message関数が見つかりません"))?
+            );
+
             Ok(Self {
                 module,
                 install_hook,
@@ -76,6 +83,7 @@ impl HookDll {
                 load_dictionary,
                 set_enabled,
                 is_enabled,
+                try_handle_dialog_message,
             })
         }
     }
@@ -103,6 +111,14 @@ impl HookDll {
     /// 有効かどうかを取得
     fn is_enabled(&self) -> bool {
         (self.is_enabled)()
+    }
+
+    /// 自前の設定系ウィンドウ（単語登録・コマンド設定）宛のメッセージなら
+    /// 処理する。true が返ったら呼び出し側は TranslateMessage/DispatchMessage
+    /// を呼んではいけない（Tabでのコントロール間移動等、ダイアログ標準の
+    /// キー操作を有効にするために必要）。
+    fn try_handle_dialog_message(&self, msg: &MSG) -> bool {
+        (self.try_handle_dialog_message)(msg as *const MSG)
     }
 }
 
@@ -304,6 +320,9 @@ fn main() -> Result<()> {
                 if msg.message == WM_QUIT {
                     running.store(false, Ordering::Relaxed);
                     break;
+                }
+                if dll.try_handle_dialog_message(&msg) {
+                    continue;
                 }
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);

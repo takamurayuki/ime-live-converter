@@ -14,9 +14,9 @@ use windows::Win32::{
         SendMessageW, SetWindowPos, SetWindowsHookExW, ShowWindow, UnhookWindowsHookEx,
         GUITHREADINFO, HHOOK, HWND_NOTOPMOST, HWND_TOPMOST, KBDLLHOOKSTRUCT, LLKHF_INJECTED, SM_CXSCREEN,
         SM_CYSCREEN, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-        SWP_SHOWWINDOW, SW_HIDE, WINDOWS_HOOK_ID, WM_IME_CONTROL, WM_KEYDOWN, WM_LBUTTONDOWN,
-        WM_NOTIFY, WM_PAINT, WM_SYSKEYDOWN, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-        WS_EX_TOPMOST, WS_POPUP,
+        SWP_SHOWWINDOW, SW_HIDE, WINDOWS_HOOK_ID, WM_IME_CONTROL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
+        WM_NOTIFY, WM_PAINT, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+        WS_EX_TOPMOST, WS_POPUP, MSG,
     },
     UI::Input::KeyboardAndMouse::{
         SendInput, INPUT, INPUT_KEYBOARD, KEYBDINPUT, INPUT_0,
@@ -129,6 +129,12 @@ pub extern "C" fn install_hook() -> bool {
         }
         IS_ENABLED = true;
         OUR_ACTIVE = false;
+        // Shift追跡（SHIFT_HELD）の初期値をここでだけ実時間状態から拾う。
+        // 以降はフック自身がkeydown/keyupを観測して更新するのでレースが無い。
+        {
+            use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+            hook::SHIFT_HELD = GetAsyncKeyState(VK_SHIFT.0 as i32) < 0;
+        }
 
         // 入力欄の位置を追う UI Automation ポーラーを開始（ポップアップ位置用）
         start_uia_poller();
@@ -257,4 +263,18 @@ pub extern "C" fn set_enabled(enabled: bool) {
 #[no_mangle]
 pub extern "C" fn is_enabled() -> bool {
     unsafe { IS_ENABLED }
+}
+
+/// 自前の設定系ウィンドウ（単語登録・コマンド設定）宛のメッセージなら
+/// IsDialogMessage で処理し、処理済みなら true を返す。ホストのメッセージ
+/// ループから、TranslateMessage/DispatchMessage の前に毎回呼んでもらう
+/// 想定（true が返ったらそちらは呼ばない）。これが無いと、Tab での
+/// コントロール間移動などダイアログ標準のキー操作がカスタムウィンドウ
+/// では効かない。
+#[no_mangle]
+pub extern "C" fn try_handle_dialog_message(msg: *const MSG) -> bool {
+    if msg.is_null() {
+        return false;
+    }
+    unsafe { settings_ui::try_handle_dialog_message(&*msg) }
 }

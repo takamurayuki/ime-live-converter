@@ -71,6 +71,34 @@ pub(crate) fn start_uia_poller() {
                 last_terminal_hwnd = fg_now;
             }
 
+            // コマンド候補モーダルを表示中、それを出した張本人のターミナル窓が
+            // （Xボタン・Alt+F4・taskkill 等で）閉じられていないか確認する。
+            // 閉じられていたら、次の打鍵を待たずにモーダルを閉じる（そうしないと
+            // 誰も所有していない浮遊ウィンドウとして残ってしまう）。
+            if last_terminal_hwnd != 0 {
+                let cm_visible = CANDIDATE_UI
+                    .lock()
+                    .map(|ui| ui.visible && ui.command_mode)
+                    .unwrap_or(false);
+                if cm_visible {
+                    let still_exists = windows::Win32::UI::WindowsAndMessaging::IsWindow(
+                        HWND(last_terminal_hwnd as *mut core::ffi::c_void),
+                    )
+                    .as_bool();
+                    if !still_exists {
+                        if let Some(hwnd) = CANDIDATE_HWND {
+                            let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                                hwnd,
+                                WM_APP_TERMINAL_CLOSED,
+                                WPARAM(0),
+                                LPARAM(0),
+                            );
+                        }
+                        last_terminal_hwnd = 0;
+                    }
+                }
+            }
+
             // 入力欄の位置が必要なのは「変換中(OUR_ACTIVE)」か「候補/コマンドの
             // ポップアップ表示中」だけ。アイドル時に UIA(キャレット) や AttachConsole を
             // 毎回叩くと、対象アプリのカーソル点滅が乱れるため、不要時は休む。

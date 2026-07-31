@@ -103,7 +103,7 @@ impl ViterbiConverter {
             // 300: 「きょうは→教は」のような僅差(88)の誤選択は覆せて、
             // かつ 私・雨 のような一般的な1文字漢字がカタカナ/未知語に
             // 負けない値。大きくすると 雨→アメ 等の副作用が出る。
-            single_kanji_penalty: 300,
+            single_kanji_penalty: 400,
             learned_unigram: HashMap::new(),
             learned_bigram: HashMap::new(),
             learned_assoc: HashMap::new(),
@@ -147,6 +147,11 @@ impl ViterbiConverter {
         // 主目的なので「誤字」を優先する（時間は文脈/学習で選び直せる）。
         self.learned_unigram
             .insert(("ごじ".to_string(), "誤字".to_string()), 4000);
+        // 「空い」（空く の音便形）は「漉い・鋤い・梳い・抄い・透い」等の
+        // 稀な同音動詞より辞書コストが高く負けやすいが、実際は
+        // 「お腹/電車が空いている」のように圧倒的に高頻度な語なので優先する。
+        self.learned_unigram
+            .insert(("すい".to_string(), "空い".to_string()), 2500);
 
         // 既定でひらがな優先にする読み。漢字表記(慕い)が稀で、ひらがな
         // (助動詞「〜したい」)の方が圧倒的に多い。ユーザーが Esc で戻さ
@@ -273,10 +278,17 @@ impl ViterbiConverter {
                 if alt.surface == cur.surface {
                     continue;
                 }
-                // 文中の他の内容語との連想スコア（前後両方向）
+                // 文中の他の内容語との連想スコア（前後両方向）。
+                // ただし直前・直後（間に助詞すら挟まない隣接語）は対象外。
+                // 連想学習は本来「駅の汽車／新聞の記者」のように助詞を挟んで
+                // 離れた内容語どうしの結びつきを見るための仕組みで、隣接する
+                // 語どうしの相性は通常の接続コストが既に見ている。ここで
+                // 隣接語まで対象にすると、「際」×「起動」のように別の文脈で
+                // 強く学習された連想が、隣接して「際起動」のような複合語に
+                // 誤読される形で1-bestを上書きしてしまうことがある。
                 let mut assoc = 0i32;
                 for (j, w) in &content {
-                    if *j == i {
+                    if *j == i || j.abs_diff(i) == 1 {
                         continue;
                     }
                     assoc += self
@@ -326,6 +338,11 @@ impl ViterbiConverter {
     ///  1. 取り違えやすいかな置換／1文字削除・小書き挿入の1編集変種（実在語のみ採用）
     ///  2. 辞書のあいまい検索（Trie上の Levenshtein、距離2まで）で見つかる実在読み
     /// 例: きづついて→傷ついて、がっこ→学校、わたしわ 単体→私は。
+    ///
+    /// 候補が複数（同じ編集距離）ある場合は、前後の確定済み文節との
+    /// 学習済みバイグラム／内容語連想（`learned_bigram`/`learned_assoc`）で
+    /// 文脈に合う方を選ぶ。誤字の直後に続けて正しく入力された内容（右文脈）
+    /// も使えるため、「打ち直し」なしに後から誤字だけ直る場合がある。
     pub fn fuzzy_suggest(&self, reading: &str) -> Option<(String, String)> {
         let total_n = reading.chars().count();
         if total_n < 2 || total_n > 32 {
@@ -333,15 +350,21 @@ impl ViterbiConverter {
         }
         let segments = self.convert_context_aware(reading);
 
-        // 変換に失敗した文節（未知語 / カタカナ・フォールバック）を連続でまとめ、
+        // 変換に失敗した文節（未知語 / カタカナ・フォールバック）に加え、
+        // 辞書上は成功していても1文字あたりのコストが極端に高い希少な
+        // 内容語（`is_implausible_content_word`）も対象に含めて連続でまとめ、
         // グループごとに (開始文節index, 終了index排他, 読み) を得る。
+        // 断片それぞれは辞書に実在するため`is_failed_segment`だけでは
+        // 拾えない、全体として意味を成さない誤変換（例:「せんせに」→
+        // 「線」+「セ」+「に」）を補正候補の探索対象にするため。
+        let is_target = |e: &WordEntry| is_failed_segment(e) || is_implausible_content_word(e);
         let mut groups: Vec<(usize, usize, String)> = Vec::new();
         let mut i = 0;
         while i < segments.len() {
-            if is_failed_segment(&segments[i]) {
+            if is_target(&segments[i]) {
                 let start = i;
                 let mut r = String::new();
-                while i < segments.len() && is_failed_segment(&segments[i]) {
+                while i < segments.len() && is_target(&segments[i]) {
                     r.push_str(&segments[i].reading);
                     i += 1;
                 }
@@ -356,7 +379,19 @@ impl ViterbiConverter {
             .into_iter()
             .filter(|(_, _, r)| r.chars().count() >= 2)
             .next_back()?;
-        let corrected = self.best_word_correction(&target)?;
+
+        // 前後の確定済み文節（左文脈・右文脈）を文脈ボーナスの手がかりにする。
+        let prev_surface = (gs > 0).then(|| segments[gs - 1].surface.as_str());
+        let next_surface = (ge < segments.len()).then(|| segments[ge].surface.as_str());
+        let context_words: Vec<String> = segments
+            .iter()
+            .enumerate()
+            .filter(|(idx, e)| !(gs..ge).contains(idx) && is_content_pos(&e.pos) && e.surface != e.reading)
+            .map(|(_, e)| e.surface.clone())
+            .collect();
+
+        let corrected =
+            self.best_word_correction(&target, prev_surface, next_surface, &context_words)?;
 
         // 全体の読みを組み立て直し（対象グループだけ差し替え）
         let mut new_reading = String::new();
@@ -384,11 +419,21 @@ impl ViterbiConverter {
     /// 候補: (1) 取り違えやすいかなの1編集変種、(2) 辞書Trieの距離1あいまい検索。
     /// 採用条件は「変換すると失敗文節（未知語/カタカナ化）が残らず、実在の
     /// 辞書語（漢字/カタカナ）で構成される」こと。＝存在しない語を組み立てない。
-    /// 編集距離が最小、次に変換コストが最小のものを選ぶ。
+    /// さらに `is_plausible_correction_cost` で1文字あたりコストが妥当な
+    /// 範囲かも見る（実在はするが希少な当て字・造語まで通さないため）。
+    /// 編集距離が最小、次に前後の文脈ボーナスを引いた実効コストが最小のものを選ぶ。
     ///
     /// 性能: 毎打鍵でフックスレッドから呼ばれるため軽さが最優先。Trie検索は
     /// 距離1のみ（距離2は辞書全体で 100ms超になりフックが無視され生キーが漏れる）。
-    fn best_word_correction(&self, word: &str) -> Option<String> {
+    /// 文脈ボーナスも候補ごとに文全体を再変換せず、学習済みマップの参照のみ
+    /// （O(1)）で済ませ、この制約に影響しないようにしている。
+    fn best_word_correction(
+        &self,
+        word: &str,
+        prev_surface: Option<&str>,
+        next_surface: Option<&str>,
+        context_words: &[String],
+    ) -> Option<String> {
         let n = word.chars().count();
         if !(2..=16).contains(&n) {
             return None;
@@ -408,7 +453,8 @@ impl ViterbiConverter {
         cands.sort();
         cands.dedup();
 
-        // 距離が小さいほど、次にコストが低いほど良い。
+        // 距離が小さいほど、次に実効コスト（変換コスト − 文脈ボーナス）が
+        // 低いほど良い。
         let mut best: Option<(String, usize, i32)> = None;
         for (v, dist) in cands {
             let (path, cost) = self.convert_with_cost(&v);
@@ -426,15 +472,65 @@ impl ViterbiConverter {
             if !has_real {
                 continue;
             }
+            let bonus = self.context_bonus(&path, prev_surface, next_surface, context_words);
+            let net_cost = cost.saturating_sub(bonus);
+            // 実在チェックだけでは希少な当て字・造語まで通ってしまうため、
+            // 1文字あたりコストの妥当性ゲートも課す（is_plausible_correction_cost）。
+            if !is_plausible_correction_cost(net_cost, v.chars().count()) {
+                continue;
+            }
             let better = match &best {
                 None => true,
-                Some((_, bd, bc)) => dist < *bd || (dist == *bd && cost < *bc),
+                Some((_, bd, bc)) => dist < *bd || (dist == *bd && net_cost < *bc),
             };
             if better {
-                best = Some((v, dist, cost));
+                best = Some((v, dist, net_cost));
             }
         }
         best.map(|(v, _, _)| v)
+    }
+
+    /// 誤字補正候補が前後の文脈（左＝直前の確定文節、右＝直後に続けて
+    /// 入力済みの文節、その他の内容語）とどれだけ馴染むかをボーナスで返す。
+    /// 学習済み `learned_bigram`/`learned_assoc` の参照のみで計算する
+    /// （文全体の再変換はしない軽量な近似）。
+    fn context_bonus(
+        &self,
+        path: &[WordEntry],
+        prev_surface: Option<&str>,
+        next_surface: Option<&str>,
+        context_words: &[String],
+    ) -> i32 {
+        let mut bonus = 0i32;
+        if let (Some(prev), Some(first)) = (prev_surface, path.first()) {
+            bonus += self
+                .learned_bigram
+                .get(&(prev.to_string(), first.surface.clone()))
+                .copied()
+                .unwrap_or(0);
+        }
+        if let (Some(next), Some(last)) = (next_surface, path.last()) {
+            bonus += self
+                .learned_bigram
+                .get(&(last.surface.clone(), next.to_string()))
+                .copied()
+                .unwrap_or(0);
+        }
+        for e in path.iter().filter(|e| is_content_pos(&e.pos) && e.surface != e.reading) {
+            for w in context_words {
+                bonus += self
+                    .learned_assoc
+                    .get(&(w.clone(), e.surface.clone()))
+                    .copied()
+                    .unwrap_or(0);
+                bonus += self
+                    .learned_assoc
+                    .get(&(e.surface.clone(), w.clone()))
+                    .copied()
+                    .unwrap_or(0);
+            }
+        }
+        bonus
     }
 
     /// 読みが「失敗文節を残さず綺麗に変換できる」なら (表記, 総コスト) を返す。
@@ -462,7 +558,7 @@ impl ViterbiConverter {
             .get(&(e.reading.clone(), e.surface.clone()))
             .copied()
             .unwrap_or(0);
-        (e.cost as i32).saturating_add(pen).saturating_sub(bonus)
+        (e.cost as i32).saturating_add(pen).saturating_sub(bonus).max(0)
     }
 
     /// ひらがな文字列を最適な単語列に変換
@@ -533,7 +629,7 @@ impl ViterbiConverter {
                         let idx = lattice.nodes.len() - 1;
                         // 1文字漢字の単独語 / カタカナ固有名詞 / 記号には実効コストを上乗せ
                         let penalty = single_kanji_penalty(&entry.surface, self.single_kanji_penalty)
-                            + katakana_proper_noun_penalty(&entry.surface, &entry.pos)
+                            + proper_noun_penalty(&entry.surface, &entry.pos)
                             + symbol_penalty(&entry.surface, &entry.pos);
                         // 学習したユニグラムはコストを減額（優先度を上げる）
                         let bonus = self
@@ -542,10 +638,17 @@ impl ViterbiConverter {
                             .copied()
                             .unwrap_or(0);
                         if penalty != 0 || bonus != 0 {
+                            // ボーナスでコストを負にはしない。負コストは「使うほど得」に
+                            // なってしまい、無関係な文脈で学習した短い語が、その語とは
+                            // 関係ない後続語のコストまで一方的に相殺できてしまう
+                            // （例: 「効果」を単独でよく使い学習しても、その学習が
+                            //  「こうかい」→「効果位」のような無関係な誤分割を後押しして
+                            //  しまってはならない）。
                             lattice.nodes[idx].word_cost = lattice.nodes[idx]
                                 .word_cost
                                 .saturating_add(penalty)
-                                .saturating_sub(bonus);
+                                .saturating_sub(bonus)
+                                .max(0);
                         }
                     }
                 }
@@ -724,17 +827,106 @@ impl ViterbiConverter {
                         current_node.left_id,
                     ) as i32;
 
-                    // 学習したバイグラム（語のつながり）は接続コストを減額
-                    if use_bigram {
-                        if let (Some(pe), Some(ce)) = (&prev_node.entry, &current_node.entry) {
+                    let mut bigram_bonus = 0i32;
+                    if let (Some(pe), Some(ce)) = (&prev_node.entry, &current_node.entry) {
+                        // 学習したバイグラム（語のつながり）は接続コストを減額
+                        if use_bigram {
                             if let Some(bonus) = self
                                 .learned_bigram
                                 .get(&(pe.surface.clone(), ce.surface.clone()))
                             {
-                                conn_cost = conn_cost.saturating_sub(*bonus);
+                                bigram_bonus = *bonus;
+                                conn_cost = conn_cost.saturating_sub(bigram_bonus);
                             }
                         }
+                        // カタカナ語+単独の接尾辞漢字という不自然な組み合わせは
+                        // 接続コストを上乗せする（例外は語・人・製 等の外来語に
+                        // 実際に付く接尾辞のみ）
+                        conn_cost = conn_cost
+                            .saturating_add(katakana_kanji_suffix_penalty(pe, ce));
+                        // 形容詞の終止形（〜い）に「て」が直接続くのは文法的に
+                        // 常に誤り（正しくは連用形〜くて）なので無条件でペナルティ
+                        conn_cost = conn_cost
+                            .saturating_add(adjective_terminal_then_te_penalty(pe, ce));
                     }
+                    // 1文字漢字が絡む不自然な接続コスト（学習バイグラム込み）には
+                    // 下限を設ける。ただし学習ボーナスでどちらかの単語コストが
+                    // 不自然に下がっている場合のみ（「英語」等、IPA辞書自体が
+                    // 正当に認識している複合語まで壊さないため）。文末（EOS）
+                    // への接続も対象に含めるため、どちらかが BOS/EOS
+                    // （entry なし）でも呼び出す。
+                    let bonus_of = |e: Option<&WordEntry>| -> i32 {
+                        e.and_then(|w| {
+                            self.learned_unigram.get(&(w.reading.clone(), w.surface.clone()))
+                        })
+                        .copied()
+                        .unwrap_or(0)
+                    };
+                    conn_cost = clamp_single_kanji_pair_conn_cost(
+                        prev_node.entry.as_ref(),
+                        current_node.entry.as_ref(),
+                        bonus_of(prev_node.entry.as_ref()),
+                        bonus_of(current_node.entry.as_ref()),
+                        conn_cost,
+                    );
+                    // 「1文字漢字＋1文字漢字の非自立名詞」で文が終わる場合にも
+                    // 下限を設ける（祖先ノードも1文字漢字の場合のみ。祖先ノードは
+                    // 既に確定済みなので参照できる）。
+                    let grandparent_entry = prev_node
+                        .prev_node
+                        .and_then(|gp_idx| lattice.nodes[gp_idx].entry.as_ref());
+                    conn_cost = single_kanji_bound_noun_phrase_end_conn_cost(
+                        prev_node.entry.as_ref(),
+                        grandparent_entry,
+                        bonus_of(prev_node.entry.as_ref()),
+                        bonus_of(grandparent_entry),
+                        conn_cost,
+                    );
+                    // 学習ボーナスの乗った1文字漢字の非自立名詞が、助詞等を
+                    // 挟まず直接別の内容語に続く場合にも下限を設ける
+                    // （例: 「際」+「起動」で「再起動」が押しのけられるのを防ぐ）。
+                    conn_cost = single_kanji_bound_noun_then_content_word_conn_cost(
+                        prev_node.entry.as_ref(),
+                        current_node.entry.as_ref(),
+                        bonus_of(prev_node.entry.as_ref()),
+                        conn_cost,
+                    );
+                    // 学習ボーナスの乗った1文字漢字の形容詞語幹（「多い」でなく
+                    // 「多」単体 等）が、助詞を挟まず直接別の内容語に続く場合にも
+                    // 下限を設ける（例:「おお」+「さか」で「大阪」が
+                    // 押しのけられるのを防ぐ）。
+                    conn_cost = bonused_adjective_stem_then_content_word_conn_cost(
+                        prev_node.entry.as_ref(),
+                        bonus_of(prev_node.entry.as_ref()),
+                        conn_cost,
+                    );
+                    // フィラーの直後に学習ボーナスの乗った語が続く場合にも
+                    // 下限を設ける
+                    conn_cost = filler_then_bonused_word_conn_cost(
+                        prev_node.entry.as_ref(),
+                        bonus_of(current_node.entry.as_ref()),
+                        conn_cost,
+                    );
+                    // 学習（ユニグラム・バイグラム）が乗った活用語が、極端に
+                    // 安い活用接続（形容詞連用形+ない 等）を通じて無関係な
+                    // 同音異義語を押しのける場合にも下限を設ける
+                    // （例:「酸く」+「ない」で「少ない」が押しのけられるのを防ぐ）。
+                    conn_cost = bonused_adjective_inflection_conn_floor(
+                        prev_node.entry.as_ref(),
+                        current_node.entry.as_ref(),
+                        bonus_of(prev_node.entry.as_ref()),
+                        bigram_bonus,
+                        conn_cost,
+                    );
+                    // 学習ボーナスの乗った語が接頭詞（お・ご 等）に直接続く
+                    // 場合にも下限を設ける
+                    // （例:「お」+「中」で「お腹」が押しのけられるのを防ぐ）。
+                    conn_cost = bonused_word_after_prefix_conn_floor(
+                        prev_node.entry.as_ref(),
+                        bonus_of(current_node.entry.as_ref()),
+                        bigram_bonus,
+                        conn_cost,
+                    );
 
                     // 総コスト = 前のノードまでのコスト + 連接コスト + 単語コスト
                     let total = prev_node.total_cost

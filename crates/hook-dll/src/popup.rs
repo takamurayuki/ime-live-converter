@@ -53,6 +53,10 @@ pub(crate) const MODE_FLASH_TIMER_ID: usize = 2;
 /// UIAポーラー→フックスレッドへの通知: カーソル（フォーカス）がターミナルへ
 /// 戻ったので、打鍵を待たずにコマンド候補モーダルを再表示する（WM_APP+1）。
 pub(crate) const WM_APP_RESHOW_COMMAND: u32 = 0x8000 + 1;
+/// UIAポーラー→フックスレッドへの通知: コマンド候補モーダルを表示していた
+/// ターミナル窓が閉じられた（破棄された）ので、打鍵を待たずにモーダルを
+/// 閉じる（WM_APP+2）。
+pub(crate) const WM_APP_TERMINAL_CLOSED: u32 = 0x8000 + 2;
 
 pub(crate) extern "system" fn candidate_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -92,6 +96,16 @@ pub(crate) extern "system" fn candidate_wndproc(hwnd: HWND, msg: u32, wparam: WP
                     }
                 }
             }
+            LRESULT(0)
+        }
+        // UIAポーラーからの通知: コマンド候補モーダルを出していたターミナル窓が
+        // 閉じられた。持ち主が消えたコマンド行はもう意味が無いので、破棄して
+        // モーダルを閉じる（Escでの取消と同じ扱い）。
+        WM_APP_TERMINAL_CLOSED => {
+            if let Ok(mut b) = COMMAND_LINE.lock() {
+                b.clear();
+            }
+            hide_candidate_window();
             LRESULT(0)
         }
         // Z順が変更されるたびに「最前面(HWND_TOPMOST)」を強制し、他ウィンドウに

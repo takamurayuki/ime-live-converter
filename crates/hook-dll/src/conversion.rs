@@ -182,6 +182,12 @@ impl LiveConversionState {
         if reading.is_empty() || surface.is_empty() {
             return false;
         }
+        // 読みが漢字/カタカナ等（＝読みと表記を入力欄で取り違えた等）だと、
+        // その読みで打っても一致しない死んだエントリになる。読みは常に
+        // ひらがなである契約なので、そうでなければ登録を拒否する。
+        if !is_hiragana_reading(&reading) {
+            return false;
+        }
         if let Some(learning) = self.learning.as_ref() {
             if learning
                 .add_user_word(&reading, &surface, Some(USER_WORD_POS), USER_WORD_COST as i32)
@@ -266,10 +272,9 @@ impl LiveConversionState {
         }
         let (reading, surface, cost) = best?;
         // 造語ガード: 1文字あたりのコストが高い（＝不自然な語の寄せ集め）なら
-        // 「意味を成す補正が見つからなかった」として出さない。今日(≈1040)/日本(≈611)
-        // 等の実語は通し、紗綾なら(≈1644)のような造語は落とす閾値にする。
-        let per_char = cost / (reading.chars().count().max(1) as i32);
-        if per_char > 1300 {
+        // 「意味を成す補正が見つからなかった」として出さない。もしかして
+        // （かな置換）側の best_word_correction と共通のしきい値を使う。
+        if !common::viterbi::is_plausible_correction_cost(cost, reading.chars().count()) {
             return None;
         }
         Some((reading, surface))
@@ -477,6 +482,24 @@ impl LiveConversionState {
                 }
             }
         }
+
+        // 定型句の続き予測: 打った読みが確定語にちょうど一致した（語の
+        // 切れ目に来た）ら、その語の後によく続く言い回し（例「削除」→
+        // 「して下さい」）を1件だけ追記候補として提案する。
+        // 追加のかな漢字変換はせず索引検索のみなので、prefix_len>=2 の
+        // 前方一致補完と同じコスト感で毎打鍵呼んでも問題ない。
+        if prefix_len >= 2 && self.romaji_buffer.is_empty() {
+            if let Some(learning) = self.learning.as_ref() {
+                if let Ok(Some((_, tail))) = learning.predict_phrase_tail(&self.hiragana_buffer) {
+                    let dup = self.predictions.iter().any(|(_, s)| *s == tail);
+                    if !dup {
+                        // reading を空にする＝現在の表示に追記するモード
+                        // （commit_prediction の既存の追記規約に合わせる）
+                        self.predictions.push((String::new(), tail));
+                    }
+                }
+            }
+        }
     }
 
     /// 予測候補を選んで確定する（番号キー）
@@ -540,14 +563,18 @@ impl LiveConversionState {
     }
 
     /// 予測候補の表示用文字列（番号は描画側で付く）。先頭が誤字補正なら
-    /// 「もしかして」ラベルを付けて、履歴補完と区別する。
+    /// 「もしかして」ラベルを付けて、履歴補完と区別する。読みが空（＝選ぶと
+    /// 現在の表示に追記するモード）の候補には「→」を付け、置き換えと
+    /// 区別できるようにする。
     pub(crate) fn prediction_display(&self) -> Vec<String> {
         self.predictions
             .iter()
             .enumerate()
-            .map(|(i, (_, s))| {
+            .map(|(i, (reading, s))| {
                 if i == 0 && self.prediction_top_is_fuzzy {
                     format!("もしかして: {}", s)
+                } else if reading.is_empty() {
+                    format!("→{}", s)
                 } else {
                     s.clone()
                 }
@@ -1073,9 +1100,14 @@ impl LiveConversionState {
 
         // 対象文節の同音語を集め、「実際の使いやすさ」を近似したキーで並べる
         // 並び順: 学習頻度が高い順 → 実効コストが低い順
-        //   実効コスト = 辞書コスト + 1文字漢字ペナルティ
+        //   実効コスト = 辞書コスト + 1文字漢字ペナルティ - 学習ユニグラムのボーナス
         //   （1文字の漢字は単独語として使われることが稀で、IPA辞書の
-        //    コストが実際の出現頻度より低く出るため補正する）
+        //    コストが実際の出現頻度より低く出るため補正する。学習ユニグラム
+        //    には起動時に薄く仕込んだ頻出語プリセット（COMMON_WORD_SEED）も
+        //    含まれており、ライブ変換の1-bestが正しく選べている語を候補一覧
+        //    でも上位にするために必須。ここを見ないと、まだ一度も確定して
+        //    いない一般的な語がプリセットの恩恵を受けられず、辞書コストが
+        //    たまたま低いだけの稀な語に負けてしまう）
         struct Seg {
             surface: String,
             freq: u32,
@@ -1089,11 +1121,16 @@ impl LiveConversionState {
                     .as_ref()
                     .and_then(|l| l.find_frequency(&seg_reading, &w.surface).ok())
                     .unwrap_or(0);
-                let penalty = single_kanji_penalty(&w.surface);
+                let penalty = single_kanji_penalty(&w.surface) + symbol_entry_penalty(&w.pos);
+                let bonus = converter
+                    .learned_unigram
+                    .get(&(w.reading.clone(), w.surface.clone()))
+                    .copied()
+                    .unwrap_or(0);
                 segs.push(Seg {
                     surface: w.surface.clone(),
                     freq,
-                    eff_cost: w.cost as i32 + penalty,
+                    eff_cost: (w.cost as i32 + penalty).saturating_sub(bonus),
                 });
             }
         }
@@ -1366,6 +1403,30 @@ pub(crate) fn single_kanji_penalty(surface: &str) -> i32 {
     }
 }
 
+/// 記号品詞（ギリシャ文字等の「記号-アルファベット」等）の候補に対する
+/// コストペナルティ（候補並べ替え専用。辞書自体は変更しない）。
+///
+/// 例:「かい」でχ（記号-アルファベット, コスト1730）が、単語コストに
+/// 1文字漢字ペナルティが乗った実在の漢字候補（介・階 等、7000超）より
+/// 上位に来てしまう。IPA辞書は数式表記等での使用を想定した低コストで、
+/// 通常の日本語入力で先頭に出てくるのは望ましくないため、候補一覧では
+/// 大きく下げる（学習頻度があればそちらが優先されるので、意図して
+/// よく使う場合は上位に出せる）。
+pub(crate) fn symbol_entry_penalty(pos: &str) -> i32 {
+    if pos.starts_with("記号") {
+        20000
+    } else {
+        0
+    }
+}
+
+/// 単語登録の読み欄として妥当か（ひらがな＋長音符のみ）
+pub(crate) fn is_hiragana_reading(reading: &str) -> bool {
+    reading
+        .chars()
+        .all(|c| ('\u{3041}'..='\u{3096}').contains(&c) || c == 'ー')
+}
+
 /// この (読み, 表記) ペアを学習してよいか
 ///
 /// 誤学習で変換が悪化するのを防ぐガード:
@@ -1397,4 +1458,101 @@ pub(crate) fn is_learnable_pair(reading: &str, surface: &str) -> bool {
         return false;
     }
     true
+}
+
+#[cfg(test)]
+mod build_candidates_tests {
+    use super::*;
+
+    /// 学習ユニグラム（頻出語プリセット含む）が、Tab候補一覧の並び順にも
+    /// 反映されることを確認する。修正前は build_candidates が辞書コスト＋
+    /// 1文字漢字ペナルティのみで並べていたため、ライブ変換の1-bestでは
+    /// 正しく選べている頻出語が、たまたま辞書コストの低い稀な語に候補
+    /// 一覧では負けてしまっていた。
+    #[test]
+    fn learned_unigram_bonus_ranks_common_word_first() {
+        let mut dict = Dictionary::new();
+        dict.matrix = common::ConnectionMatrix::new(10, 10);
+        for i in 0..10 {
+            for j in 0..10 {
+                dict.matrix.set(i, j, 200);
+            }
+        }
+        // 「稀語」は辞書コストがたまたま低く設定されている想定（IPA辞書に
+        // ありがちな癖の再現）。「常用語」は使用頻度は高いがコストは高め。
+        dict.add_word(common::WordEntry {
+            surface: "常用語".to_string(), reading: "きしゃ".to_string(),
+            left_id: 1, right_id: 1, cost: 5000, pos: "名詞".to_string(),
+        });
+        dict.add_word(common::WordEntry {
+            surface: "稀語".to_string(), reading: "きしゃ".to_string(),
+            left_id: 1, right_id: 1, cost: 3000, pos: "名詞".to_string(),
+        });
+        let mut converter = ViterbiConverter::new(dict);
+        // 「常用語」は既に何度か使われて学習済み（頻出語プリセットと同じ経路）
+        converter.learn_unigram("きしゃ", "常用語", 3);
+
+        let mut state = LiveConversionState::new();
+        state.converter = Some(converter);
+        state.hiragana_buffer = "きしゃ".to_string();
+
+        let (candidates, _seg_reading, seg_surfaces, ..) = state.build_candidates();
+        assert_eq!(seg_surfaces.first().map(String::as_str), Some("常用語"));
+        assert_eq!(candidates.first().map(String::as_str), Some("常用語"));
+    }
+
+    /// 記号品詞（ギリシャ文字等）が、辞書コストの低さだけでTab候補一覧の
+    /// 先頭に来ないことを確認する（例:「かい」でχが介・階等の実在の
+    /// 漢字候補より上に出てしまっていた回帰）。
+    #[test]
+    fn symbol_entry_does_not_rank_above_real_kanji_word() {
+        let mut dict = Dictionary::new();
+        dict.matrix = common::ConnectionMatrix::new(10, 10);
+        for i in 0..10 {
+            for j in 0..10 {
+                dict.matrix.set(i, j, 200);
+            }
+        }
+        // χ のように記号品詞かつ辞書コストが極端に低いエントリを再現
+        dict.add_word(common::WordEntry {
+            surface: "χ".to_string(), reading: "かい".to_string(),
+            left_id: 1, right_id: 1, cost: 1730, pos: "記号-アルファベット-*-*".to_string(),
+        });
+        dict.add_word(common::WordEntry {
+            surface: "介".to_string(), reading: "かい".to_string(),
+            left_id: 1, right_id: 1, cost: 5608, pos: "名詞-サ変接続-*-*".to_string(),
+        });
+        let converter = ViterbiConverter::new(dict);
+
+        let mut state = LiveConversionState::new();
+        state.converter = Some(converter);
+        state.hiragana_buffer = "かい".to_string();
+
+        let (candidates, ..) = state.build_candidates();
+        assert_ne!(candidates.first().map(String::as_str), Some("χ"), "記号が先頭に来てはいけない");
+    }
+}
+
+#[cfg(test)]
+mod reading_validation_tests {
+    use super::is_hiragana_reading;
+
+    #[test]
+    fn accepts_hiragana_and_long_vowel_mark() {
+        assert!(is_hiragana_reading("ぷらいみんぐ"));
+        assert!(is_hiragana_reading("そーと"));
+    }
+
+    #[test]
+    fn rejects_kanji_reading() {
+        // 実データで見つかった「読み欄に表記(漢字)を入れてしまった」誤登録
+        // （例: 読み="死ぬ気" 表記="しぬき"）を弾けることを確認する。
+        assert!(!is_hiragana_reading("死ぬ気"));
+    }
+
+    #[test]
+    fn rejects_katakana_and_ascii() {
+        assert!(!is_hiragana_reading("ソート"));
+        assert!(!is_hiragana_reading("react"));
+    }
 }

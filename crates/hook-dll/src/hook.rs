@@ -33,11 +33,12 @@ pub(crate) fn vk_to_char(vk_code: u32, _scan_code: u32, shift_pressed: bool) -> 
 
     // 日本語入力でよく使う記号のみ、レイアウト非依存の OEM VK で拾う。
     // 返した記号は add_char → RomajiConverter で全角化される
-    // （, . - ? ! [ ] のみ。& @ / 等は None を返して半角のまま素通し）。
+    // （, . - ? ! [ ] / のみ。& @ 等は None を返して半角のまま素通し）。
     match vk_code {
         0xBC if !shift_pressed => Some(','), // VK_OEM_COMMA → 、
         0xBE if !shift_pressed => Some('.'), // VK_OEM_PERIOD → 。
         0xBD if !shift_pressed => Some('-'), // VK_OEM_MINUS → ー
+        0xBF if !shift_pressed => Some('/'), // VK_OEM_2 → ・
         0xBF if shift_pressed => Some('?'),  // VK_OEM_2 shift → ？
         0x31 if shift_pressed => Some('!'),  // '1' shift → ！
         0xDB if !shift_pressed => Some('['), // VK_OEM_4 → 「
@@ -54,12 +55,38 @@ pub(crate) fn is_commit_char(ch: char) -> bool {
     matches!(ch, ',' | '.' | '?' | '!')
 }
 
+/// フック自身が同じスレッドで観測したShift押下状態（レースなし）。
+///
+/// `GetAsyncKeyState` は「呼んだ瞬間の実時間の状態」を返すため、低レベル
+/// フックのコールバックがOSから遅れて呼ばれた場合、直前に離したはずの
+/// Shiftがまだ押下中と誤判定されることがある（特に連続入力時）。これに
+/// より句読点キー（VK_OEM_PERIOD/COMMA）が「Shift押下中」と誤判定され、
+/// 全角化されず素通しされる＝「。のはずが.になる／稀に両方混ざって出る」
+/// 不具合につながり得る。フック自身がShiftのkeydown/keyupを同じコール
+/// バック内で順序通りに観測して更新するので、この方式ならレースが起きない。
+pub(crate) static mut SHIFT_HELD: bool = false;
+
+/// Shift系のvkCode（左右どちらでも）か
+fn is_shift_vk(vk_code: u32) -> bool {
+    matches!(vk_code, 0x10 /* VK_SHIFT */ | 0xA0 /* VK_LSHIFT */ | 0xA1 /* VK_RSHIFT */)
+}
+
+/// フックが観測したキーイベントから `SHIFT_HELD` を更新する。
+/// `LowLevelKeyboardProc` の先頭、他の判定より前に呼ぶこと。
+pub(crate) unsafe fn track_shift_state(vk_code: u32, event: u32) {
+    if !is_shift_vk(vk_code) {
+        return;
+    }
+    if event == WM_KEYDOWN || event == WM_SYSKEYDOWN {
+        SHIFT_HELD = true;
+    } else if event == WM_KEYUP || event == WM_SYSKEYUP {
+        SHIFT_HELD = false;
+    }
+}
+
 /// Shiftキーが押されているか確認
 pub(crate) fn is_shift_pressed() -> bool {
-    unsafe {
-        use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
-        GetAsyncKeyState(VK_SHIFT.0 as i32) < 0
-    }
+    unsafe { SHIFT_HELD }
 }
 
 /// Ctrlキーが押されているか確認
@@ -81,6 +108,7 @@ pub(crate) fn is_alt_pressed() -> bool {
 // WM_IME_CONTROL wparam 定数 (windows crate に未定義のため手動定義)
 // https://learn.microsoft.com/en-us/windows/win32/intl/wm-ime-control
 pub(crate) const IMC_GETCONVERSIONMODE: usize = 0x0001;
+pub(crate) const IMC_SETCONVERSIONMODE: usize = 0x0002;
 pub(crate) const IMC_GETOPENSTATUS: usize = 0x0005;
 pub(crate) const IMC_SETOPENSTATUS: usize = 0x0006;
 
@@ -116,6 +144,44 @@ pub(crate) fn close_ms_ime_for_foreground() {
             WM_IME_CONTROL,
             WPARAM(IMC_SETOPENSTATUS),
             LPARAM(0),
+            SMTO_ABORTIFHUNG,
+            30,
+            None,
+        );
+    }
+}
+
+/// フォアグラウンドウィンドウの MS-IME を開き、ひらがな入力モードにする。
+///
+/// 単語登録の読み欄のように「必ずひらがなで入力してほしい」フィールドに
+/// フォーカスが移ったときに呼ぶ。IMC_SETOPENSTATUS=1 でIMEを開き、
+/// IMC_SETCONVERSIONMODE で NATIVE（日本語入力）ビットのみ立てる
+/// （KATAKANA/ROMAN 等は落として確実にひらがなにする）。
+pub(crate) fn open_ms_ime_hiragana_for_foreground() {
+    unsafe {
+        use windows::Win32::UI::WindowsAndMessaging::{SendMessageTimeoutW, SMTO_ABORTIFHUNG};
+        let hwnd = GetForegroundWindow();
+        if hwnd.0.is_null() {
+            return;
+        }
+        let ime_wnd = ImmGetDefaultIMEWnd(hwnd);
+        if ime_wnd.0.is_null() {
+            return;
+        }
+        let _ = SendMessageTimeoutW(
+            ime_wnd,
+            WM_IME_CONTROL,
+            WPARAM(IMC_SETOPENSTATUS),
+            LPARAM(1),
+            SMTO_ABORTIFHUNG,
+            30,
+            None,
+        );
+        let _ = SendMessageTimeoutW(
+            ime_wnd,
+            WM_IME_CONTROL,
+            WPARAM(IMC_SETCONVERSIONMODE),
+            LPARAM(IME_CMODE_NATIVE.0 as isize),
             SMTO_ABORTIFHUNG,
             30,
             None,
@@ -416,7 +482,11 @@ pub extern "system" fn LowLevelKeyboardProc(
 
         let kb = *(lparam.0 as *const KBDLLHOOKSTRUCT);
         let event = wparam.0 as u32;
-        
+
+        // 他の判定より前に、Shift押下状態をレースなく更新する
+        // （早期returnの影響を受けないよう最優先で行う）。
+        track_shift_state(kb.vkCode, event);
+
         // デバッグ: キー入力をログ
         if event == WM_KEYDOWN || event == WM_SYSKEYDOWN {
             debug_log!("キー入力検出: vkCode={}, flags={}", kb.vkCode, kb.flags.0);
@@ -684,7 +754,7 @@ pub extern "system" fn LowLevelKeyboardProc(
                         return LRESULT(1);
                     }
 
-                    // かなにしないテキストキー（数字・@ & / ; 等）が変換中に来たら、
+                    // かなにしないテキストキー（数字・@ & ; 等）が変換中に来たら、
                     // まず下書きを確定してから、そのキーを半角のままアプリへ渡す。
                     //   確定せずに素通しすると、下書きの内部状態（送信済み文字数）と
                     //   実際の表示がズレて、次の変換時に BS 回数が狂い「たまに文字が

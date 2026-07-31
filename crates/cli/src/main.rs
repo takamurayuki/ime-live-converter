@@ -190,6 +190,22 @@ impl Cli {
         }
     }
 
+    fn show_phrase(&self, reading: &str) {
+        let Some(p) = &self.learning_db_path else {
+            println!("学習DB未ロード。:learning <path> でロードしてください。");
+            return;
+        };
+        let Ok(repo) = LearningRepository::open(p) else {
+            println!("学習DBを開けませんでした。");
+            return;
+        };
+        match repo.predict_phrase_tail(reading) {
+            Ok(Some((surface, tail))) => println!("{} → {}{}", reading, surface, tail),
+            Ok(None) => println!("(定型句の続き予測なし)"),
+            Err(e) => println!("エラー: {}", e),
+        }
+    }
+
     fn show_nbest(&self, input: &str, n: usize) {
         let hiragana = self.normalize_input(input);
         let Some(v) = &self.viterbi else {
@@ -611,6 +627,13 @@ fn handle_command(cli: &mut Cli, cmd: &str) -> Result<bool> {
         }
         "live" => {
             live_mode(cli)?;
+        }
+        "phrase" => {
+            if let Some(reading) = parts.get(1) {
+                cli.show_phrase(reading);
+            } else {
+                println!("使い方: :phrase <読み>");
+            }
         }
         "nbest" => {
             if let Some(input) = parts.get(1) {

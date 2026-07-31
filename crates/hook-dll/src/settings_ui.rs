@@ -913,7 +913,7 @@ pub(crate) extern "system" fn settings_wndproc(hwnd: HWND, msg: u32, wparam: WPA
 /// エイリアス設定ウィンドウを開く（なければ作る）。ホットキー Ctrl+Alt+A から呼ぶ。
 pub(crate) unsafe fn open_settings_window() {
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, RegisterClassW, SetForegroundWindow, ShowWindow, SW_SHOW,
+        CreateWindowExW, RegisterClassW, ShowWindow, SW_SHOW,
         WNDCLASSW, WS_CAPTION, WS_OVERLAPPED, WS_SYSMENU, WS_VISIBLE,
     };
     // コマンド予測ポップアップは閉じない。設定表示中はポップアップの最前面固定を
@@ -930,8 +930,8 @@ pub(crate) unsafe fn open_settings_window() {
     }
     if let Some(hwnd) = SETTINGS_HWND {
         let _ = ShowWindow(hwnd, SW_SHOW);
-        let _ = SetForegroundWindow(hwnd);
         settings_refresh_list(hwnd);
+        force_foreground_and_focus(hwnd, None);
         return;
     }
     let Ok(hinst) = GetModuleHandleW(None) else { return };
@@ -970,7 +970,7 @@ pub(crate) unsafe fn open_settings_window() {
     };
     SETTINGS_HWND = Some(hwnd);
     let _ = ShowWindow(hwnd, SW_SHOW);
-    let _ = SetForegroundWindow(hwnd);
+    force_foreground_and_focus(hwnd, None);
 }
 
 /// フォアグラウンドが自プロセスのウィンドウ（設定画面・単語登録・ファイルダイアログ等）か。
@@ -990,6 +990,27 @@ pub(crate) unsafe fn foreground_is_ours() -> bool {
     let mut pid = 0u32;
     GetWindowThreadProcessId(fg, Some(&mut pid));
     pid == GetCurrentProcessId()
+}
+
+/// 自前の設定系ウィンドウ（単語登録・コマンド設定）宛のメッセージを
+/// IsDialogMessage 経由で処理する。
+///
+/// これらはダイアログテンプレートではなく CreateWindowExW で作った素の
+/// ウィンドウなので、Tab でのコントロール間移動・既定ボタンへの Enter・
+/// Escで閉じる等のダイアログ標準の挙動は何もしなければ効かない
+/// （WS_TABSTOP を付けているだけでは不十分）。IsDialogMessage にメッセージを
+/// 渡すことでこれらを標準ダイアログ同様に有効化できる。呼び出し元
+/// （メインのメッセージループ）は、この関数が true を返したら
+/// TranslateMessage/DispatchMessage を呼んではいけない
+/// （IsDialogMessage が内部で処理済みのため）。
+pub(crate) unsafe fn try_handle_dialog_message(msg: &windows::Win32::UI::WindowsAndMessaging::MSG) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{IsDialogMessageW, MSG};
+    for hwnd in [WORD_SETTINGS_HWND, SETTINGS_HWND].into_iter().flatten() {
+        if IsDialogMessageW(hwnd, msg as *const MSG).as_bool() {
+            return true;
+        }
+    }
+    false
 }
 
 /// コマンド設定・単語登録のいずれかの設定ウィンドウが表示中か。
@@ -1067,6 +1088,45 @@ pub(crate) unsafe fn word_on_select(parent: HWND) {
     }
 }
 
+/// 読み欄(EDIT)のサブクラス化前の既定ウィンドウプロシージャ。
+/// 読み欄は常に1つしか無い（単語登録ウィンドウはシングルトン）ので
+/// 単一のstaticで足りる。
+static mut READING_EDIT_ORIG_PROC: isize = 0;
+
+/// 読み欄(EDIT)をサブクラス化し、ひらがな以外の文字入力を拒否する
+/// （読みは必ずひらがなという契約のため）。
+unsafe fn install_reading_edit_subclass(parent: HWND) {
+    use windows::Win32::UI::WindowsAndMessaging::{GetDlgItem, SetWindowLongPtrW, GWLP_WNDPROC};
+    let Ok(ctrl) = GetDlgItem(parent, ID_WORD_READING) else { return };
+    READING_EDIT_ORIG_PROC = SetWindowLongPtrW(
+        ctrl,
+        GWLP_WNDPROC,
+        reading_edit_subclass_proc as *const () as isize,
+    );
+}
+
+/// 読み欄のサブクラスプロシージャ。WM_CHAR でひらがな（+長音符ー）と
+/// 制御文字（BackSpace 等、0x20未満）以外を握りつぶして入力させない。
+/// IME確定前の変換候補文字は届かず、確定した文字だけがWM_CHARで来るため、
+/// ローマ字入力の途中を誤って弾くことはない。
+unsafe extern "system" fn reading_edit_subclass_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    use windows::Win32::UI::WindowsAndMessaging::{CallWindowProcW, WM_CHAR, WNDPROC};
+    if msg == WM_CHAR {
+        let ch = char::from_u32(wparam.0 as u32).unwrap_or('\0');
+        let is_control = (ch as u32) < 0x20;
+        if !is_control && !is_hiragana_reading(&ch.to_string()) {
+            return LRESULT(0);
+        }
+    }
+    let orig: WNDPROC = std::mem::transmute(READING_EDIT_ORIG_PROC);
+    CallWindowProcW(orig, hwnd, msg, wparam, lparam)
+}
+
 pub(crate) extern "system" fn word_settings_wndproc(
     hwnd: HWND,
     msg: u32,
@@ -1074,8 +1134,8 @@ pub(crate) extern "system" fn word_settings_wndproc(
     lparam: LPARAM,
 ) -> LRESULT {
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, GetDlgItem, ShowWindow, HMENU, SW_HIDE, WM_CLOSE, WM_COMMAND, WM_CREATE,
-        WINDOW_EX_STYLE, WINDOW_STYLE, WS_BORDER, WS_CHILD, WS_TABSTOP, WS_VISIBLE,
+        CreateWindowExW, ShowWindow, HMENU, SW_HIDE, WM_CLOSE, WM_COMMAND,
+        WM_CREATE, WINDOW_EX_STYLE, WINDOW_STYLE, WS_BORDER, WS_CHILD, WS_TABSTOP, WS_VISIBLE,
     };
     unsafe {
         match msg {
@@ -1133,6 +1193,7 @@ pub(crate) extern "system" fn word_settings_wndproc(
                 mk("BUTTON", "単語登録", vis | 0x7 /*BS_GROUPBOX*/, gx, 6, gw, form_h, 0);
                 mk("STATIC", "読み:", vis, il, 34, labelw, 20, 0);
                 mk("EDIT", "", edit, ex, 32, ew, 26, ID_WORD_READING);
+                install_reading_edit_subclass(hwnd);
                 mk("STATIC", "表記:", vis, il, 68, labelw, 20, 0);
                 mk("EDIT", "", edit, ex, 66, ew, 26, ID_WORD_SURFACE);
                 mk("STATIC", "（読みはひらがな。表記はその読みで出したい語）", vis, il, 98, gw - 2 * P, 20, 0);
@@ -1183,7 +1244,6 @@ pub(crate) extern "system" fn word_settings_wndproc(
                 }
                 mk("BUTTON", "閉じる", btn, ir - 84, list_gy + list_gh + 8, 84, 30, ID_WORD_CLOSE);
                 word_refresh_list(hwnd);
-                let _ = GetDlgItem(hwnd, ID_WORD_READING);
                 LRESULT(0)
             }
             WM_NOTIFY => {
@@ -1208,14 +1268,18 @@ pub(crate) extern "system" fn word_settings_wndproc(
                         let reading = settings_get_text(hwnd, ID_WORD_READING).trim().to_string();
                         let surface = settings_get_text(hwnd, ID_WORD_SURFACE).trim().to_string();
                         if !reading.is_empty() && !surface.is_empty() {
-                            if let Some(ctx) = LIVE_CONTEXT.get() {
-                                if let Ok(mut c) = ctx.lock() {
-                                    c.register_user_word(&reading, &surface);
-                                }
+                            let ok = LIVE_CONTEXT
+                                .get()
+                                .and_then(|ctx| ctx.lock().ok())
+                                .map(|mut c| c.register_user_word(&reading, &surface))
+                                .unwrap_or(false);
+                            // 失敗時（例: 読み欄がひらがなでない）は入力欄を
+                            // 残し、何が拒否されたか気づけるようにする。
+                            if ok {
+                                settings_set_text(hwnd, ID_WORD_READING, "");
+                                settings_set_text(hwnd, ID_WORD_SURFACE, "");
+                                word_refresh_list(hwnd);
                             }
-                            settings_set_text(hwnd, ID_WORD_READING, "");
-                            settings_set_text(hwnd, ID_WORD_SURFACE, "");
-                            word_refresh_list(hwnd);
                         }
                         LRESULT(0)
                     }
@@ -1250,6 +1314,16 @@ pub(crate) extern "system" fn word_settings_wndproc(
                         }
                         LRESULT(0)
                     }
+                    ID_WORD_READING => {
+                        // EN_SETFOCUS=0x0100: 読み欄にフォーカスが移るたびIMEを
+                        // ひらがな入力モードにする（毎回打鍵前に手動で切り替え
+                        // なくて済むように）。
+                        let code = ((wparam.0 >> 16) & 0xFFFF) as u32;
+                        if code == 0x0100 {
+                            open_ms_ime_hiragana_for_foreground();
+                        }
+                        LRESULT(0)
+                    }
                     ID_WORD_CLOSE => {
                         WORD_SETTINGS_OPEN = false;
                         let _ = ShowWindow(hwnd, SW_HIDE);
@@ -1271,7 +1345,7 @@ pub(crate) extern "system" fn word_settings_wndproc(
 /// 単語登録ウィンドウを開く（なければ作る）。日本語変換モードの Ctrl+Alt+A から呼ぶ。
 pub(crate) unsafe fn open_word_settings_window() {
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, RegisterClassW, SetForegroundWindow, ShowWindow, SW_SHOW,
+        CreateWindowExW, GetDlgItem, RegisterClassW, ShowWindow, SW_SHOW,
         WNDCLASSW, WS_CAPTION, WS_OVERLAPPED, WS_SYSMENU, WS_VISIBLE,
     };
     WORD_SETTINGS_OPEN = true;
@@ -1283,8 +1357,8 @@ pub(crate) unsafe fn open_word_settings_window() {
     }
     if let Some(hwnd) = WORD_SETTINGS_HWND {
         let _ = ShowWindow(hwnd, SW_SHOW);
-        let _ = SetForegroundWindow(hwnd);
         word_refresh_list(hwnd);
+        force_foreground_and_focus(hwnd, GetDlgItem(hwnd, ID_WORD_READING).ok());
         return;
     }
     let Ok(hinst) = GetModuleHandleW(None) else { return };
@@ -1318,5 +1392,40 @@ pub(crate) unsafe fn open_word_settings_window() {
     };
     WORD_SETTINGS_HWND = Some(hwnd);
     let _ = ShowWindow(hwnd, SW_SHOW);
+    force_foreground_and_focus(hwnd, GetDlgItem(hwnd, ID_WORD_READING).ok());
+}
+
+/// フックスレッドは物理キー入力を横取りして見ているだけで、OSからは
+/// 「今フォアグラウンドの入力を処理しているスレッド」として扱われない。
+/// そのため素の `SetForegroundWindow` は黙って失敗することがあり、
+/// 続けて `SetFocus` を呼んでもカーソルが見えるだけで実際のキー入力は
+/// 元のフォアグラウンドウィンドウに送られ続けてしまう
+/// （クリックすると直るのは「クリックはOSが例外的に許可する
+/// アクティブ化」だからで、SetForegroundWindow が単体では拒否される
+/// のと対照的）。
+///
+/// 現在のフォアグラウンドウィンドウのスレッドの入力キューに一時的に
+/// アタッチしてから遷移・フォーカスさせることで、実際にOSのアクティブ
+/// ウィンドウ／フォーカスを取得する（Win32の定石）。アタッチしたまま
+/// SetFocus まで終わらせてからデタッチする必要がある。
+unsafe fn force_foreground_and_focus(hwnd: HWND, focus_ctrl: Option<HWND>) {
+    use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow,
+    };
+
+    let fg = GetForegroundWindow();
+    let fg_thread = if fg.0.is_null() { 0 } else { GetWindowThreadProcessId(fg, None) };
+    let cur_thread = GetCurrentThreadId();
+    let attached = fg_thread != 0
+        && fg_thread != cur_thread
+        && AttachThreadInput(cur_thread, fg_thread, true).as_bool();
+
     let _ = SetForegroundWindow(hwnd);
+    let _ = SetFocus(focus_ctrl.unwrap_or(hwnd));
+
+    if attached {
+        let _ = AttachThreadInput(cur_thread, fg_thread, false);
+    }
 }

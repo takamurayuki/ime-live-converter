@@ -57,6 +57,42 @@ fn parse_csv_line(line: &str) -> Option<WordEntry> {
         return None;
     }
 
+    // NEologd等のWeb由来の大規模データに混入する低品質エントリを除外する。
+    // これらは通常のIPA辞書CSVには存在しないパターンなので、既存の基本
+    // 辞書エントリには影響しない。
+    let reading_len = reading.chars().count();
+    // 1) 絵文字が表記に含まれるものは実用的な変換対象ではない
+    //    （例: 読み「か」に絵文字「🉑」が割り当てられている等）。
+    if surface.chars().any(|c| (c as u32) >= 0x1F000) {
+        return None;
+    }
+    // 2) 表記に英字を含みながら読みが極端に短い（2文字以下）ものは、
+    //    外国語の断片に誤って短い読みが割り当てられたゴミであることが
+    //    多い（例: 表記"Squirtlings"の読みが「お」1文字 等）。
+    if surface.chars().any(|c| c.is_ascii_alphabetic()) && reading_len <= 2 {
+        return None;
+    }
+    // 4) 顔文字・SNSアカウント名的な装飾記号を含む表記は、実用的なかな
+    //    漢字変換の対象ではない（例: "*メル*"/"＊メル＊" が読み「めるかり」
+    //    の先頭候補になってしまう、"(^ω^)"系の顔文字が紛れ込む 等）。
+    //    基本辞書（IPA辞書本体）にはこれらの文字を含む表記が一切無いこと
+    //    を確認済みなので、正規の語を誤って弾く心配はない。
+    // '-'/'－'（ハイフンマイナス）は "GENSHOU-現象-" のようなSNSアカウント名
+    // 由来の表記に使われる。カタカナ語の長音符 'ー'（U+30FC）とは別の文字
+    // なので、コーヒー等の正規語を弾く心配は無い。
+    const DECORATIVE_SYMBOLS: &[char] = &[
+        '(', ')', '（', '）', '~', '～', '^', '＾', '*', '＊', '#', '＃', '@', '＠', '_', '＿',
+        '`', '´', '°', '-', '－',
+    ];
+    if surface.chars().any(|c| DECORATIVE_SYMBOLS.contains(&c)) {
+        return None;
+    }
+    // 3) 固有名詞なのに読みが1文字は日本語としてまず現実的にありえない
+    //    （実在の1文字読みの語は基本辞書に一般名詞・助詞等として収録済み）。
+    if pos.starts_with("名詞-固有名詞") && reading_len <= 1 {
+        return None;
+    }
+
     // 「読みをかな表記しただけ」の表記ゆれエントリを除外する
     // （例: ツクり/動詞, コンニチワ/感動詞）。
     // IPA辞書は解析用のため、こうした変種が正規表記より低コストな場合が
@@ -177,21 +213,8 @@ fn load_utf8_csv_file(path: &Path) -> Result<Vec<WordEntry>> {
     Ok(entries)
 }
 
-/// IPA辞書ディレクトリから辞書を構築
-fn build_dictionary(dict_dir: &Path) -> Result<Dictionary> {
-    let mut dict = Dictionary::new();
-    let mut total_words = 0;
-
-    // matrix.defを読み込む
-    let matrix_path = dict_dir.join("matrix.def");
-    if matrix_path.exists() {
-        dict.matrix = load_matrix(&matrix_path)?;
-        println!("連接行列を読み込みました");
-    } else {
-        println!("警告: matrix.defが見つかりません。デフォルトの連接行列を使用します。");
-    }
-
-    // CSVファイルを読み込む
+/// ディレクトリ内の全CSVファイルをパースして単語一覧を返す（辞書には未追加）
+fn load_csv_dir_entries(dict_dir: &Path) -> Result<Vec<WordEntry>> {
     let csv_files: Vec<_> = fs::read_dir(dict_dir)?
         .filter_map(|e| e.ok())
         .filter(|e| {
@@ -202,7 +225,7 @@ fn build_dictionary(dict_dir: &Path) -> Result<Dictionary> {
         .collect();
 
     if csv_files.is_empty() {
-        anyhow::bail!("CSVファイルが見つかりません");
+        anyhow::bail!("CSVファイルが見つかりません: {}", dict_dir.display());
     }
 
     let pb = ProgressBar::new(csv_files.len() as u64);
@@ -213,6 +236,7 @@ fn build_dictionary(dict_dir: &Path) -> Result<Dictionary> {
             .progress_chars("#>-"),
     );
 
+    let mut all_entries = Vec::new();
     for entry in csv_files {
         let path = entry.path();
         pb.set_message(format!("{}", path.file_name().unwrap_or_default().to_string_lossy()));
@@ -222,17 +246,92 @@ fn build_dictionary(dict_dir: &Path) -> Result<Dictionary> {
             Ok(e) if !e.is_empty() => e,
             _ => load_csv_file(&path).unwrap_or_default(),
         };
-
-        for entry in entries {
-            dict.add_word(entry);
-            total_words += 1;
-        }
+        all_entries.extend(entries);
 
         pb.inc(1);
     }
+    pb.finish_with_message(format!("完了: {} 単語", all_entries.len()));
 
-    pb.finish_with_message(format!("完了: {} 単語", total_words));
-    println!("総単語数: {}", total_words);
+    Ok(all_entries)
+}
+
+/// 補助辞書（NEologd等）の固有名詞に、出典不明の異常な低コストを補正するための
+/// 底上げ・上乗せ。基本辞書に無い（＝補助辞書だけが持ち込む）語にのみ適用する。
+///
+/// NEologdのコスト推定は自動生成でIPA辞書ほど校正されておらず、固有名詞の
+/// 一部（特に希少な地名・人名・組織名）が負値〜極端に低いコストを持つ
+/// ことがある（実測で全体の1割超）。これにより「がっこ」→組織名"gacco"、
+/// 「わた」→人名「和太」のように、ありふれた読みの一般語・動詞や
+/// カタカナフォールバックを押しのけてしまう。
+/// 一方、基本辞書（IPA辞書）に元々ある固有名詞（大阪・東京 等）は
+/// 適切に校正済みで、この補正の対象外にする必要がある
+/// （出典を区別せず一律ペナルティを掛けると、こうした正当で頻出な
+/// 固有名詞まで壊れることを実測で確認済み）。
+const SUPPLEMENT_PROPER_NOUN_MIN_COST: i32 = 3000;
+const SUPPLEMENT_PROPER_NOUN_SURCHARGE: i32 = 2500;
+
+fn adjust_supplement_entry(mut entry: WordEntry) -> WordEntry {
+    if entry.pos.starts_with("名詞-固有名詞") {
+        let adjusted = (entry.cost as i32)
+            .max(SUPPLEMENT_PROPER_NOUN_MIN_COST)
+            .saturating_add(SUPPLEMENT_PROPER_NOUN_SURCHARGE)
+            .min(i16::MAX as i32);
+        entry.cost = adjusted as i16;
+    }
+    entry
+}
+
+/// IPA辞書ディレクトリ（+ 任意で補助辞書ディレクトリ）から辞書を構築
+///
+/// 補助辞書（NEologd等）は、基本辞書に既に存在する語（読み+表記が一致）は
+/// 重複追加せずスキップし（基本辞書側の校正済みコストを優先）、基本辞書に
+/// 無い語だけを `adjust_supplement_entry` で補正のうえ追加する。
+fn build_dictionary(dict_dir: &Path, supplement_dir: Option<&Path>) -> Result<Dictionary> {
+    let mut dict = Dictionary::new();
+
+    // matrix.defを読み込む
+    let matrix_path = dict_dir.join("matrix.def");
+    if matrix_path.exists() {
+        dict.matrix = load_matrix(&matrix_path)?;
+        println!("連接行列を読み込みました");
+    } else {
+        println!("警告: matrix.defが見つかりません。デフォルトの連接行列を使用します。");
+    }
+
+    println!("基本辞書を読み込んでいます: {}", dict_dir.display());
+    let base_entries = load_csv_dir_entries(dict_dir)?;
+    let mut base_keys: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::with_capacity(base_entries.len());
+    for entry in base_entries {
+        base_keys.insert((entry.reading.clone(), entry.surface.clone()));
+        dict.add_word(entry);
+    }
+    println!("基本辞書: {} 単語", base_keys.len());
+
+    if let Some(supp_dir) = supplement_dir {
+        println!("補助辞書を読み込んでいます: {}", supp_dir.display());
+        let supp_entries = load_csv_dir_entries(supp_dir)?;
+        let mut added = 0u64;
+        let mut skipped_dup = 0u64;
+        let mut surcharged = 0u64;
+        for entry in supp_entries {
+            if base_keys.contains(&(entry.reading.clone(), entry.surface.clone())) {
+                skipped_dup += 1;
+                continue;
+            }
+            let is_proper_noun = entry.pos.starts_with("名詞-固有名詞");
+            let entry = adjust_supplement_entry(entry);
+            if is_proper_noun {
+                surcharged += 1;
+            }
+            dict.add_word(entry);
+            added += 1;
+        }
+        println!(
+            "補助辞書: {} 単語追加（うち固有名詞に補正適用 {} 語）、基本辞書と重複のため {} 語スキップ",
+            added, surcharged, skipped_dup
+        );
+    }
 
     Ok(dict)
 }
@@ -353,12 +452,16 @@ fn main() -> Result<()> {
 
     if args.len() < 2 {
         println!("使い方:");
-        println!("  {} build <IPA辞書ディレクトリ> [出力ファイル]", args[0]);
+        println!("  {} build <IPA辞書ディレクトリ> [出力ファイル] [補助辞書ディレクトリ]", args[0]);
         println!("  {} extend <辞書ファイル> <補助CSV>  (常用語を追加)", args[0]);
         println!("  {} test <辞書ファイル>", args[0]);
         println!();
+        println!("補助辞書ディレクトリ（NEologd等）は、基本辞書に無い語だけを取り込み、");
+        println!("固有名詞には出典不明の異常な低コストを補正するペナルティを掛ける。");
+        println!();
         println!("例:");
         println!("  {} build ./ipadic ./dictionaries/system.dic", args[0]);
+        println!("  {} build ./ipadic ./dictionaries/system.dic ./neologd", args[0]);
         println!("  {} extend ./dictionaries/system.dic ./dictionaries/extra.csv", args[0]);
         println!("  {} test ./dictionaries/system.dic", args[0]);
         return Ok(());
@@ -375,6 +478,11 @@ fn main() -> Result<()> {
             } else {
                 Path::new("dictionaries/system.dic").to_path_buf()
             };
+            let supplement_dir = if args.len() >= 5 {
+                Some(Path::new(&args[4]))
+            } else {
+                None
+            };
 
             // 出力ディレクトリを作成
             if let Some(parent) = output_path.parent() {
@@ -382,7 +490,7 @@ fn main() -> Result<()> {
             }
 
             println!("IPA辞書を読み込んでいます: {}", dict_dir.display());
-            let dict = build_dictionary(dict_dir)?;
+            let dict = build_dictionary(dict_dir, supplement_dir)?;
             save_dictionary(&dict, &output_path)?;
         }
         "extend" => {

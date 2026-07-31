@@ -493,6 +493,88 @@ impl LearningRepository {
         Ok(rows)
     }
 
+    /// 読みに完全一致する確定履歴のうち、最頻の表記を返す（語の切れ目判定用）
+    fn best_surface_for_reading(&self, reading: &str) -> Result<Option<(String, u32)>> {
+        if reading.is_empty() {
+            return Ok(None);
+        }
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT surface, frequency FROM conversion_history
+                 WHERE reading = ?1 AND surface <> ?1
+                 ORDER BY frequency DESC LIMIT 1",
+                params![reading],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, u32>(1)?)),
+            )
+            .ok())
+    }
+
+    /// バイグラムの最頻の後続表記を返す（頻度が閾値未満のものは無視してノイズを避ける）
+    fn top_bigram_next(&self, prev_surface: &str, min_freq: u32) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT surface FROM word_bigram
+                 WHERE prev_surface = ?1 AND frequency >= ?2
+                 ORDER BY frequency DESC LIMIT 1",
+                params![prev_surface, min_freq],
+                |r| r.get::<_, String>(0),
+            )
+            .ok())
+    }
+
+    /// 名詞の直後で「新しい節を始める」格助詞。この助詞へ渡ると、次に何が
+    /// 続くかは文ごとにバラバラで、バイグラム全体での最頻語（例:「を」の
+    /// 次は最頻でも「表示」14件/「確認」12件/「追加」11件…と僅差で割れる）
+    /// にすぎず、元の語と無関係な語に飛んでしまう（例:「設定」→「を」→
+    /// 「表示」＝「設定を表示され」という無関係な文への飛躍）。
+    /// 活用の送り仮名（し・て・さ・れ 等）は文法的に一意に近く安全だが、
+    /// これらの格助詞をまたぐ連鎖だけは辿らずに打ち切る。
+    const TOPIC_SHIFT_PARTICLES: &'static [&'static str] =
+        &["を", "が", "は", "も", "に", "で", "と", "の", "や", "か"];
+
+    /// 定型句の続き予測: 読みが確定語にちょうど一致した時点（語の切れ目）で、
+    /// その語の後によく続くバイグラムの連鎖（活用＋補助動詞など）を辿って
+    /// 復元する。例:「さくじょ」→「削除」の後、し→て→下さい と辿り
+    /// 「して下さい」を返す。「〜して下さい」のような依頼文を毎回全部
+    /// 打たなくて済むようにする。
+    ///
+    /// 連鎖は頻度の低いノイズ（学習の72〜86%は頻度1の一回きりの繋がり）を
+    /// 拾わないよう最小頻度で足切りし、暴走・循環を避けるため最大ホップ数
+    /// で打ち切る。格助詞をまたいだ先は元の語と無関係になりやすいので
+    /// `TOPIC_SHIFT_PARTICLES` で連鎖を止める。追加のかな漢字変換は行わず
+    /// 索引検索のみで完結するため、打鍵ごとに呼んでもフックの遅延
+    /// （<300ms制約）に影響しない。
+    pub fn predict_phrase_tail(&self, reading: &str) -> Result<Option<(String, String)>> {
+        const MAX_HOPS: usize = 4;
+        const MIN_FREQ: u32 = 5;
+
+        let Some((surface, _)) = self.best_surface_for_reading(reading)? else {
+            return Ok(None);
+        };
+        let mut tail = String::new();
+        let mut current = surface.clone();
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(current.clone());
+        for _ in 0..MAX_HOPS {
+            let Some(next) = self.top_bigram_next(&current, MIN_FREQ)? else {
+                break;
+            };
+            if visited.contains(&next) || Self::TOPIC_SHIFT_PARTICLES.contains(&next.as_str()) {
+                break;
+            }
+            tail.push_str(&next);
+            visited.insert(next.clone());
+            current = next;
+        }
+        if tail.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some((surface, tail)))
+        }
+    }
+
     /// 指定した読みの変換履歴（ひらがな以外の表記）を削除する
     ///
     /// Esc でひらがなに戻したとき、その読みで学習済みの漢字/カタカナ表記の
@@ -905,6 +987,53 @@ mod tests {
         repo.record_bigram("会議", "室")?;
         let r = repo.predict_next("会議", 10)?;
         assert_eq!(r.first().map(|(s, _)| s.as_str()), Some("資料")); // 頻度順で先頭
+        Ok(())
+    }
+
+    #[test]
+    fn test_predict_phrase_tail() -> Result<()> {
+        let repo = LearningRepository::in_memory()?;
+        // 「削除」の後によく続く「し→て→下さい」の連鎖を仕込む
+        for _ in 0..40 { repo.record_commit("さくじょ", "削除", None)?; }
+        for _ in 0..20 { repo.record_bigram("削除", "し")?; }
+        for _ in 0..300 { repo.record_bigram("し", "て")?; }
+        for _ in 0..120 { repo.record_bigram("て", "下さい")?; }
+        // ノイズ（頻度1）は連鎖に混ざらない
+        repo.record_bigram("下さい", "、")?;
+
+        let r = repo.predict_phrase_tail("さくじょ")?;
+        assert_eq!(r, Some(("削除".to_string(), "して下さい".to_string())));
+
+        // 読みが確定履歴に無ければ None
+        assert!(repo.predict_phrase_tail("そんざいしない")?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_predict_phrase_tail_stops_on_low_frequency() -> Result<()> {
+        let repo = LearningRepository::in_memory()?;
+        for _ in 0..10 { repo.record_commit("かくにん", "確認", None)?; }
+        // 後続バイグラムが無い（一度も学習していない）ので延長できない
+        let r = repo.predict_phrase_tail("かくにん")?;
+        assert!(r.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_predict_phrase_tail_stops_at_topic_shift_particle() -> Result<()> {
+        // 実データで見つかった回帰: 「設定」→「を」→「表示」のように格助詞を
+        // またぐと、元の語と無関係な最頻語に飛んでしまう（「設定を表示され」）。
+        // 格助詞に着いたら連鎖を止め、無関係な予測を出さないことを確認する。
+        let repo = LearningRepository::in_memory()?;
+        for _ in 0..40 { repo.record_commit("せってい", "設定", None)?; }
+        for _ in 0..6 { repo.record_bigram("設定", "を")?; }
+        // 「を」の後は文ごとにバラバラ（他の語ではよくある状況）に相当する
+        // ノイズとして、無関係な複数の高頻度後続を用意する。
+        for _ in 0..14 { repo.record_bigram("を", "表示")?; }
+        for _ in 0..12 { repo.record_bigram("を", "確認")?; }
+
+        let r = repo.predict_phrase_tail("せってい")?;
+        assert!(r.is_none(), "格助詞をまたいだ無関係な予測が出た: {:?}", r);
         Ok(())
     }
 

@@ -316,11 +316,12 @@ impl RomajiConverter {
         }
 
         // 記号（日本語入力でよく使う最小セットのみ全角化）
-        // プログラマ記号（& @ / 等）は半角のまま素通しさせ、意図しない
-        // 全角化を避ける。
+        // プログラマ記号（& @ 等）は半角のまま素通しさせ、意図しない
+        // 全角化を避ける。「/」は一般的なIME同様「・」（中黒）に変換する
+        // （「コーヒー・ティー」のような区切りで使うのが本来の用途）。
         for (k, v) in [
             ("-", "ー"), (",", "、"), (".", "。"), ("?", "？"), ("!", "！"),
-            ("[", "「"), ("]", "」"), ("~", "〜"),
+            ("[", "「"), ("]", "」"), ("~", "〜"), ("/", "・"),
         ] {
             mapping.insert(k, v);
         }
@@ -466,6 +467,8 @@ mod tests {
         assert_eq!(converter.convert("ra-menn"), "らーめん");
         assert_eq!(converter.convert("hai."), "はい。");
         assert_eq!(converter.convert("sou,"), "そう、");
+        // 「/」は中黒に変換する（「コーヒー・ティー」のような区切り用途）
+        assert_eq!(converter.convert("/"), "・");
         // ふぁ行・ゔ・つぁ・てぃ/でぃ
         assert_eq!(converter.convert("fairu"), "ふぁいる");
         assert_eq!(converter.convert("vaiorinn"), "ゔぁいおりん");
