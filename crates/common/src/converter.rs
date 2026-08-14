@@ -574,12 +574,60 @@ mod tests {
     #[test]
     fn test_commit_and_clear() {
         let mut converter = LiveConverter::new();
-        
+
         converter.input_hiragana("てすと");
         assert!(converter.is_composing());
-        
+
         let result = converter.commit();
         assert!(!result.is_empty());
         assert!(!converter.is_composing());
+    }
+
+    #[test]
+    fn test_typo_correction_cost_gain_not_inflated_by_seed_bonus() {
+        // 実例(タスク#583 カテゴリB): 「おいしい」が「お→を」かな混同補正
+        // (typo.rs, confidence 0.6) 経由で無関係な「を石井」に誤訂正される。
+        // 原因は起動時シード learned_unigram[("を","を")] の過大なボーナスが
+        // 誤字訂正のcost_gain判定（本ファイルの generate_candidates）に
+        // 漏れ込み、「を」+「石井(いしい)」の分割コストを不当に押し下げる
+        // ことだった。この合成辞書では「石井」に相当する語のコストを、
+        // 生コストの和では「美味しい」に負けるが、旧シード値(8000)なら
+        // 昇格してしまう水準に設定している。
+        let mut dict = Dictionary::new();
+        dict.matrix = crate::dictionary::ConnectionMatrix::new(10, 10);
+        for i in 0..10 {
+            for j in 0..10 {
+                dict.matrix.set(i, j, 0);
+            }
+        }
+        dict.add_word(crate::WordEntry {
+            surface: "美味しい".to_string(), reading: "おいしい".to_string(),
+            left_id: 1, right_id: 1, cost: 5000, pos: "形容詞-自立-*-*".to_string(),
+        });
+        dict.add_word(crate::WordEntry {
+            surface: "を".to_string(), reading: "を".to_string(),
+            left_id: 2, right_id: 2, cost: 4183, pos: "助詞-格助詞-一般-*".to_string(),
+        });
+        dict.add_word(crate::WordEntry {
+            surface: "石井".to_string(), reading: "いしい".to_string(),
+            left_id: 3, right_id: 3, cost: 1900, pos: "名詞-固有名詞-人名-姓".to_string(),
+        });
+
+        let mut converter = LiveConverter::new();
+        converter.set_dictionary(dict);
+
+        let candidates = converter.generate_candidates("おいしい");
+        assert!(!candidates.is_empty());
+        assert_eq!(
+            candidates[0].text, "美味しい",
+            "誤字訂正候補『を石井』が1位に昇格してはいけない: {:?}",
+            candidates.iter().map(|c| &c.text).collect::<Vec<_>>()
+        );
+        assert!(
+            !candidates.iter().any(|c| c.text == "を石井"
+                && c.kind == crate::candidate::CandidateKind::TypoCorrection
+                && c.score < 0.0),
+            "『を石井』が昇格スコア(負値)で候補に含まれてはいけない"
+        );
     }
 }

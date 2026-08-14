@@ -360,10 +360,10 @@ fn test_common_word_seed_applied() {
     // 頻出語プリセットが空でなく、代表語が入っている
     let converter = ViterbiConverter::new(create_test_dictionary());
     assert!(converter.learned_unigram.contains_key(&("あう".to_string(), "会う".to_string())));
-    // を の強優先も入っている
+    // を の優先も入っている（タスク#583でヲに勝つ最小限の500に調整）
     assert_eq!(
         converter.learned_unigram.get(&("を".to_string(), "を".to_string())),
-        Some(&8000)
+        Some(&500)
     );
 }
 
@@ -944,4 +944,56 @@ fn test_live_conversion_context() {
     context.add_hiragana("は");
     let conversion = context.get_conversion();
     assert!(conversion.contains("今日") || conversion.contains("は"));
+}
+
+#[test]
+fn test_symbol_penalty_extended_range_prevents_multiplication_sign() {
+    // 実例: 「かける」の1位候補に乗算記号「×」(U+00D7, Latin-1 Supplement)が
+    // 出てしまう（本来は 掛ける/駆ける 等の動詞になるべき）。
+    // 「×」は ASCII (U+0021-007E) にも全角 (U+FF01-FF5E) にも含まれず、
+    // 拡張前の symbol_penalty ではペナルティ対象外だった。
+    let mut dict = Dictionary::new();
+    dict.matrix = crate::dictionary::ConnectionMatrix::new(10, 10);
+    for i in 0..10 {
+        for j in 0..10 {
+            dict.matrix.set(i, j, 200);
+        }
+    }
+    dict.add_word(WordEntry {
+        surface: "×".to_string(), reading: "かける".to_string(),
+        left_id: 1, right_id: 1, cost: 3000, pos: "記号-一般-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "掛ける".to_string(), reading: "かける".to_string(),
+        left_id: 2, right_id: 2, cost: 5000, pos: "動詞-自立-*-*".to_string(),
+    });
+    let mut converter = ViterbiConverter::new(dict);
+    converter.enable_katakana_fallback = false;
+    // 記号の生コストの方が低いが、拡張したペナルティにより動詞が選ばれる
+    assert_eq!(converter.convert_to_string("かける"), "掛ける");
+}
+
+#[test]
+fn test_symbol_penalty_extended_range_prevents_yen_sign() {
+    // 実例: 「えんしゅうりつ」(円周率) の1位が「￥州立」になる。
+    // 「￥」(U+FFE5) は全角/半角形の通貨記号ブロック (U+FFE0-FFEE) で、
+    // 拡張前の symbol_penalty のいずれのレンジにも含まれなかった。
+    let mut dict = Dictionary::new();
+    dict.matrix = crate::dictionary::ConnectionMatrix::new(10, 10);
+    for i in 0..10 {
+        for j in 0..10 {
+            dict.matrix.set(i, j, 200);
+        }
+    }
+    dict.add_word(WordEntry {
+        surface: "￥".to_string(), reading: "えん".to_string(),
+        left_id: 1, right_id: 1, cost: 3000, pos: "記号-一般-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "円".to_string(), reading: "えん".to_string(),
+        left_id: 2, right_id: 2, cost: 5000, pos: "名詞-一般-*-*".to_string(),
+    });
+    let mut converter = ViterbiConverter::new(dict);
+    converter.enable_katakana_fallback = false;
+    assert_eq!(converter.convert_to_string("えん"), "円");
 }

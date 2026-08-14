@@ -120,12 +120,14 @@ impl ViterbiConverter {
                 .entry((reading.to_string(), surface.to_string()))
                 .or_insert(COMMON_WORD_SEED_BONUS);
         }
-        // 助詞「を」は IPA辞書の安いカタカナ「ヲ」に負け、かつ他語の部分
-        // 文字列にならない（安全）ため強めに優先する。
-        // （「ほん」等は「にほんご」の部分列になり強優先すると壊れるので
-        //  中程度プリセット止まりにする）
+        // 助詞「を」は IPA辞書の安いカタカナ「ヲ」に負けないよう優先する。
+        // 値は「ヲ」に勝つのに十分な範囲でできるだけ小さくする。過大な値
+        // (旧8000) は誤字訂正のcost_gain判定（converter.rs）に漏れ込み、
+        // かな混同「お→を」の訂正候補（typo.rs）が無関係な語にも過剰に
+        // 昇格してしまう副作用があった（例:「おいしい」→「を石井」。
+        // タスク#583, research.md カテゴリB）。
         self.learned_unigram
-            .insert(("を".to_string(), "を".to_string()), 8000);
+            .insert(("を".to_string(), "を".to_string()), 500);
         // 「考える」は辞書コストが高く(7049)、単独だと安いカタカナ断片
         // 「カン」+助詞の分割に負けるため強めに優先する。
         self.learned_unigram

@@ -12,3 +12,16 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+
+# ルート直下の tests/ にある実辞書ベースの回帰コーパス統合テスト
+# (tests/conversion_corpus.rs) を `cargo test` から実行可能にするための
+# 最小限のルートパッケージ定義。src/lib.rs 等の実体は持たず、
+# 自動検出される tests/*.rs のみをターゲットとする（タスク#583）。
+[package]
+name = "ime-live-converter-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+common = { path = "crates/common" }
