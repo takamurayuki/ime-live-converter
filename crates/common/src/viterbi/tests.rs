@@ -356,6 +356,520 @@ fn test_learned_hiragana_preference() {
 }
 
 #[test]
+fn test_learned_hiragana_does_not_fragment_longer_word() {
+    // 実例:「さいきどう」が「再起動」ではなく「さい」(ひらがな)+「起動」に
+    // 誤分割される。
+    //
+    // ユーザーが（別の文脈で）「さい」をEscでひらがなに戻した学習が
+    // 積み上がると、その学習は「さい」という2文字の出現全てにひらがな
+    // ノードを追加する。これが「再起動」のように「さい」で始まる
+    // より長い正当な複合語の先頭を奪い、断片化させてしまっていた。
+    let mut dict = Dictionary::new();
+    dict.matrix = crate::dictionary::ConnectionMatrix::new(10, 10);
+    for i in 0..10 {
+        for j in 0..10 {
+            dict.matrix.set(i, j, 200);
+        }
+    }
+    dict.add_word(WordEntry {
+        surface: "再起動".to_string(), reading: "さいきどう".to_string(),
+        left_id: 1, right_id: 1, cost: 2000, pos: "名詞-一般-*-*".to_string(),
+    });
+    let mut converter = ViterbiConverter::new(dict);
+    converter.enable_katakana_fallback = false;
+    // 「さい」を単体でEscした学習が積み上がっている状態を再現する。
+    converter.learn_hiragana("さい", 6);
+    // にもかかわらず「さいきどう」は「さい」+断片に分割されず、
+    // 正しく1語の「再起動」になる
+    assert_eq!(converter.convert_to_string("さいきどう"), "再起動");
+    // 一方、学習対象の読みが単体・末尾として出現する場合は従来どおり
+    // ひらがな優先が効く（このガードで意図を壊していないことの確認）
+    assert_eq!(converter.convert_to_string("さい"), "さい");
+}
+
+#[test]
+fn test_trusted_phrase_bonus_beats_negative_cost_fragment_split() {
+    // 実例（もんだいない→問題ない）を模した合成辞書。実語との衝突を避ける
+    // ため架空の語を使う（本物の「もんだいない」は seed_common_words で
+    // 既に trusted_phrase_bonus 登録済みのため、そのままでは学習前でも
+    // 勝ってしまい「学習が無いと負ける」状態を再現できない）。
+    //
+    // 「以内」を含むこの手の断片列は、base IPADic自体の連接コストの癖で
+    // 合計コストが元から負になり得る（実測: base cost≈-3708、断片個別の
+    // ユニグラム学習も乗ると≈-6708）。対抗する語を`learn_unigram`
+    // （`effective_word_cost`で0未満に floor される）でどれだけ優先しても、
+    // コストは0止まりで負の断片パスに勝てない。`trusted_phrase_bonus`は
+    // この手の恒久的に正しいと分かっている語に限り0未満まで割り引ける
+    // 専用の仕組み。
+    let mut dict = Dictionary::new();
+    dict.matrix = crate::dictionary::ConnectionMatrix::new(10, 10);
+    for i in 0..10 {
+        for j in 0..10 {
+            dict.matrix.set(i, j, 200);
+        }
+    }
+    dict.matrix.set(1, 2, -3000); // 揉れ→だぞ
+    dict.matrix.set(2, 3, -1000); // だぞ→意内
+    dict.matrix.set(3, 0, -800); // 意内→EOS
+    dict.add_word(WordEntry {
+        surface: "検査済".to_string(), reading: "もれだぞいない".to_string(),
+        left_id: 4, right_id: 4, cost: 1200, pos: "名詞-一般-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "揉れ".to_string(), reading: "もれ".to_string(),
+        left_id: 1, right_id: 1, cost: 2000, pos: "動詞-自立-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "だぞ".to_string(), reading: "だぞ".to_string(),
+        left_id: 2, right_id: 2, cost: 1500, pos: "助動詞-*-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "意内".to_string(), reading: "いない".to_string(),
+        left_id: 3, right_id: 3, cost: 800, pos: "名詞-非自立-副詞可能-*".to_string(),
+    });
+    let mut converter = ViterbiConverter::new(dict);
+    converter.enable_katakana_fallback = false;
+    // 断片側は元々コストが負（学習ボーナス無しでも「検査済」より安い）
+    assert_eq!(converter.convert_to_string("もれだぞいない"), "揉れだぞ意内");
+    // learned_unigram だけでは 0 floor に阻まれて勝てないことを確認
+    converter.learn_unigram("もれだぞいない", "検査済", 20);
+    assert_eq!(converter.convert_to_string("もれだぞいない"), "揉れだぞ意内");
+    // trusted_phrase_bonus なら 0 未満まで割り引けるので勝てる
+    converter
+        .trusted_phrase_bonus
+        .insert(("もれだぞいない".to_string(), "検査済".to_string()), 5000);
+    assert_eq!(converter.convert_to_string("もれだぞいない"), "検査済");
+}
+
+#[test]
+fn test_content_word_particle_reading_before_eos_penalty() {
+    // 実例:「わたしはに」が「私はに」ではなく「私は二」になる。
+    //
+    // base IPADic では助詞「に」よりも数詞「二」の方が単語コストが低い
+    // ことがある。文中（後ろに他の語が続く）なら助詞としての「に」が
+    // 通常勝つが、文末（EOS直前）でだけ数詞「二」に負けやすい。
+    // `is_lone_particle`は入力全体がちょうど1助詞のときしか救えないため、
+    // 「わたしはに」のような文末の「に」は対象外だった。
+    let mut dict = Dictionary::new();
+    dict.matrix = crate::dictionary::ConnectionMatrix::new(10, 10);
+    for i in 0..10 {
+        for j in 0..10 {
+            dict.matrix.set(i, j, 200);
+        }
+    }
+    dict.add_word(WordEntry {
+        surface: "は".to_string(), reading: "は".to_string(),
+        left_id: 1, right_id: 1, cost: 300, pos: "助詞-係助詞-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "に".to_string(), reading: "に".to_string(),
+        left_id: 2, right_id: 2, cost: 500, pos: "助詞-格助詞-一般-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "二".to_string(), reading: "に".to_string(),
+        left_id: 3, right_id: 3, cost: 100, pos: "名詞-数-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "人気".to_string(), reading: "にんき".to_string(),
+        left_id: 4, right_id: 4, cost: 800, pos: "名詞-一般-*-*".to_string(),
+    });
+    let mut converter = ViterbiConverter::new(dict);
+    converter.enable_katakana_fallback = false;
+    // 文末の「に」は数詞「二」ではなく助詞「に」のまま残る
+    assert_eq!(converter.convert_to_string("はに"), "はに");
+    // 文中に他の語が続く場合の「に」で始まる別の語は影響を受けない
+    assert_eq!(converter.convert_to_string("にんき"), "人気");
+}
+
+#[test]
+fn test_adverb_particle_bigram_neutralized_only_at_utterance_start() {
+    // 実例:「どうか」が同音の漢字語「同化」に変換できず、常にひらがな
+    // 「どうか」のまま残る。
+    //
+    // 「どう」（副詞）+「か」（助詞）の接続はIPA辞書上もともと安い
+    // （「どうですか」等、副詞に「か」が続く構文自体が高頻度なため）。
+    // 無関係な文脈（例:「どうですか」を何度も確定した）で積み上がった
+    // 学習バイグラムがこの接続をさらに安くすると、同音の単漢字・複合語
+    // （「同化」等）を含むどのアトミックな1語よりも安くなってしまう。
+    //
+    // ただし「行けるかどうか」のように、この「どう」+「か」が文中（＝
+    // 「どう」の直前がBOSではない）に現れる場合は「〜かどうか」
+    // （whether or not）という極めて頻出な慣用構文であり、バイグラム
+    // 学習を丸ごと無効化すると逆に「行けるか同化」のように壊れてしまう
+    // （実測で確認した回帰）。「どう」の直前がBOS（＝この読み全体の
+    // 先頭）の場合だけに限定することで、両方を同時に満たす。
+    let mut dict = Dictionary::new();
+    dict.matrix = crate::dictionary::ConnectionMatrix::new(10, 10);
+    for i in 0..10 {
+        for j in 0..10 {
+            dict.matrix.set(i, j, 200);
+        }
+    }
+    dict.matrix.set(0, 1, -1137); // BOS→どう
+    dict.matrix.set(1, 2, -2681); // どう→か
+    dict.matrix.set(2, 0, -1037); // か→EOS
+    dict.matrix.set(0, 3, 131); // BOS→同化
+    dict.matrix.set(3, 0, -736); // 同化→EOS
+    dict.matrix.set(4, 2, -500); // 木→か
+    dict.matrix.set(2, 1, -500); // か→どう
+    dict.add_word(WordEntry {
+        surface: "どう".to_string(), reading: "どう".to_string(),
+        left_id: 1, right_id: 1, cost: 5052, pos: "副詞-助詞類接続-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "か".to_string(), reading: "か".to_string(),
+        left_id: 2, right_id: 2, cost: 5360, pos: "助詞-副助詞／並立助詞／終助詞-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "同化".to_string(), reading: "どうか".to_string(),
+        left_id: 3, right_id: 3, cost: 4727, pos: "名詞-サ変接続-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "木".to_string(), reading: "き".to_string(),
+        left_id: 4, right_id: 4, cost: 3000, pos: "名詞-一般-*-*".to_string(),
+    });
+    let mut converter = ViterbiConverter::new(dict);
+    converter.enable_katakana_fallback = false;
+    // 無関係な文脈（「どうですか」等）で「どう」+「か」の並びが何度も
+    // 確定され、バイグラム学習が積み上がっている状態を再現する。
+    converter.learn_bigram("どう", "か", 5);
+
+    // 文頭の「どうか」は正しく「同化」になる
+    assert_eq!(converter.convert_to_string("どうか"), "同化");
+    // 文中の「〜かどうか」（「どう」の直前が「か」＝文頭ではない）は
+    // 壊れず、正しく「木」+「か」+「どうか」に変換される
+    assert_eq!(converter.convert_to_string("きかどうか"), "木かどうか");
+}
+
+#[test]
+fn test_ichigai_seed_beats_noun_particle_split() {
+    // 実例:「いちがい」が同音の複合語「一概」に変換できず「位置」+「が」+
+    // 「胃」に誤分割される。「位置」は接頭詞ではなく通常の名詞のため、
+    // 接頭詞向けの既存ガード（bonused_word_after_prefix_conn_floor 等）が
+    // 効かない。無関係な文脈で「位置」の単語コスト・「位置」→「が」の
+    // 接続の両方に学習が積み上がると、断片解釈の合計コストが「一概」の
+    // 生コストより安くなる（実測: 分割≈1094、一概の生コスト由来の合計
+    // ≈4333）。個別の接続ガードで塞ぐのではなく、対抗語「一概」自体を
+    // seed_common_words で直接優先する（0未満にはしない通常のユニグラム
+    // ボーナスで十分勝てるため trusted_phrase_bonus は使わない）。
+    let mut dict = Dictionary::new();
+    dict.matrix = crate::dictionary::ConnectionMatrix::new(10, 10);
+    for i in 0..10 {
+        for j in 0..10 {
+            dict.matrix.set(i, j, 200);
+        }
+    }
+    dict.matrix.set(0, 1, 131); // BOS→位置
+    dict.matrix.set(1, 2, -4646); // 位置→が
+    dict.matrix.set(2, 3, -824); // が→胃
+    dict.matrix.set(3, 0, -573); // 胃→EOS
+    dict.matrix.set(0, 4, -283); // BOS→一概
+    dict.matrix.set(4, 0, -573); // 一概→EOS
+    dict.add_word(WordEntry {
+        surface: "位置".to_string(), reading: "いち".to_string(),
+        left_id: 1, right_id: 1, cost: 5356, pos: "名詞-サ変接続-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "が".to_string(), reading: "が".to_string(),
+        left_id: 2, right_id: 2, cost: 3866, pos: "助詞-格助詞-一般-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "胃".to_string(), reading: "い".to_string(),
+        left_id: 3, right_id: 3, cost: 5240, pos: "名詞-一般-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "一概".to_string(), reading: "いちがい".to_string(),
+        left_id: 4, right_id: 4, cost: 5189, pos: "名詞-一般-*-*".to_string(),
+    });
+    let converter = ViterbiConverter::new(dict);
+    assert_eq!(converter.convert_to_string("いちがい"), "一概");
+}
+
+#[test]
+fn test_corpus_unigram_behaves_like_learned_unigram() {
+    // corpus_unigram（コーパス由来の語頻度、`corpus_lm.dic`経由で読み込む）が
+    // learned_unigram（個人の変換履歴）と同じ経路でword_costを減額し、
+    // 同じ効果を持つことを確認する（統合コード自体の回帰テスト）。
+    // 辞書構成は`test_ichigai_seed_beats_noun_particle_split`と同一
+    // （位置+が+胃 の断片解釈 vs 一概）。
+    let mut dict = Dictionary::new();
+    dict.matrix = crate::dictionary::ConnectionMatrix::new(10, 10);
+    for i in 0..10 {
+        for j in 0..10 {
+            dict.matrix.set(i, j, 200);
+        }
+    }
+    dict.matrix.set(0, 1, 131); // BOS→位置
+    dict.matrix.set(1, 2, -4646); // 位置→が
+    dict.matrix.set(2, 3, -824); // が→胃
+    dict.matrix.set(3, 0, -573); // 胃→EOS
+    dict.matrix.set(0, 4, -283); // BOS→一概
+    dict.matrix.set(4, 0, -573); // 一概→EOS
+    dict.add_word(WordEntry {
+        surface: "位置".to_string(), reading: "いち".to_string(),
+        left_id: 1, right_id: 1, cost: 5356, pos: "名詞-サ変接続-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "が".to_string(), reading: "が".to_string(),
+        left_id: 2, right_id: 2, cost: 3866, pos: "助詞-格助詞-一般-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "胃".to_string(), reading: "い".to_string(),
+        left_id: 3, right_id: 3, cost: 5240, pos: "名詞-一般-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "一概".to_string(), reading: "いちがい".to_string(),
+        left_id: 4, right_id: 4, cost: 5189, pos: "名詞-一般-*-*".to_string(),
+    });
+
+    let mut converter = ViterbiConverter::new(dict);
+    converter.enable_katakana_fallback = false;
+    // seed_common_words が同じキーに learned_unigram を仕込むため、
+    // corpus_unigram だけの効果を見るために取り除く
+    converter.learned_unigram.remove(&("いちがい".to_string(), "一概".to_string()));
+    converter.corpus_unigram.insert(("いちがい".to_string(), "一概".to_string()), 6000);
+    assert_eq!(converter.convert_to_string("いちがい"), "一概");
+}
+
+#[test]
+fn test_kyouko_seed_beats_common_word_plus_rare_kanji_split() {
+    // 実例:「きょうこ」が同音の「強固」に変換できず「今日」+「鼓」に
+    // 誤分割される（今日鼓）。「今日」は読み3文字（きょう）の保護対象語
+    // （[[short-reading-conn-floor-general-fix]]の読み2文字以下ガードの
+    // 対象外。「今日は/今日が」を壊さないため）で、日常的な使用頻度の
+    // 高さから無関係な文脈でも学習ユニグラムボーナスが上限
+    // (UNIGRAM_BONUS_CAP)まで乗りやすく、実質コストが0近くまで下がる。
+    // すると稀な単漢字「鼓」（こ、単独では高コスト）と組み合わせた合計
+    // コストが、「強固」の生コストや、学習なしでも接続コストが有利で
+    // 「強固」に僅差で勝ってしまう同音の姓「京子」の合計コストより
+    // 安くなる。ガードで塞げる形（短い語＋文頭）ではないため、
+    // 「一概」「水曜」と同様に対抗語自体をseed_common_wordsで直接優先する。
+    let mut dict = Dictionary::new();
+    dict.matrix = crate::dictionary::ConnectionMatrix::new(10, 10);
+    for i in 0..10 {
+        for j in 0..10 {
+            dict.matrix.set(i, j, 200);
+        }
+    }
+    dict.matrix.set(0, 1, 100); // BOS→今日
+    dict.matrix.set(1, 2, -50); // 今日→鼓
+    dict.matrix.set(2, 0, 100); // 鼓→EOS
+    dict.matrix.set(0, 3, 300); // BOS→京子
+    dict.matrix.set(3, 0, -300); // 京子→EOS
+    dict.matrix.set(0, 4, 400); // BOS→強固
+    dict.matrix.set(4, 0, 100); // 強固→EOS
+    dict.add_word(WordEntry {
+        surface: "今日".to_string(), reading: "きょう".to_string(),
+        left_id: 1, right_id: 1, cost: 4263, pos: "名詞-副詞可能-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "鼓".to_string(), reading: "こ".to_string(),
+        left_id: 2, right_id: 2, cost: 5435, pos: "名詞-サ変接続-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "京子".to_string(), reading: "きょうこ".to_string(),
+        left_id: 3, right_id: 3, cost: 6792, pos: "名詞-固有名詞-人名-名".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "強固".to_string(), reading: "きょうこ".to_string(),
+        left_id: 4, right_id: 4, cost: 4685, pos: "名詞-形容動詞語幹-*-*".to_string(),
+    });
+    let mut converter = ViterbiConverter::new(dict);
+    converter.enable_katakana_fallback = false;
+    // 「今日」に無関係な文脈からの学習ボーナスが上限まで乗っている状態を再現
+    converter.learned_unigram
+        .insert(("きょう".to_string(), "今日".to_string()), UNIGRAM_BONUS_CAP);
+    assert_eq!(converter.convert_to_string("きょうこ"), "強固");
+}
+
+#[test]
+fn test_bonused_prev_with_positive_raw_conn_cost_not_floored() {
+    // 実例:「いみのある」（意味のある）が「異ミのある」に誤変換される
+    // 回帰（2026-08-07、[[short-reading-conn-floor-general-fix]]の一般化
+    // ガード自体が原因）。「意味」は読み2文字（いみ）の日常語で、よく使う
+    // ため学習ユニグラムボーナスが上限まで乗り、かつ「意味→の」という
+    // 正当なバイグラムも学習される（が、これも上限まで乗る）。
+    // `bonused_short_prev_conn_floor_at_utterance_start`は「prevの読みが
+    // 2文字以下＋文頭＋ボーナスあり」という条件だけで機械的に接続コストを
+    // 底上げしていたため、「位置→が」（辞書本来の接続コストが元から
+    // 大きく負、実測約-4600）のような本当に不自然な断片と、「意味→の」
+    // （辞書本来の接続コストはふつうの正の値、実測+259。バイグラム学習が
+    // 乗って見かけ上負に見えるだけ）という正当な文の接続を区別できず、
+    // 後者まで一律に底上げしてしまっていた（実測: いみのある→異ミのある）。
+    // 学習バイグラムを差し引く前の「辞書本来の接続コスト」で判定するよう
+    // 修正した（cur側にボーナスがある場合は対象外、詳細は関数のコメント
+    // 参照）。「異」+「ミ」のような断片解釈が「意味」+「の」に勝たない
+    // ことを確認する。
+    let mut dict = Dictionary::new();
+    dict.matrix = crate::dictionary::ConnectionMatrix::new(10, 10);
+    for i in 0..10 {
+        for j in 0..10 {
+            dict.matrix.set(i, j, 200);
+        }
+    }
+    dict.matrix.set(0, 1, 200); // BOS→意味
+    dict.matrix.set(1, 2, 259); // 意味→の（辞書本来の接続コスト。正の値）
+    dict.matrix.set(2, 0, 200); // の→EOS
+    dict.matrix.set(0, 3, 200); // BOS→異
+    dict.matrix.set(3, 4, -3000); // 異→三幅（断片解釈が有利になるよう不自然に安く設定）
+    dict.matrix.set(4, 0, 200); // 三幅→EOS
+    dict.add_word(WordEntry {
+        surface: "意味".to_string(), reading: "いみ".to_string(),
+        left_id: 1, right_id: 1, cost: 4502, pos: "名詞-サ変接続-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "の".to_string(), reading: "の".to_string(),
+        left_id: 2, right_id: 2, cost: 2879, pos: "助詞-連体化-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "異".to_string(), reading: "い".to_string(),
+        left_id: 3, right_id: 3, cost: 7074, pos: "接頭詞-名詞接続-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "三幅".to_string(), reading: "みの".to_string(),
+        left_id: 4, right_id: 4, cost: 6000, pos: "名詞-一般-*-*".to_string(),
+    });
+    let mut converter = ViterbiConverter::new(dict);
+    converter.enable_katakana_fallback = false;
+    // 「意味」を日常的によく使い、単語自身とバイグラム両方に上限までの
+    // 学習ボーナスが乗っている状態を再現
+    converter.learned_unigram
+        .insert(("いみ".to_string(), "意味".to_string()), UNIGRAM_BONUS_CAP);
+    converter.learned_bigram
+        .insert(("意味".to_string(), "の".to_string()), BIGRAM_BONUS_CAP);
+    assert_eq!(converter.convert_to_string("いみの"), "意味の");
+}
+
+#[test]
+fn test_oshieru_seed_beats_bonused_prefix_plus_rare_proper_noun() {
+    // 実例:「おしえる」が「教える」に変換できず「押し」+「エル」に
+    // 誤分割される（実測: 押しエル）。「押し」は頻出語のため無関係な
+    // 文脈で学習ユニグラムボーナスが上限まで乗りやすく、実質コストが
+    // 0近くまで下がる。「エル」は読み「える」を持つ稀な固有名詞
+    // （人名、cost=4914）で、[[short-reading-conn-floor-general-fix]]の
+    // 一般化ガードの対象になり得るが、curが辞書に実在する語（カタカナの
+    // フォールバックノードではない）のため接続コストの底上げだけでは
+    // 検出できない。「きょうこ」→「強固」と同型なので対抗語自体を
+    // seed_common_wordsで直接優先する。
+    let mut dict = Dictionary::new();
+    dict.matrix = crate::dictionary::ConnectionMatrix::new(10, 10);
+    for i in 0..10 {
+        for j in 0..10 {
+            dict.matrix.set(i, j, 200);
+        }
+    }
+    dict.matrix.set(0, 1, 200); // BOS→押し
+    dict.matrix.set(1, 2, 200); // 押し→エル
+    dict.matrix.set(2, 0, 200); // エル→EOS
+    dict.matrix.set(0, 3, 200); // BOS→教える
+    dict.matrix.set(3, 0, 200); // 教える→EOS
+    dict.add_word(WordEntry {
+        surface: "押し".to_string(), reading: "おし".to_string(),
+        left_id: 1, right_id: 1, cost: 5874, pos: "動詞-自立-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "エル".to_string(), reading: "える".to_string(),
+        left_id: 2, right_id: 2, cost: 4914, pos: "名詞-固有名詞-人名-名".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "教える".to_string(), reading: "おしえる".to_string(),
+        left_id: 3, right_id: 3, cost: 6842, pos: "動詞-自立-*-*".to_string(),
+    });
+    let mut converter = ViterbiConverter::new(dict);
+    converter.enable_katakana_fallback = false;
+    converter.learned_unigram
+        .insert(("おし".to_string(), "押し".to_string()), UNIGRAM_BONUS_CAP);
+    assert_eq!(converter.convert_to_string("おしえる"), "教える");
+}
+
+#[test]
+fn test_kyouiku_trusted_phrase_beats_negative_cost_split() {
+    // 実例:「きょういく」が「教育」に変換できず「今日」+「行く」に
+    // 誤分割される（実測: 今日行く）。「今日」は頻出語のため学習ユニグラム
+    // ボーナスが上限まで乗りやすいだけでなく、「今日行く」という文自体も
+    // 実際によく使われるため「今日→行く」のバイグラムまで学習されやすい
+    // （実測+1500）。加えて「今日→行く」の辞書本来の接続コストもサ変接続語
+    // 一般の癖で負（実測-1881）のため、断片解釈の合計コストが学習無しでも
+    // 既に負になり得る。「教育」を通常のユニグラムボーナス（0未満不可floor）
+    // で優先するだけでは勝てなかった（実測でUNIGRAM_BONUS_CAPと同水準では
+    // 不足）ため、「水曜」「問題ない」と同様に0未満まで割り引ける
+    // trusted_phrase_bonus を使う。
+    let mut dict = Dictionary::new();
+    dict.matrix = crate::dictionary::ConnectionMatrix::new(10, 10);
+    for i in 0..10 {
+        for j in 0..10 {
+            dict.matrix.set(i, j, 200);
+        }
+    }
+    dict.matrix.set(0, 1, 200); // BOS→今日
+    dict.matrix.set(1, 2, -1881); // 今日→行く（辞書本来の接続コスト。実測どおり負）
+    dict.matrix.set(2, 0, 200); // 行く→EOS
+    dict.matrix.set(0, 3, 200); // BOS→教育
+    dict.matrix.set(3, 0, 200); // 教育→EOS
+    dict.add_word(WordEntry {
+        surface: "今日".to_string(), reading: "きょう".to_string(),
+        left_id: 1, right_id: 1, cost: 4263, pos: "名詞-副詞可能-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "行く".to_string(), reading: "いく".to_string(),
+        left_id: 2, right_id: 2, cost: 8852, pos: "動詞-自立-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "教育".to_string(), reading: "きょういく".to_string(),
+        left_id: 3, right_id: 3, cost: 1448, pos: "名詞-サ変接続-*-*".to_string(),
+    });
+    let mut converter = ViterbiConverter::new(dict);
+    converter.enable_katakana_fallback = false;
+    converter.learned_unigram
+        .insert(("きょう".to_string(), "今日".to_string()), UNIGRAM_BONUS_CAP);
+    converter.learned_bigram
+        .insert(("今日".to_string(), "行く".to_string()), 1500);
+    assert_eq!(converter.convert_to_string("きょういく"), "教育");
+}
+
+#[test]
+fn test_suiyou_trusted_phrase_beats_negative_cost_split() {
+    // 実例:「すいよう」が同音の「水曜」に変換できず「酸い」+「よう」に
+    // 誤分割される。「よう」はIPA辞書上、同じ表記に9種類ものPOS
+    // （名詞-非自立-助動詞語幹・形容詞-非自立・助詞-終助詞・動詞-自立・
+    // 感動詞 等）が重複登録されており、接続コストガードで1つのPOS
+    // バリアントを塞いでも、別のPOSバリアント経由で同じ誤変換がすり抜ける
+    // （実測で複数バリアント経由の回帰を確認済み）。断片解釈の合計コストが
+    // 学習無しでも既に負（実測cost≈-2517）のため、`learned_unigram`の
+    // 0未満不可floorでは勝てず、[[bonused-prefix-stacking-conversion-bug]]と
+    // 同様に0未満まで割り引ける`trusted_phrase_bonus`を使う。
+    let mut dict = Dictionary::new();
+    dict.matrix = crate::dictionary::ConnectionMatrix::new(10, 10);
+    for i in 0..10 {
+        for j in 0..10 {
+            dict.matrix.set(i, j, 200);
+        }
+    }
+    dict.matrix.set(0, 1, -2409); // BOS→酸い
+    dict.matrix.set(1, 2, -2653); // 酸い→よう
+    dict.matrix.set(2, 0, -361); // よう→EOS
+    dict.matrix.set(0, 3, -316); // BOS→水曜
+    dict.matrix.set(3, 0, -826); // 水曜→EOS
+    dict.add_word(WordEntry {
+        surface: "酸い".to_string(), reading: "すい".to_string(),
+        left_id: 1, right_id: 1, cost: 5366, pos: "形容詞-自立-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "よう".to_string(), reading: "よう".to_string(),
+        left_id: 2, right_id: 2, cost: 4540, pos: "名詞-非自立-助動詞語幹-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "水曜".to_string(), reading: "すいよう".to_string(),
+        left_id: 3, right_id: 3, cost: 5306, pos: "名詞-副詞可能-*-*".to_string(),
+    });
+    let mut converter = ViterbiConverter::new(dict);
+    converter.enable_katakana_fallback = false;
+    // 「酸い」に無関係な文脈での学習ボーナスが積み上がっている状態を再現する
+    converter.learn_unigram("すい", "酸い", 3);
+    assert_eq!(converter.convert_to_string("すいよう"), "水曜");
+}
+
+#[test]
 fn test_common_word_seed_applied() {
     // 頻出語プリセットが空でなく、代表語が入っている
     let converter = ViterbiConverter::new(create_test_dictionary());
@@ -708,6 +1222,145 @@ fn test_bonused_word_after_prefix_prevents_unbalanced_split() {
     // にもかかわらず「おなか」は「お」+「中」に分割されず、
     // 正しく1語の「お腹」になる
     assert_eq!(converter.convert_to_string("おなか"), "お腹");
+}
+
+#[test]
+fn test_bonused_prefix_own_cost_prevents_unbalanced_split() {
+    // 実例: 「さいてきか」が「再」+「摘果」に誤分割される
+    // （「最適化」という正しい1語があるにもかかわらず）。
+    //
+    // 上の test_bonused_word_after_prefix_prevents_unbalanced_split は
+    // 接頭詞側（「お」）が生コストのままで、後続語（「中」）だけに学習
+    // ボーナスが乗るケース。今回はそれとは異なり、接頭詞自身（「再」）も
+    // 「再起動」「再送」等の無関係な文脈で積み上がった学習ボーナスにより
+    // 単語コストがほぼ0まで下がっているケース。接続コストの下限0だけでは
+    // 「再」側のコスト減も打ち消せず、以前は「最適化」が押しのけられていた。
+    let mut dict = Dictionary::new();
+    dict.matrix = crate::dictionary::ConnectionMatrix::new(10, 10);
+    for i in 0..10 {
+        for j in 0..10 {
+            dict.matrix.set(i, j, 200);
+        }
+    }
+    dict.matrix.set(1, 2, -3000); // 再→摘果（品詞IDの組の癖）
+    dict.matrix.set(2, 0, -2000); // 摘果→EOS（品詞IDの組の癖）
+    dict.add_word(WordEntry {
+        surface: "最適化".to_string(), reading: "さいてきか".to_string(),
+        left_id: 3, right_id: 3, cost: 4000, pos: "名詞-一般-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "再".to_string(), reading: "さい".to_string(),
+        left_id: 1, right_id: 1, cost: 3000, pos: "接頭詞-名詞接続-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "摘果".to_string(), reading: "てきか".to_string(),
+        left_id: 2, right_id: 2, cost: 3000, pos: "名詞-サ変接続-*-*".to_string(),
+    });
+    let mut converter = ViterbiConverter::new(dict);
+    converter.enable_katakana_fallback = false;
+    // 「再」は無関係な文脈（再起動・再送 等）で繰り返し使われ、学習ボーナスが
+    // 上限近くまで積み上がっている状態を再現する。
+    converter.learn_unigram("さい", "再", 12);
+    converter.learn_unigram("てきか", "摘果", 1);
+    // にもかかわらず「さいてきか」は「再」+「摘果」に分割されず、
+    // 正しく1語の「最適化」になる
+    assert_eq!(converter.convert_to_string("さいてきか"), "最適化");
+}
+
+#[test]
+fn test_bonused_prefix_alone_with_unbonused_cur_prevents_unbalanced_split() {
+    // 実例: 「ぜんしゃ」が「前」+カタカナ・フォールバック「シャ」に誤分割
+    // される（「前者」という正しい1語があるにもかかわらず）。
+    //
+    // 上の test_bonused_prefix_own_cost_prevents_unbalanced_split は
+    // 「再」（prev）に加えて「摘果」（cur）にも学習ボーナスが乗っていた
+    // ため、`bonused_word_after_prefix_conn_floor` の外側ガード
+    // （`cur_unigram_bonus <= 0 && bigram_bonus <= 0` で早期returnする
+    // 条件）がたまたま素通りせず、内側の `prev_unigram_bonus > 0` 分岐まで
+    // 到達できていた。しかし「前」+カタカナ・フォールバックのように、
+    // cur側が学習ボーナスを一切受けようがない合成ノード（フォールバックは
+    // 辞書語ではないため learned_unigram に入らない）だと、外側ガードで
+    // 早期returnしてしまい、prev自身のボーナスが原因でも一切介入できて
+    // いなかった（本番のリグレッション。2026-08-02）。
+    let mut dict = Dictionary::new();
+    dict.matrix = crate::dictionary::ConnectionMatrix::new(10, 10);
+    for i in 0..10 {
+        for j in 0..10 {
+            dict.matrix.set(i, j, 200);
+        }
+    }
+    dict.matrix.set(1, 3, -3000); // 前→カタカナ候補（品詞IDの組の癖）
+    dict.matrix.set(3, 0, -600); // カタカナ候補→EOS
+    dict.add_word(WordEntry {
+        surface: "前者".to_string(), reading: "ぜんしゃ".to_string(),
+        left_id: 3, right_id: 3, cost: 5864, pos: "名詞-一般-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "前".to_string(), reading: "ぜん".to_string(),
+        left_id: 1, right_id: 1, cost: 5052, pos: "接頭詞-名詞接続-*-*".to_string(),
+    });
+    let mut converter = ViterbiConverter::new(dict);
+    // カタカナ・フォールバックを有効のままにする（「シャ」を合成させるため）。
+    converter.katakana_min_len = 1;
+    // 「前」は無関係な文脈（前回・前提 等）で繰り返し使われ、学習ボーナスが
+    // 上限近くまで積み上がっている状態を再現する。「しゃ」側には一切
+    // 学習を与えない（cur_unigram_bonus=0 のまま）。
+    converter.learn_unigram("ぜん", "前", 12);
+    // にもかかわらず「ぜんしゃ」は「前」+カタカナに分割されず、
+    // 正しく1語の「前者」になる
+    assert_eq!(converter.convert_to_string("ぜんしゃ"), "前者");
+}
+
+#[test]
+fn test_bonused_cur_word_beats_unbonused_homophone_stem_at_utterance_start() {
+    // 実例:「とおして」が「賭」(1文字)+「押して」に誤分割される
+    // （「通して」という正しい動詞があるにもかかわらず）。
+    //
+    // 上のテスト群とは異なるパターン: prevの「賭」自身には学習ボーナスが
+    // 乗っていない。ボーナスが乗っているのは cur の「押し」（無関係な
+    // 文脈「強く押した」等で積み上がる）で、「押し」と「通し」は同じ
+    // 活用型（同じleft_id/right_id）を共有する同音の動詞連用形。
+    // 「押し」の単語コストがボーナスでほぼ0まで下がると、対抗する
+    // 「通し」（ボーナス無し、生コストのまま）との単語コスト差
+    // （実測 約7000）が、接続コストの下限0だけでは埋まらない
+    // （2026-08-06、もぐら叩き解消のため一般化したガードで検出）。
+    let mut dict = Dictionary::new();
+    dict.matrix = crate::dictionary::ConnectionMatrix::new(10, 10);
+    for i in 0..10 {
+        for j in 0..10 {
+            dict.matrix.set(i, j, 200);
+        }
+    }
+    dict.matrix.set(0, 1, 200); // BOS→賭
+    dict.matrix.set(1, 2, -300); // 賭→押し/通し（同じleft_id=2を共有）
+    dict.matrix.set(0, 2, 200); // BOS→通し（直接、賭を経由しない場合）
+    dict.matrix.set(2, 3, -200); // 押し/通し→て
+    dict.matrix.set(3, 0, -200); // て→EOS
+    dict.add_word(WordEntry {
+        surface: "賭".to_string(), reading: "と".to_string(),
+        left_id: 1, right_id: 1, cost: 5066, pos: "名詞-サ変接続-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "押し".to_string(), reading: "おし".to_string(),
+        left_id: 2, right_id: 2, cost: 5874, pos: "動詞-自立-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "通し".to_string(), reading: "とおし".to_string(),
+        left_id: 2, right_id: 2, cost: 7191, pos: "動詞-自立-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "て".to_string(), reading: "て".to_string(),
+        left_id: 3, right_id: 3, cost: 5170, pos: "助詞-接続助詞-*-*".to_string(),
+    });
+    let mut converter = ViterbiConverter::new(dict);
+    converter.enable_katakana_fallback = false;
+    // 「押し」は無関係な文脈（強く押した 等）で繰り返し確定され、
+    // 学習ボーナスが上限近くまで積み上がっている状態を再現する。
+    // 「賭」自身にはボーナスを与えない。
+    converter.learn_unigram("おし", "押し", 10);
+    // にもかかわらず「とおして」は「賭」+「押して」に分割されず、
+    // 正しく1語の動詞「通して」になる
+    assert_eq!(converter.convert_to_string("とおして"), "通して");
 }
 
 #[test]

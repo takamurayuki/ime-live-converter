@@ -42,7 +42,23 @@ impl Cli {
         let dict = Dictionary::load(path)
             .with_context(|| format!("辞書のロードに失敗: {}", path.display()))?;
         // LiveConverter と独立の ViterbiConverter の両方にロード
-        self.viterbi = Some(ViterbiConverter::new(Dictionary::load(path)?));
+        let mut viterbi = ViterbiConverter::new(Dictionary::load(path)?);
+        let corpus_lm_path = path.with_file_name("corpus_lm.dic");
+        if corpus_lm_path.exists() {
+            match common::CorpusLm::load(&corpus_lm_path) {
+                Ok(lm) => {
+                    println!(
+                        "コーパスLMをロード: {} (unigram={}, bigram={})",
+                        corpus_lm_path.display(),
+                        lm.unigrams.len(),
+                        lm.bigrams.len()
+                    );
+                    viterbi.load_corpus_lm(&lm);
+                }
+                Err(e) => println!("コーパスLMのロードに失敗: {}", e),
+            }
+        }
+        self.viterbi = Some(viterbi);
         self.converter.set_dictionary(dict);
         Ok(())
     }

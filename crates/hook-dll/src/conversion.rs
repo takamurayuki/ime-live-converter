@@ -18,6 +18,14 @@ pub(crate) const USER_WORD_COST: i16 = 2000;
 /// ボーナスが付き、「ユーザーが明示登録した語」を最優先で選ばせる。
 pub(crate) const USER_WORD_LEARN_FREQ: u32 = 20;
 
+/// 隣接する漢字複合語を自動登録するために必要な最小バイグラム頻度
+/// （同じ隣接ペアがこの回数だけ確定されたら辞書に単語として登録する）。
+/// 1回で登録すると誤変換をそのまま固定してしまう恐れがあるため、
+/// 学習系ボーナスと同様に反復を要求する。
+pub(crate) const AUTO_COMPOUND_MIN_FREQ: u32 = 3;
+/// 自動登録する複合語の読みの最大文字数（暴走的に長い結合を防ぐ）。
+pub(crate) const AUTO_COMPOUND_MAX_READING_LEN: usize = 8;
+
 /// ライブ変換の状態
 pub(crate) struct LiveConversionState {
     /// ローマ字→ひらがな変換
@@ -58,6 +66,11 @@ pub(crate) struct LiveConversionState {
     pub(crate) predictions: Vec<(String, String)>,
     /// predictions[0] が「もしかして（誤字補正）」かどうか。表示ラベル用。
     pub(crate) prediction_top_is_fuzzy: bool,
+    /// prediction_top_is_fuzzy が true のとき、その場で計算した誤字補正では
+    /// なく、過去にユーザーが実際に確定した学習済みの誤字修正かどうか。
+    /// Deleteキーでの「誤学習リセット」対象の判定に使う（その場計算のもの
+    /// には消す学習が無い）。
+    pub(crate) prediction_top_is_learned_typo: bool,
     /// 予測リスト内で選択中の位置（↑↓で移動。Enterでこれを確定）。
     pub(crate) prediction_index: usize,
     /// 直近に確定した表記（次単語予測・バイグラム記録に使う）
@@ -97,6 +110,7 @@ impl LiveConversionState {
             recent_context: String::new(),
             predictions: Vec::new(),
             prediction_top_is_fuzzy: false,
+            prediction_top_is_learned_typo: false,
             prediction_index: 0,
             last_committed: String::new(),
             kana_tail_len: 0,
@@ -136,11 +150,17 @@ impl LiveConversionState {
                 conv.learn_hiragana(&reading, freq);
             }
         }
+        if let Ok(typos) = learning.all_typo_corrections() {
+            for (wrong, reading, surface, freq) in typos {
+                conv.learn_typo_correction(&wrong, &reading, &surface, freq);
+            }
+        }
         debug_log!(
-            "学習ロード: unigram={}, bigram={}, assoc={}",
+            "学習ロード: unigram={}, bigram={}, assoc={}, typo={}",
             conv.learned_unigram.len(),
             conv.learned_bigram.len(),
-            conv.learned_assoc.len()
+            conv.learned_assoc.len(),
+            conv.typo_corrections.len()
         );
     }
 
@@ -209,6 +229,36 @@ impl LiveConversionState {
             });
             // 学習済みの別解にも勝てるよう、登録語に学習ボーナスを付与する。
             conv.learn_unigram(&reading, &surface, USER_WORD_LEARN_FREQ);
+        }
+        true
+    }
+
+    /// 隣接する漢字複合語の反復使用から自動登録する（`register_user_word`と
+    /// 同じ辞書注入だが、DBには`source='auto'`で記録し手動登録と区別する）。
+    pub(crate) fn register_auto_compound(&mut self, reading: &str, surface: &str) -> bool {
+        if reading.is_empty() || surface.is_empty() || !is_hiragana_reading(reading) {
+            return false;
+        }
+        if let Some(learning) = self.learning.as_ref() {
+            if learning
+                .add_auto_compound_word(reading, surface, USER_WORD_COST as i32)
+                .is_err()
+            {
+                return false;
+            }
+        } else {
+            return false;
+        }
+        if let Some(conv) = self.converter.as_mut() {
+            conv.dictionary.add_word(common::WordEntry {
+                surface: surface.to_string(),
+                reading: reading.to_string(),
+                left_id: USER_WORD_POS_ID,
+                right_id: USER_WORD_POS_ID,
+                cost: USER_WORD_COST,
+                pos: USER_WORD_POS.to_string(),
+            });
+            conv.learn_unigram(reading, surface, USER_WORD_LEARN_FREQ);
         }
         true
     }
@@ -404,31 +454,6 @@ impl LiveConversionState {
         true
     }
 
-    /// 現在のライブ変換結果が「変換に失敗している気配」か（安いヒューリスティック）。
-    ///
-    /// 重いかなレベル誤字補正（`fuzzy_suggest`）を毎打鍵で走らせるとフックが
-    /// 遅延して生キーが漏れるため、まずこの安い判定でふるいにかける。
-    /// - カタカナ・フォールバック（native な読みがカタカナ化）＝失敗のサイン
-    /// - まったく漢字にならず全ひらがなのまま（未知語の可能性）
-    /// 長すぎる入力は補正コストが高いので対象外にする。
-    fn conversion_looks_failed(&self) -> bool {
-        // 末尾に残ったローマ字（英字）は除いて判定する
-        let r: String = self
-            .conversion_result
-            .chars()
-            .filter(|c| !c.is_ascii_alphabetic())
-            .collect();
-        let n = r.chars().count();
-        if !(2..=16).contains(&n) {
-            return false;
-        }
-        let has_katakana = r.chars().any(|c| ('\u{30A1}'..='\u{30FA}').contains(&c));
-        let all_kana = r
-            .chars()
-            .all(|c| ('\u{3041}'..='\u{3096}').contains(&c) || c == '\u{30FC}' || c == '\u{3093}');
-        has_katakana || all_kana
-    }
-
     /// 予測変換の候補を更新する
     ///
     /// - 打鍵中（hiragana_buffer あり）: 読みが前方一致する確定履歴を補完候補に
@@ -436,29 +461,42 @@ impl LiveConversionState {
     pub(crate) fn update_predictions(&mut self) {
         self.predictions.clear();
         self.prediction_top_is_fuzzy = false;
+        self.prediction_top_is_learned_typo = false;
         self.prediction_index = 0;
 
-        // もしかして（誤字補正）は2段構え:
-        //  1) ローマ字取り残し（gm… のように英字が残って変換に失敗）→ romaji_repair
-        //  2) ローマ字は全部かなになったが、実在語に変換できていない（未知語のまま／
-        //     カタカナ・フォールバック。例「するう」「きづついて」）→ fuzzy_suggest で
-        //     辞書のあいまい検索＋変換コストから「意味の通る語」に寄せる。
-        // どちらも「自動変換に失敗した時だけ」出す（正しく変換できた入力には出さない）。
-        if let Some((reading, surface)) = self.romaji_repair_suggest() {
+        // 0) 過去に実際にユーザーが確定した誤字修正（学習済み）が今回の読みに
+        //    そのまま一致するなら最優先で使う。都度のローマ字探索・辞書の
+        //    あいまい検索より速く、かつユーザー本人が一度確定した確実な
+        //    修正なので誤検出の心配が無い（personalized correction）。
+        let learned_typo = self.converter.as_ref().and_then(|conv| {
+            conv.typo_corrections
+                .get(&self.hiragana_buffer)
+                .map(|(reading, surface, _bonus)| (reading.clone(), surface.clone()))
+        });
+        if let Some((reading, surface)) = learned_typo {
+            if surface != self.conversion_result {
+                self.predictions.push((reading, surface));
+                self.prediction_top_is_fuzzy = true;
+                self.prediction_top_is_learned_typo = true;
+            }
+        }
+
+        // もしかして（誤字補正）は「ローマ字取り残し」（gm… のように英字が
+        // 残って変換に失敗）→ romaji_repair のみを対象にする。
+        //
+        // 以前は「ローマ字は全部かなになったが、辞書上意味を成さない断片
+        // （するう→する う、さい+起動 等）」も fuzzy_suggest で拾っていたが、
+        // これは辞書のあいまい検索による“その場の推測”で、外れることも
+        // 多くノイズになるという実機フィードバックにより対象から外した
+        // （[[fuzzy-correction-approach]]参照）。上の学習済み誤字修正
+        // （ユーザー本人が過去に確定した確実な修正）は対象外にしない。
+        // 学習済み修正が既に見つかっていれば、そちらを優先する
+        // （同じ読みに対して重複した候補を出さないため）。
+        if !self.predictions.is_empty() {
+            // 学習済み修正を既に積んだので何もしない
+        } else if let Some((reading, surface)) = self.romaji_repair_suggest() {
             self.predictions.push((reading, surface));
             self.prediction_top_is_fuzzy = true;
-        } else if self.romaji_buffer.is_empty()
-            && !self.hiragana_buffer.chars().any(|c| c.is_ascii_alphabetic())
-            && self.conversion_looks_failed()
-        {
-            // ローマ字取り残しが無く、かつ変換に失敗している気配のときだけ
-            // 重いかなレベル補正を走らせる（毎打鍵での過負荷＝フック遅延を避ける）。
-            if let Some(conv) = self.converter.as_ref() {
-                if let Some((reading, surface)) = conv.fuzzy_suggest(&self.hiragana_buffer) {
-                    self.predictions.push((reading, surface));
-                    self.prediction_top_is_fuzzy = true;
-                }
-            }
         }
 
         // ここから先（履歴による前方一致補完）は学習DBが要る。
@@ -511,6 +549,8 @@ impl LiveConversionState {
             return None;
         }
         let (reading, surface) = self.predictions[index].clone();
+        // 誤字修正の学習用に、確定でクリアされる前の生の読み（誤字そのもの）を控える。
+        let original_reading = self.hiragana_buffer.clone();
         // 前方一致は現在表示を置換、次単語は追記
         let delete_count = if reading.is_empty() {
             0
@@ -539,6 +579,29 @@ impl LiveConversionState {
                 if let Some(conv) = self.converter.as_mut() {
                     conv.learn_bigram(&self.last_committed, &surface, freq);
                 }
+            }
+            // もしかして（誤字補正）の先頭候補を実際に選んだ＝その場で提示した
+            // 修正をユーザーが確認・採用したということなので、誤字そのもの
+            // （original_reading）→修正後(reading, surface) を学習する。
+            // 次回同じ誤字を打ったとき、辞書のあいまい検索をやり直さずに
+            // 即座に同じ修正を最優先で出せるようになる（使うほど賢くなる）。
+            if index == 0
+                && self.prediction_top_is_fuzzy
+                && original_reading != reading
+                && !original_reading.is_empty()
+                && is_learnable_pair(&reading, &surface)
+            {
+                let _ = learning.record_typo_correction(&original_reading, &reading, &surface);
+                let freq = learning
+                    .find_typo_correction_frequency(&original_reading, &reading, &surface)
+                    .unwrap_or(1);
+                if let Some(conv) = self.converter.as_mut() {
+                    conv.learn_typo_correction(&original_reading, &reading, &surface, freq);
+                }
+                debug_log!(
+                    "誤字修正を学習: '{}' → 読み='{}' 表記='{}'",
+                    original_reading, reading, surface
+                );
             }
         }
 
@@ -586,16 +649,37 @@ impl LiveConversionState {
     ///
     /// 「誤字を修正するう」のように、過去に誤って確定した内容がそのまま履歴補完
     /// として出てくる場合、その (読み, 表記) の学習だけを消す。先頭が「もしかして」
-    /// （その場で計算した誤字補正で、学習由来ではない）の場合は消すものが無いので
-    /// 何もしない。リセットしたら true。
+    /// の場合、その場で計算した誤字補正（学習由来ではない）なら消すものが無いので
+    /// 何もしないが、学習済みの誤字修正（prediction_top_is_learned_typo）なら
+    /// その学習を消す。リセットしたら true。
     pub(crate) fn reset_prediction_learning(&mut self) -> bool {
         if self.predictions.is_empty() {
             return false;
         }
         let idx = self.prediction_index.min(self.predictions.len() - 1);
-        // もしかして（fuzzy）先頭は学習由来でないのでリセット対象外
         if self.prediction_top_is_fuzzy && idx == 0 {
-            return false;
+            // 学習済みの誤字修正なら、その誤字学習だけを消す
+            // （その場計算のもしかしてには消す学習が無いので何もしない）。
+            if !self.prediction_top_is_learned_typo {
+                return false;
+            }
+            let wrong_reading = self.hiragana_buffer.clone();
+            let (reading, surface) = self.predictions[0].clone();
+            if wrong_reading.is_empty() {
+                return false;
+            }
+            if let Some(learning) = self.learning.as_ref() {
+                let _ = learning.forget_typo_correction(&wrong_reading, &reading, &surface);
+            }
+            if let Some(conv) = self.converter.as_mut() {
+                conv.forget_typo_correction(&wrong_reading);
+            }
+            debug_log!(
+                "誤字修正の学習リセット: '{}' → 読み='{}' 表記='{}'",
+                wrong_reading, reading, surface
+            );
+            self.update_predictions();
+            return true;
         }
         let (reading, surface) = self.predictions[idx].clone();
         if reading.is_empty() || surface.is_empty() {
@@ -702,6 +786,9 @@ impl LiveConversionState {
             }
         }
         // バイグラム（隣接する表記のつながり）
+        // 収集だけしておき、実際の登録は関数末尾（learning の借用が終わった後）で行う
+        // （register_auto_compound は &mut self で learning/converter 両方に触るため）。
+        let mut auto_compound_candidates: Vec<(String, String)> = Vec::new();
         for pair in segments.windows(2) {
             let prev = &pair[0].1;
             let next = &pair[1].1;
@@ -716,6 +803,27 @@ impl LiveConversionState {
             let freq = learning.find_bigram_frequency(prev, next).unwrap_or(1);
             if let Some(conv) = self.converter.as_mut() {
                 conv.learn_bigram(prev, next, freq);
+            }
+            // 隣接する漢字複合語の自動登録判定（辞書に無く・両方とも漢字を
+            // 含む内容語・反復して確定されている場合、1語として登録する）。
+            if freq >= AUTO_COMPOUND_MIN_FREQ
+                && common::viterbi::is_content_pos(&pair[0].2)
+                && common::viterbi::is_content_pos(&pair[1].2)
+                && contains_kanji(prev)
+                && contains_kanji(next)
+            {
+                let combined_reading = format!("{}{}", pair[0].0, pair[1].0);
+                if combined_reading.chars().count() <= AUTO_COMPOUND_MAX_READING_LEN {
+                    let combined_surface = format!("{}{}", prev, next);
+                    let already_exists = self
+                        .converter
+                        .as_ref()
+                        .and_then(|c| c.dictionary.lookup(&combined_reading))
+                        .is_some_and(|entries| entries.iter().any(|e| e.surface == combined_surface));
+                    if !already_exists {
+                        auto_compound_candidates.push((combined_reading, combined_surface));
+                    }
+                }
             }
         }
         // 内容語連想（助詞・助動詞を飛ばした内容語どうしの繋がり）
@@ -737,6 +845,9 @@ impl LiveConversionState {
             }
             last_content = Some(surface.clone());
         }
+        for (reading, surface) in auto_compound_candidates {
+            self.register_auto_compound(&reading, &surface);
+        }
     }
 
     /// 辞書をロード
@@ -746,6 +857,28 @@ impl LiveConversionState {
             Ok(dict) => {
                 debug_log!("辞書読み込み成功、ViterbiConverter作成中");
                 self.converter = Some(ViterbiConverter::new(dict));
+                // コーパス由来の語頻度データ（あれば）を読み込む。辞書と
+                // 同じディレクトリの corpus_lm.dic を探す（無くても動作する
+                // 任意のファイル。Stage 0の検証用資産）。
+                let corpus_lm_path = path.with_file_name("corpus_lm.dic");
+                if corpus_lm_path.exists() {
+                    match common::CorpusLm::load(&corpus_lm_path) {
+                        Ok(lm) => {
+                            if let Some(conv) = self.converter.as_mut() {
+                                conv.load_corpus_lm(&lm);
+                            }
+                            debug_log!(
+                                "コーパスLMを読み込みました: {} (unigram={}, bigram={})",
+                                corpus_lm_path.display(),
+                                lm.unigrams.len(),
+                                lm.bigrams.len()
+                            );
+                        }
+                        Err(e) => {
+                            debug_log!("コーパスLMのロードに失敗: {}", e);
+                        }
+                    }
+                }
                 // 過去の学習をライブ変換エンジンに反映
                 self.reload_learning_into_converter();
                 // ユーザー登録の単語を辞書へ注入（辞書に無い複合語を変換可能に）
@@ -1098,53 +1231,48 @@ impl LiveConversionState {
         let suffix_reading: String =
             entries[end + 1..].iter().map(|e| e.reading.as_str()).collect();
 
-        // 対象文節の同音語を集め、「実際の使いやすさ」を近似したキーで並べる
-        // 並び順: 学習頻度が高い順 → 実効コストが低い順
-        //   実効コスト = 辞書コスト + 1文字漢字ペナルティ - 学習ユニグラムのボーナス
-        //   （1文字の漢字は単独語として使われることが稀で、IPA辞書の
-        //    コストが実際の出現頻度より低く出るため補正する。学習ユニグラム
-        //    には起動時に薄く仕込んだ頻出語プリセット（COMMON_WORD_SEED）も
-        //    含まれており、ライブ変換の1-bestが正しく選べている語を候補一覧
-        //    でも上位にするために必須。ここを見ないと、まだ一度も確定して
-        //    いない一般的な語がプリセットの恩恵を受けられず、辞書コストが
-        //    たまたま低いだけの稀な語に負けてしまう）
+        // 対象文節の同音語を集め、実際にその位置に置いたときの文全体コストで
+        // 並べる。以前は対象語だけの辞書コスト＋ペナルティ－学習ボーナスという
+        // 独自の簡易式（前後の語との接続コストを一切見ない）で並べていたため、
+        // 自動変換（文全体のViterbi）の1-bestと候補一覧の1位が食い違ったり、
+        // 接続コストの都合で本来は選ばれない低頻度語が候補一覧の上位に出る
+        // ことがあった。ここでは`effective_word_cost`（学習ユニグラム・
+        // コーパス頻度・1文字漢字ペナルティ込みの単語自身のコスト）に、
+        // 前後の確定済み文節との接続コスト（`context_connection_cost`。
+        // 学習/コーパスのバイグラムボーナスを含む、自動変換と同じ計算式）を
+        // 加えた合計で並べる。これにより自動変換の1-bestと候補一覧の1位が
+        // 構造的に一致する（ただし`scoring.rs`のガード関数群は含まない簡易版
+        // であり、完全に同一のロジックではない）。
         struct Seg {
             surface: String,
-            freq: u32,
             eff_cost: i32,
         }
+        let prev_entry = if start > 0 { entries.get(start - 1) } else { None };
+        let next_entry = entries.get(end + 1);
         let mut segs: Vec<Seg> = Vec::new();
         if let Some(words) = converter.dictionary.lookup(&seg_reading) {
             for w in words {
-                let freq = self
-                    .learning
-                    .as_ref()
-                    .and_then(|l| l.find_frequency(&seg_reading, &w.surface).ok())
-                    .unwrap_or(0);
-                let penalty = single_kanji_penalty(&w.surface) + symbol_entry_penalty(&w.pos);
-                let bonus = converter
-                    .learned_unigram
-                    .get(&(w.reading.clone(), w.surface.clone()))
-                    .copied()
-                    .unwrap_or(0);
+                // 記号品詞（ギリシャ文字等）は辞書コストが低くても実用語より
+                // 優先させない（scoring.rsの`symbol_penalty`はASCII/全角記号
+                // だけを対象にしており、χ等の記号POS全般はカバーしないため
+                // ここで別途ペナルティを科す）。
+                let penalty = symbol_entry_penalty(&w.pos);
+                let own_cost = converter.effective_word_cost(w).saturating_add(penalty);
+                let ctx_cost = converter.context_connection_cost(prev_entry, w, next_entry);
                 segs.push(Seg {
                     surface: w.surface.clone(),
-                    freq,
-                    eff_cost: (w.cost as i32 + penalty).saturating_sub(bonus),
+                    eff_cost: own_cost.saturating_add(ctx_cost),
                 });
             }
         }
         // カタカナ・ひらがな表記も候補に含める（末尾寄り）
         let katakana = common::hiragana_to_katakana(&seg_reading);
         if katakana != seg_reading {
-            segs.push(Seg { surface: katakana, freq: 0, eff_cost: 30000 });
+            segs.push(Seg { surface: katakana, eff_cost: 50000 });
         }
-        segs.push(Seg { surface: seg_reading.clone(), freq: 0, eff_cost: 32000 });
+        segs.push(Seg { surface: seg_reading.clone(), eff_cost: 52000 });
 
-        // 学習頻度が高い順 → 実効コストが低い順
-        // （文全体の 1-best は IPA コストの癖で 1文字漢字を選ぶことがあるため、
-        //  ここでは 1-best を先頭固定せず、ペナルティ込みコスト順に任せる）
-        segs.sort_by(|a, b| b.freq.cmp(&a.freq).then(a.eff_cost.cmp(&b.eff_cost)));
+        segs.sort_by(|a, b| a.eff_cost.cmp(&b.eff_cost));
 
         // 前半（固定）+ 対象文節表記 + 後半（固定）で候補文字列を作る
         let mut seen = std::collections::HashSet::new();
@@ -1384,25 +1512,6 @@ pub(crate) fn is_single_kanji_entry(e: &common::WordEntry) -> bool {
     }
 }
 
-/// 1文字の漢字表記に対するコストペナルティ
-///
-/// IPA辞書は解析用のため、1文字漢字の名詞（教・卿・挟 など）が
-/// 単独語として実際の出現頻度より低コストに設定されていることが多い。
-/// かな漢字変換の候補一覧ではこれらが上位に来ると邪魔なので、
-/// 候補並べ替え用に実効コストを底上げする（辞書自体は変更しない）。
-pub(crate) fn single_kanji_penalty(surface: &str) -> i32 {
-    let mut chars = surface.chars();
-    let (Some(c), None) = (chars.next(), chars.next()) else {
-        return 0; // 2文字以上は対象外
-    };
-    let is_kanji = ('\u{4E00}'..='\u{9FFF}').contains(&c) || ('\u{3400}'..='\u{4DBF}').contains(&c);
-    if is_kanji {
-        2000
-    } else {
-        0
-    }
-}
-
 /// 記号品詞（ギリシャ文字等の「記号-アルファベット」等）の候補に対する
 /// コストペナルティ（候補並べ替え専用。辞書自体は変更しない）。
 ///
@@ -1425,6 +1534,13 @@ pub(crate) fn is_hiragana_reading(reading: &str) -> bool {
     reading
         .chars()
         .all(|c| ('\u{3041}'..='\u{3096}').contains(&c) || c == 'ー')
+}
+
+/// 表記に漢字（CJK統合漢字）が1文字以上含まれるか。
+/// 隣接複合語の自動登録を「漢字を含む内容語どうし」に絞るための判定
+/// （助詞やひらがなだけの語を巻き込まないため）。
+pub(crate) fn contains_kanji(surface: &str) -> bool {
+    surface.chars().any(|c| ('\u{4E00}'..='\u{9FAF}').contains(&c))
 }
 
 /// この (読み, 表記) ペアを学習してよいか
@@ -1531,6 +1647,225 @@ mod build_candidates_tests {
         let (candidates, ..) = state.build_candidates();
         assert_ne!(candidates.first().map(String::as_str), Some("χ"), "記号が先頭に来てはいけない");
     }
+
+    /// 前の文節との接続コストが候補一覧の並び順に反映されることを確認する
+    /// （修正前は対象語だけの辞書コストで並べており、前後の文脈を一切
+    /// 見ていなかった）。「硬貨」は単語コスト自体はわずかに安いが、直前の
+    /// 「為替」との接続コストが「効果」よりずっと高い設定にしてあるため、
+    /// 文全体では「効果」の方が自然（自動変換の1-bestも効果になる）。
+    /// 候補一覧の1位もそれと一致するべき。
+    #[test]
+    fn context_connection_cost_affects_candidate_order() {
+        let mut dict = Dictionary::new();
+        dict.matrix = common::ConnectionMatrix::new(10, 10);
+        for i in 0..10 {
+            for j in 0..10 {
+                dict.matrix.set(i, j, 200);
+            }
+        }
+        dict.matrix.set(1, 2, 50); // 為替→効果: 自然な接続
+        dict.matrix.set(1, 3, 9000); // 為替→硬貨: 不自然な接続
+        dict.add_word(common::WordEntry {
+            surface: "為替".to_string(), reading: "かわせ".to_string(),
+            left_id: 1, right_id: 1, cost: 3000, pos: "名詞".to_string(),
+        });
+        dict.add_word(common::WordEntry {
+            surface: "効果".to_string(), reading: "こうか".to_string(),
+            left_id: 2, right_id: 2, cost: 3000, pos: "名詞".to_string(),
+        });
+        dict.add_word(common::WordEntry {
+            surface: "硬貨".to_string(), reading: "こうか".to_string(),
+            left_id: 3, right_id: 3, cost: 2900, pos: "名詞".to_string(),
+        });
+        let converter = ViterbiConverter::new(dict);
+
+        let mut state = LiveConversionState::new();
+        state.hiragana_buffer = "かわせこうか".to_string();
+        state.converter = Some(converter);
+
+        // 自動変換（文全体の1-best）は「効果」を選ぶ
+        let live = state.converter.as_ref().unwrap().convert_context_aware_to_string("かわせこうか");
+        assert_eq!(live, "為替効果");
+
+        // 候補一覧の1位も一致するべき（単語コスト単体では「硬貨」の方が
+        // 安いが、文脈込みの合計コストでは「効果」が勝つ）
+        let (candidates, _seg_reading, seg_surfaces, ..) = state.build_candidates();
+        assert_eq!(seg_surfaces.first().map(String::as_str), Some("効果"));
+        assert_eq!(candidates.first().map(String::as_str), Some("為替効果"));
+    }
+}
+
+#[cfg(test)]
+mod auto_compound_tests {
+    use super::*;
+
+    fn dict_without_compound() -> common::Dictionary {
+        let mut dict = common::Dictionary::new();
+        dict.add_word(common::WordEntry {
+            surface: "再".to_string(), reading: "さい".to_string(),
+            left_id: 1, right_id: 1, cost: 4000, pos: "接頭詞-名詞接続-*-*".to_string(),
+        });
+        dict.add_word(common::WordEntry {
+            surface: "起動".to_string(), reading: "きどう".to_string(),
+            left_id: 1, right_id: 1, cost: 4000, pos: "名詞-サ変接続-*-*".to_string(),
+        });
+        dict
+    }
+
+    /// 「再」+「起動」のように辞書に無い複合語（再起動）が3回続けて隣接して
+    /// 確定されたら、辞書に単語として自動登録され、DBには source='auto' で
+    /// 記録されることを確認する。1〜2回目ではまだ登録されない（反復を要求）。
+    #[test]
+    fn repeated_adjacent_kanji_pair_gets_auto_registered() {
+        let mut state = LiveConversionState::new();
+        state.converter = Some(ViterbiConverter::new(dict_without_compound()));
+        state.learning = common::LearningRepository::in_memory().ok();
+        assert!(state.learning.is_some());
+
+        let segments = vec![
+            ("さい".to_string(), "再".to_string(), "接頭詞-名詞接続-*-*".to_string()),
+            ("きどう".to_string(), "起動".to_string(), "名詞-サ変接続-*-*".to_string()),
+        ];
+
+        state.learn_from_segments(&segments);
+        state.learn_from_segments(&segments);
+        let not_yet = state
+            .converter
+            .as_ref()
+            .unwrap()
+            .dictionary
+            .lookup("さいきどう")
+            .is_none_or(|es| !es.iter().any(|e| e.surface == "再起動"));
+        assert!(not_yet, "1〜2回目ではまだ自動登録されないはず");
+
+        state.learn_from_segments(&segments);
+        let conv = state.converter.as_ref().unwrap();
+        assert!(
+            conv.dictionary
+                .lookup("さいきどう")
+                .unwrap()
+                .iter()
+                .any(|e| e.surface == "再起動"),
+            "3回目で辞書に自動登録されるはず"
+        );
+
+        let words = state.learning.as_ref().unwrap().get_all_user_words().unwrap();
+        let auto = words
+            .iter()
+            .find(|w| w.reading == "さいきどう" && w.surface == "再起動")
+            .expect("DBにも登録されているはず");
+        assert_eq!(auto.source, "auto");
+    }
+
+    /// 助詞や単独ひらがなを挟むペアは自動登録しない
+    #[test]
+    fn particle_adjacent_pair_not_registered() {
+        let mut dict = common::Dictionary::new();
+        dict.add_word(common::WordEntry {
+            surface: "検索".to_string(), reading: "けんさく".to_string(),
+            left_id: 1, right_id: 1, cost: 4000, pos: "名詞-サ変接続-*-*".to_string(),
+        });
+        let mut state = LiveConversionState::new();
+        state.converter = Some(ViterbiConverter::new(dict));
+        state.learning = common::LearningRepository::in_memory().ok();
+
+        let segments = vec![
+            ("けんさく".to_string(), "検索".to_string(), "名詞-サ変接続-*-*".to_string()),
+            ("は".to_string(), "は".to_string(), "助詞-係助詞-*-*".to_string()),
+        ];
+        for _ in 0..5 {
+            state.learn_from_segments(&segments);
+        }
+        let words = state.learning.as_ref().unwrap().get_all_user_words().unwrap();
+        assert!(words.is_empty(), "助詞を挟むペアは自動登録されないはず");
+    }
+}
+
+#[cfg(test)]
+mod typo_learning_tests {
+    use super::*;
+
+    fn typo_test_dict() -> Dictionary {
+        let mut dict = Dictionary::new();
+        dict.add_word(common::WordEntry {
+            surface: "今日".to_string(), reading: "きょう".to_string(),
+            left_id: 1, right_id: 1, cost: 3000, pos: "名詞".to_string(),
+        });
+        dict.add_word(common::WordEntry {
+            surface: "は".to_string(), reading: "は".to_string(),
+            left_id: 2, right_id: 2, cost: 3000, pos: "助詞".to_string(),
+        });
+        dict
+    }
+
+    /// もしかしての先頭候補を確定すると誤字修正が学習され、次回同じ誤字を
+    /// 打ったときに（辞書のあいまい検索をやり直さず）学習済み候補として
+    /// 最優先で出てくること、さらに Delete でその学習だけをリセットできる
+    /// ことを一連の流れで確認する。
+    ///
+    /// もしかしての初回検出手段（ローマ字取り残し repair 等）とは切り離して
+    /// 「確定→学習→次回再利用→Deleteでリセット」のパイプラインだけを
+    /// 検証するため、1回目の候補は実際の検出を通さず直接セットする
+    /// （もしかしての一般的なあいまい検索はノイズ低減のため既に廃止済み。
+    /// [[fuzzy-correction-approach]]参照。学習・再利用の仕組み自体は
+    /// 検出手段が何であっても同じonce もしかしてとして出た候補に対して働く）。
+    #[test]
+    fn accepting_fuzzy_suggestion_learns_and_reapplies_next_time() {
+        let mut state = LiveConversionState::new();
+        state.converter = Some(ViterbiConverter::new(typo_test_dict()));
+        state.learning = common::LearningRepository::in_memory().ok();
+        assert!(state.learning.is_some());
+
+        // 1回目: 「きようは」（拗音の打ち間違い）に対して、もしかして候補
+        // 「きょうは→今日は」が出ている状態を再現する。まだ学習していない
+        // ので prediction_top_is_learned_typo は false。
+        state.hiragana_buffer = "きようは".to_string();
+        state.predictions = vec![("きょうは".to_string(), "今日は".to_string())];
+        state.prediction_top_is_fuzzy = true;
+        state.prediction_top_is_learned_typo = false;
+
+        // その候補を確定する（＝ユーザーが修正を採用した）
+        state.commit_prediction(0);
+
+        // 学習DB・メモリ上の変換器の両方に誤字修正が記録されている
+        let freq = state
+            .learning
+            .as_ref()
+            .unwrap()
+            .find_typo_correction_frequency("きようは", "きょうは", "今日は")
+            .unwrap();
+        assert_eq!(freq, 1);
+        assert!(state
+            .converter
+            .as_ref()
+            .unwrap()
+            .typo_corrections
+            .contains_key("きようは"));
+
+        // 2回目: 同じ誤字「きようは」を打つと、あいまい検索をやり直さず
+        // 学習済みの修正がそのまま最優先の候補として出る。
+        state.hiragana_buffer = "きようは".to_string();
+        state.update_predictions();
+        assert!(state.prediction_top_is_fuzzy);
+        assert!(state.prediction_top_is_learned_typo, "学習済み候補として出るべき");
+        assert_eq!(state.predictions.first(), Some(&("きょうは".to_string(), "今日は".to_string())));
+
+        // Delete で誤字修正の学習だけをリセットできる
+        assert!(state.reset_prediction_learning());
+        assert!(!state
+            .converter
+            .as_ref()
+            .unwrap()
+            .typo_corrections
+            .contains_key("きようは"));
+        let freq_after = state
+            .learning
+            .as_ref()
+            .unwrap()
+            .find_typo_correction_frequency("きようは", "きょうは", "今日は")
+            .unwrap();
+        assert_eq!(freq_after, 0);
+    }
 }
 
 #[cfg(test)]
@@ -1556,3 +1891,4 @@ mod reading_validation_tests {
         assert!(!is_hiragana_reading("react"));
     }
 }
+

@@ -7,8 +7,10 @@ pub mod typo;
 pub mod converter;
 pub mod learning;
 pub mod rerank;
+pub mod corpus_lm;
 
 pub use dictionary::{Dictionary, WordEntry, TrieNode, ConnectionMatrix, CharCategory, PosId};
+pub use corpus_lm::CorpusLm;
 pub use viterbi::{ViterbiConverter, LiveConversionContext, Lattice, LatticeNode, IncrementalViterbi};
 pub use candidate::{Candidate, CandidateKind, hiragana_to_katakana, katakana_to_hiragana};
 pub use composition::{CompositionState, InputContext, should_auto_convert};

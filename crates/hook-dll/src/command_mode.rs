@@ -227,11 +227,21 @@ pub(crate) fn update_command_suggestions() {
         }
         return;
     }
-    let preds = command_predictions(&buf, 8);
+    let preds = command_predictions(&buf, CANDIDATE_PAGE_SIZE);
     if preds.is_empty() {
         if !flashing {
             hide_candidate_window();
         }
+        return;
+    }
+    // まだ一度も表示していない（＝これが初回表示になる）のに、実位置
+    // （Win32キャレット/UIAキャッシュ）がまだ無い場合は今回は表示を見送る。
+    // UIAポーラーはターミナルにフォーカスがある間バックグラウンドで
+    // 位置を取得し続けているため、次の打鍵までにはほぼ間に合う
+    // （たった数十ms）。ここで無理に出すと、フォアグラウンド窓の最下部
+    // という粗いフォールバック位置にまず表示され、実位置が届いた次の
+    // 打鍵で正しい位置へ飛ぶという見た目の違和感が生じるため、それを避ける。
+    if !candidate_window_visible() && !has_reliable_caret_pos() {
         return;
     }
     let items: Vec<String> = preds.iter().map(|(disp, _, _, _, _)| disp.clone()).collect();
@@ -247,7 +257,7 @@ pub(crate) unsafe fn command_move(forward: bool) -> bool {
     if buf.trim().is_empty() {
         return false;
     }
-    let preds = command_predictions(&buf, 8);
+    let preds = command_predictions(&buf, CANDIDATE_PAGE_SIZE);
     if preds.is_empty() {
         return false;
     }
@@ -302,6 +312,50 @@ pub(crate) unsafe fn command_commit() -> Option<LRESULT> {
     Some(LRESULT(1))
 }
 
+/// Ctrl+数字(1〜9): 一覧の index 番目（0始まり）の候補を選んで確定・実行する。
+/// `command_commit` と同じ確定処理を、選択インデックスを明示して行う版。
+///
+/// 素の数字キー（1〜9）は git のコミット数指定・ポート番号など実際のコマンド
+/// 文字列で頻繁に使われるため選択キーには使えない。Ctrl併用なら通常の
+/// コマンド入力と衝突しない（呼び出し側で Ctrl 押下時のみ呼ぶ）。
+/// 対象候補が無ければ None（キーは消費しない＝呼び出し側の通常の
+/// Ctrl+キー処理へ委ねる）。
+pub(crate) unsafe fn command_select_by_number(index: usize) -> Option<LRESULT> {
+    let buf = COMMAND_LINE.lock().map(|x| x.clone()).unwrap_or_default();
+    if buf.trim().is_empty() {
+        return None;
+    }
+    let preds = command_predictions(&buf, CANDIDATE_PAGE_SIZE);
+    if index >= preds.len() {
+        return None;
+    }
+    COMMAND_SEL = index;
+    let (_disp, target, _desc, _is_alias, auto_run) = preds[index].clone();
+    // トリガーが Ctrl+数字 のため、この時点ではユーザーはまだ物理的に
+    // Ctrl を押したままのことが多い。合成 Backspace が Ctrl+Backspace
+    // （単語ごと削除）に化けるのを防ぐため、確定処理の間だけ合成的に
+    // Ctrl を離し、処理後に押し直して物理状態と辻褄を合わせる。
+    send_vk_edge(VK_CONTROL, false);
+    execute_action(ConversionAction {
+        delete_count: buf.chars().count(),
+        insert_text: target.clone(),
+    });
+    if auto_run {
+        send_vk(VK_RETURN);
+        record_command_line(&target);
+        if let Ok(mut b) = COMMAND_LINE.lock() {
+            b.clear();
+        }
+    } else {
+        if let Ok(mut b) = COMMAND_LINE.lock() {
+            *b = target;
+        }
+    }
+    send_vk_edge(VK_CONTROL, true);
+    hide_candidate_window();
+    Some(LRESULT(1))
+}
+
 /// Delete: 一覧で選択中の「コマンド履歴」を削除する（学習DBから消す）。
 /// 履歴コマンド（is_alias=false）のみ対象。エイリアスは設定ウィンドウで管理。
 /// 削除したら true（＝キーを消費）。対象が無ければ false（従来の行編集扱いへ）。
@@ -310,7 +364,7 @@ pub(crate) unsafe fn command_delete_selected() -> bool {
     if buf.trim().is_empty() {
         return false;
     }
-    let preds = command_predictions(&buf, 8);
+    let preds = command_predictions(&buf, CANDIDATE_PAGE_SIZE);
     if preds.is_empty() || COMMAND_SEL >= preds.len() {
         return false;
     }

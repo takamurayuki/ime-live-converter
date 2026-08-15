@@ -89,12 +89,54 @@ pub(crate) fn is_shift_pressed() -> bool {
     unsafe { SHIFT_HELD }
 }
 
+/// vkCodeごとの「現在押されっぱなしか」を追う配列（OSキーリピート検出用）。
+///
+/// WH_KEYBOARD_LL の KBDLLHOOKSTRUCT には、古典的な WM_KEYDOWN の lParam
+/// ビット30（「直前も押されていたか」）に相当する情報が無いため、自前で
+/// vkCodeごとの押下状態を追跡しないとOSのキーリピート（押しっぱなし）を
+/// 検出できない。`static mut`配列への索引アクセスは共有参照の警告が出る
+/// ため、他の共有可変状態（COMMAND_LINE 等）と同様に Mutex で持つ。
+pub(crate) static KEY_REPEAT_HELD: Mutex<[bool; 256]> = Mutex::new([false; 256]);
+
+/// このイベントがOSのキーリピート（同じキーを押しっぱなしにした再送）かを
+/// 判定しつつ、held状態を更新する。呼ぶ側は自己注入キー（SendInputで
+/// 送った合成キー）を渡さないこと（自分が送ったBackspace/Enter等の連続
+/// 送出を「実キーのリピート」と誤認識し、次の本物のキー入力を誤って
+/// リピート扱いしてしまうため）。
+pub(crate) fn track_key_repeat(vk_code: u32, event: u32) -> bool {
+    let idx = vk_code as usize;
+    let Ok(mut held) = KEY_REPEAT_HELD.lock() else { return false };
+    if idx >= held.len() {
+        return false;
+    }
+    if event == WM_KEYDOWN || event == WM_SYSKEYDOWN {
+        let was_held = held[idx];
+        held[idx] = true;
+        was_held
+    } else {
+        // KEYUP等: 押されていない状態に戻す（リピートではない）
+        held[idx] = false;
+        false
+    }
+}
+
 /// Ctrlキーが押されているか確認
 pub(crate) fn is_ctrl_pressed() -> bool {
     unsafe {
         use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
         GetAsyncKeyState(VK_CONTROL.0 as i32) < 0
     }
+}
+
+/// vk_code が修飾キー自体（Ctrl/Alt/Shift の左右どちらか）か。
+///
+/// 低レベルキーボードフックの vkCode は、修飾キー自体が押された/離された
+/// イベントでは総称の VK_CONTROL(0x11)/VK_MENU(0x12) ではなく、左右を
+/// 区別した VK_LCONTROL(0xA2)/VK_RCONTROL(0xA3)/VK_LMENU(0xA4)/VK_RMENU(0xA5)
+/// 等で届く。Ctrl+数字のような組み合わせキー判定で「Ctrlキー自体の押下」を
+/// combo として誤検出しないよう、除外判定に使う。
+pub(crate) fn is_modifier_vk(vk_code: u32) -> bool {
+    matches!(vk_code, 0x10 | 0x11 | 0x12 | 0xA0 | 0xA1 | 0xA2 | 0xA3 | 0xA4 | 0xA5)
 }
 
 /// Altキーが押されているか確認
@@ -122,6 +164,33 @@ pub(crate) fn is_ime_toggle_vk(vk: u32) -> bool {
     matches!(vk, 0x19 | 0xF3 | 0xF4)
 }
 
+/// フォアグラウンド窓の「実際にキーボードフォーカスを持つ窓」を解決する。
+///
+/// `ImmGetDefaultIMEWnd`はIMEコンテキストを引数のhwndから解決するが、
+/// WebView2/Chromium系のように「トップレベル窓とは別の子窓が実際に入力を
+/// 受け取る」構成のアプリでは、`GetForegroundWindow()`が返すトップレベル窓
+/// と、実際にIME上フォーカスされている窓が一致しないことがある。その場合
+/// IMEの開閉指示がトップレベル窓へ送られても実際にテキストを受け取る窓
+/// には届かず、MS-IMEが開いたまま残って注入した文字が二重に変換される
+/// （実機報告: WebView2アプリで二重変換・文字化けが発生）。
+/// `GetGUIThreadInfo`でフォアグラウンドスレッドの実際のフォーカス窓
+/// (`hwndFocus`)を取得できればそちらを対象にし、取れなければ従来通り
+/// トップレベル窓自体にフォールバックする。
+pub(crate) fn resolve_ime_target_hwnd(hwnd_fg: HWND) -> HWND {
+    unsafe {
+        let tid = GetWindowThreadProcessId(hwnd_fg, None);
+        let mut gti = GUITHREADINFO {
+            cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+            ..Default::default()
+        };
+        if GetGUIThreadInfo(tid, &mut gti).is_ok() && !gti.hwndFocus.0.is_null() {
+            gti.hwndFocus
+        } else {
+            hwnd_fg
+        }
+    }
+}
+
 /// フォアグラウンドウィンドウの MS-IME を強制的に閉じる
 ///
 /// 我々が SendInput KEYEVENTF_UNICODE で送る文字を MS-IME が
@@ -130,10 +199,11 @@ pub(crate) fn is_ime_toggle_vk(vk: u32) -> bool {
 pub(crate) fn close_ms_ime_for_foreground() {
     unsafe {
         use windows::Win32::UI::WindowsAndMessaging::{SendMessageTimeoutW, SMTO_ABORTIFHUNG};
-        let hwnd = GetForegroundWindow();
-        if hwnd.0.is_null() {
+        let hwnd_fg = GetForegroundWindow();
+        if hwnd_fg.0.is_null() {
             return;
         }
+        let hwnd = resolve_ime_target_hwnd(hwnd_fg);
         let ime_wnd = ImmGetDefaultIMEWnd(hwnd);
         if ime_wnd.0.is_null() {
             return;
@@ -160,10 +230,11 @@ pub(crate) fn close_ms_ime_for_foreground() {
 pub(crate) fn open_ms_ime_hiragana_for_foreground() {
     unsafe {
         use windows::Win32::UI::WindowsAndMessaging::{SendMessageTimeoutW, SMTO_ABORTIFHUNG};
-        let hwnd = GetForegroundWindow();
-        if hwnd.0.is_null() {
+        let hwnd_fg = GetForegroundWindow();
+        if hwnd_fg.0.is_null() {
             return;
         }
+        let hwnd = resolve_ime_target_hwnd(hwnd_fg);
         let ime_wnd = ImmGetDefaultIMEWnd(hwnd);
         if ime_wnd.0.is_null() {
             return;
@@ -299,11 +370,12 @@ pub(crate) fn toggle_our_active() {
 /// - それ以外 (NATIVE && !KATAKANA) → ひらがなモード → 変換ON
 pub(crate) fn is_ime_hiragana_mode() -> bool {
     unsafe {
-        let hwnd = GetForegroundWindow();
-        if hwnd.0.is_null() {
+        let hwnd_fg = GetForegroundWindow();
+        if hwnd_fg.0.is_null() {
             debug_log!("IMEモード: フォアグラウンドウィンドウなし - パススルー");
             return false;
         }
+        let hwnd = resolve_ime_target_hwnd(hwnd_fg);
 
         let ime_wnd = ImmGetDefaultIMEWnd(hwnd);
         if ime_wnd.0.is_null() {
@@ -381,6 +453,34 @@ pub(crate) fn send_vk(vk: VIRTUAL_KEY) {
                 },
             },
         ];
+        SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+    }
+}
+
+/// 修飾キー（Ctrl等）だけを押す/離す1イベントだけ送る。
+///
+/// Ctrl+数字のような修飾キー付きのトリガーで確定処理を行う場合、その時点
+/// ではユーザーが物理的にまだCtrlを押したままになっている。ここで送る
+/// 合成 Backspace（`execute_action`）はキー自体には修飾キー情報を持たない
+/// 単なる VK_BACK だが、OSは「現在押されている修飾キー」を見て配信先へ
+/// 通知するため、物理Ctrlが押されたままだと合成 Backspace が
+/// Ctrl+Backspace（多くのシェルで「単語ごと削除」）に化けてしまう。
+/// 確定処理の前後でCtrlを合成的に離す/押し直すことで、この化けを防ぎつつ、
+/// 処理後もユーザーの物理的な押下状態と辻褄を合わせる。
+pub(crate) fn send_vk_edge(vk: VIRTUAL_KEY, down: bool) {
+    unsafe {
+        let inputs = [INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: vk,
+                    wScan: 0,
+                    dwFlags: if down { KEYBD_EVENT_FLAGS(0) } else { KEYEVENTF_KEYUP },
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        }];
         SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
     }
 }
@@ -498,6 +598,11 @@ pub extern "system" fn LowLevelKeyboardProc(
             return CallNextHookEx(None, code, wparam, lparam);
         }
 
+        // 実キーのリピート状態を更新（自己注入キーを除外した後で行う。
+        // 自分が送るBackspace/Enter等の連続送出を「押しっぱなし」と
+        // 誤認識すると、次の本物のキー入力まで誤ってリピート扱いされる）。
+        let is_key_repeat = track_key_repeat(kb.vkCode, event);
+
         // 有効でない場合はパススルー
         if !IS_ENABLED {
             debug_log!("変換無効: パススルー");
@@ -564,8 +669,24 @@ pub extern "system" fn LowLevelKeyboardProc(
             //   - それ以外 → 従来どおりパススルー。
             if !OUR_ACTIVE {
                 if IS_ENABLED && is_terminal_focused() {
-                    // Ctrl/Alt 併用（Ctrl+C 等の行編集・ショートカット）は追跡を中断
-                    if is_ctrl_pressed() || is_alt_pressed() {
+                    // Ctrl+数字(1〜9): コマンド候補一覧を番号で直接選んで実行する。
+                    // 素の数字キーは git log -1 やポート番号等、実際のコマンド
+                    // 文字列で頻繁に使うため選択キーにできない（Ctrl併用なら
+                    // 衝突しない）。対象候補が無ければ None が返り、下の通常の
+                    // Ctrl/Alt処理（追跡中断・パススルー）にそのまま委ねる。
+                    if is_ctrl_pressed() && !is_alt_pressed() && (0x31..=0x39).contains(&vk_code) {
+                        if let Some(r) = command_select_by_number((vk_code - 0x31) as usize) {
+                            return r;
+                        }
+                    }
+                    // Ctrl/Alt 併用（Ctrl+C 等の行編集・ショートカット）は追跡を中断。
+                    // ただし vk_code が修飾キー自体（Ctrlを押した/離した瞬間の
+                    // イベント）のときは対象外にする。除外しないと、Ctrl+数字を
+                    // 押そうとして先に Ctrl だけが単独のイベントとして届いた
+                    // 時点でバッファが消え、ポップアップが即座に閉じてしまう
+                    // （その後の数字キーはターミナルへ生で漏れ、ベル音や
+                    // ターミナル側のCtrl+数字ショートカットが誤発火する）。
+                    if (is_ctrl_pressed() || is_alt_pressed()) && !is_modifier_vk(vk_code) {
                         if let Ok(mut b) = COMMAND_LINE.lock() {
                             b.clear();
                         }
@@ -722,6 +843,14 @@ pub extern "system" fn LowLevelKeyboardProc(
 
                     // アルファベット・句読点キー
                     if let Some(ch) = vk_to_char(vk_code, kb.scanCode, is_shift_pressed()) {
+                        // OSのキーリピート（押しっぱなし）による再送は無視する。
+                        // 特に句読点（,.?!）は入力後に自動確定するため、リピートで
+                        // 複数回処理されると「。」「、」等が連続して重複挿入され、
+                        // かつ確定処理（学習の記録等）も余分に走ってしまう
+                        // （実機報告: "." で「。。」が連続して出る）。
+                        if is_key_repeat {
+                            return LRESULT(1);
+                        }
                         let mut actions = Vec::new();
 
                         // 候補一覧から選択中に次の入力が来たら、選択中の候補を
@@ -935,5 +1064,40 @@ pub extern "system" fn LowLevelKeyboardProc(
         }
 
         CallNextHookEx(None, code, wparam, lparam)
+    }
+}
+
+#[cfg(test)]
+mod key_repeat_tests {
+    use super::*;
+
+    /// 他のテストと static を共有するため、衝突しない未使用の vkCode を使う。
+    const TEST_VK: u32 = 250;
+
+    #[test]
+    fn keydown_then_keyup_is_not_a_repeat() {
+        // 前のテストの残留状態を掃除
+        track_key_repeat(TEST_VK, WM_KEYUP);
+        // 最初の押下はリピートではない
+        assert!(!track_key_repeat(TEST_VK, WM_KEYDOWN));
+        // 離す
+        assert!(!track_key_repeat(TEST_VK, WM_KEYUP));
+        // 離した後の押下も、また新規の押下なのでリピートではない
+        assert!(!track_key_repeat(TEST_VK, WM_KEYDOWN));
+        track_key_repeat(TEST_VK, WM_KEYUP);
+    }
+
+    #[test]
+    fn held_key_keydown_is_a_repeat() {
+        const VK: u32 = 251;
+        track_key_repeat(VK, WM_KEYUP);
+        assert!(!track_key_repeat(VK, WM_KEYDOWN), "最初の押下");
+        // keyupを挟まず連続でkeydownが来る＝OSのキーリピート
+        assert!(track_key_repeat(VK, WM_KEYDOWN), "2回目以降はリピート扱い");
+        assert!(track_key_repeat(VK, WM_KEYDOWN), "3回目もリピート扱い");
+        track_key_repeat(VK, WM_KEYUP);
+        // keyup後の押下はリピートではない
+        assert!(!track_key_repeat(VK, WM_KEYDOWN));
+        track_key_repeat(VK, WM_KEYUP);
     }
 }

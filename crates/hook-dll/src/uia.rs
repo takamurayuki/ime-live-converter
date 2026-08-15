@@ -7,6 +7,13 @@ use crate::*;
 pub(crate) static FOCUSED_IS_TERMINAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// この Space 押下で既に LLM 変換を発火したか（オートリピートの二重発火防止）
 
+/// この回数だけ連続して位置が変化しなかったら「安定」とみなし、
+/// ポーリング間隔を`POSITION_STABLE_INTERVAL_MS`まで落とす。
+const POSITION_STABLE_THRESHOLD: u32 = 3;
+/// 位置が安定している間のポーリング間隔（ミリ秒）。通常の150msより長くし、
+/// AttachConsole/UIA呼び出しの頻度を下げてカーソル点滅への影響を減らす。
+const POSITION_STABLE_INTERVAL_MS: u64 = 500;
+
 /// UI Automation で取得したフォーカス入力欄の位置キャッシュ (x, y)
 /// バックグラウンドスレッドが更新し、ポップアップ表示時に参照する。
 /// ブラウザ・ターミナル等 Win32 キャレットを公開しないアプリ向け。
@@ -35,6 +42,9 @@ pub(crate) fn start_uia_poller() {
         // カーソル（フォーカス）がターミナルへ「戻った」瞬間の検出用
         let mut was_terminal = false;
         let mut last_terminal_hwnd: isize = 0;
+        // 位置が連続して変化していない回数（作文中の点滅対策用、下記参照）
+        let mut stable_count: u32 = 0;
+        let mut last_pos: Option<(i32, i32, i32)> = None;
         loop {
             // 軽量: フォーカス要素のクラス名から「統合ターミナル(xterm 等)」かを判定。
             // 窓クラスで判別できない VSCode 等の端末をコマンドモード対象にするため、
@@ -100,13 +110,26 @@ pub(crate) fn start_uia_poller() {
             }
 
             // 入力欄の位置が必要なのは「変換中(OUR_ACTIVE)」か「候補/コマンドの
-            // ポップアップ表示中」だけ。アイドル時に UIA(キャレット) や AttachConsole を
-            // 毎回叩くと、対象アプリのカーソル点滅が乱れるため、不要時は休む。
-            let need_pos = OUR_ACTIVE || candidate_window_visible();
+            // ポップアップ表示中」、または「コマンド行を打ち始めていて、
+            // これから初回表示しようとしている」とき。アイドル時に
+            // UIA(キャレット) や AttachConsole を毎回叩くと、対象アプリの
+            // カーソル点滅が乱れるため、不要時は休む。
+            // 最後の条件（打ち始め）が無いと、ポップアップがまだ一度も
+            // 表示されていない最初の打鍵の時点では need_pos が立たず、
+            // UIA_ANCHOR が空のまま初回表示だけフォールバック位置（画面/窓の
+            // 最下部）になってしまう（次の打鍵で正しい位置へ飛んで見える
+            // 原因だった）。COMMAND_LINE の空チェックだけなら軽量なミューテックス
+            // ロックのみでカーソル点滅への影響は無いため、アイドル時でも見て良い。
+            let command_line_pending = COMMAND_LINE.lock().map(|b| !b.is_empty()).unwrap_or(false);
+            let need_pos = OUR_ACTIVE || candidate_window_visible() || command_line_pending;
             if !need_pos {
                 std::thread::sleep(std::time::Duration::from_millis(250));
                 continue;
             }
+            // command_line_pending だけで need_pos になった（＝コマンド候補が
+            // まだ一度も表示されていない）場合は、初回表示までの体感速度を
+            // 優先し、この後の通常ループ間隔（150ms）より短い間隔で回す。
+            let just_started_typing = command_line_pending && !OUR_ACTIVE && !candidate_window_visible();
             let hwnd_fg = GetForegroundWindow();
             let uia = uia_focused_anchor(&auto);
             // UIA でカーソルが取れなければ、クラシックコンソール(conhost)向けに
@@ -136,7 +159,28 @@ pub(crate) fn start_uia_poller() {
             if let Ok(mut c) = UIA_ANCHOR.lock() {
                 *c = pos;
             }
-            std::thread::sleep(std::time::Duration::from_millis(150));
+            // 位置が変わっていなければ安定カウンタを進め、しばらく安定して
+            // いたらポーリング間隔を落とす。UIA/AttachConsoleの呼び出し自体
+            // （このループの上のuia_focused_anchor/console_caret_screen_pos）
+            // は対象アプリのカーソル点滅を乱すことがコード上分かっている
+            // （106行目付近のコメント参照）ため、位置がまだ動く可能性が高い
+            // 打ち始め・移動直後は素早く追従しつつ、ポップアップの位置が
+            // 落ち着いている間はAttachConsole等の呼び出し頻度自体を下げて
+            // 点滅への影響を減らす。
+            if pos == last_pos {
+                stable_count = stable_count.saturating_add(1);
+            } else {
+                stable_count = 0;
+                last_pos = pos;
+            }
+            let interval_ms = if just_started_typing {
+                30
+            } else if stable_count >= POSITION_STABLE_THRESHOLD {
+                POSITION_STABLE_INTERVAL_MS
+            } else {
+                150
+            };
+            std::thread::sleep(std::time::Duration::from_millis(interval_ms));
         }
     });
 }
@@ -240,11 +284,44 @@ pub(crate) unsafe fn focused_element_is_terminal(
     }
     if let Ok(nm) = elem.CurrentName() {
         let s = nm.to_string();
-        if s.to_lowercase().contains("terminal") || s.contains("ターミナル") {
+        if (s.to_lowercase().contains("terminal") || s.contains("ターミナル"))
+            && !is_non_text_control_type(&elem)
+        {
             return true;
         }
     }
     false
+}
+
+/// アクセシブル名だけで「ターミナル」判定すると、実際には統合ターミナル
+/// を"開くボタン"やメニュー項目のように、名前に"terminal"を含むだけの
+/// 無関係な要素にフォーカスがあってもコマンドモードへ誤って落ちてしまう
+/// （実機報告: WebView2アプリでターミナルパネルの周辺UIにフォーカスが
+/// あるだけで変換が一切走らなくなる）。実際のテキスト入力・ターミナル
+/// 内容表示に使われそうにないコントロール種別（ボタン・メニュー項目・
+/// タブ・ツールバー等）を除外することで、名前ベースの誤検出を減らす
+/// （ターミナル本体が使う種別を限定してallowlist化すると、未知の実装
+/// パターンを取りこぼす恐れがあるため、denylist方式にしている）。
+unsafe fn is_non_text_control_type(elem: &windows::Win32::UI::Accessibility::IUIAutomationElement) -> bool {
+    use windows::Win32::UI::Accessibility::{
+        UIA_ButtonControlTypeId, UIA_HyperlinkControlTypeId, UIA_ImageControlTypeId,
+        UIA_ListItemControlTypeId, UIA_MenuControlTypeId, UIA_MenuItemControlTypeId,
+        UIA_TabItemControlTypeId, UIA_ToolBarControlTypeId, UIA_ToolTipControlTypeId,
+        UIA_TreeItemControlTypeId,
+    };
+    let Ok(ct) = elem.CurrentControlType() else {
+        return false;
+    };
+    ct == UIA_ButtonControlTypeId
+        || ct == UIA_HyperlinkControlTypeId
+        || ct == UIA_ImageControlTypeId
+        || ct == UIA_ListItemControlTypeId
+        || ct == UIA_MenuControlTypeId
+        || ct == UIA_MenuItemControlTypeId
+        || ct == UIA_TabItemControlTypeId
+        || ct == UIA_ToolBarControlTypeId
+        || ct == UIA_ToolTipControlTypeId
+        || ct == UIA_TreeItemControlTypeId
 }
 
 pub(crate) unsafe fn uia_focused_anchor(

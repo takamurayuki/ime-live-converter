@@ -302,8 +302,9 @@ pub(crate) fn command_settings_button_rect(rc_client: &RECT) -> RECT {
     }
 }
 
-/// コマンドモードのコマンド候補を描画する（見出し＋⚙設定ボタン＋コマンド＋薄い説明）。
-/// 番号は付けない（数字はコマンドの一部として打つため）。Tab で先頭を補完。
+/// コマンドモードのコマンド候補を描画する（見出し＋⚙設定ボタン＋番号＋コマンド＋薄い説明）。
+/// 番号は Ctrl+数字 で直接選択できる（素の数字キーはコマンド文字列の一部として
+/// 打つため、選択キーには使えない）。Tab で先頭を補完。
 pub(crate) unsafe fn paint_command_items(
     hdc: HDC,
     rc_client: &RECT,
@@ -345,17 +346,28 @@ pub(crate) unsafe fn paint_command_items(
     } else {
         "Enter:挿入のみ"
     };
-    let mut head: Vec<u16> = format!("\u{2318} コマンド  ( Tab:補完 / {} )", enter_hint)
-        .encode_utf16()
-        .collect();
+    let mut head: Vec<u16> = format!(
+        "\u{2318} コマンド  ( Tab:補完 / Ctrl+数字:選択 / {} )",
+        enter_hint
+    )
+    .encode_utf16()
+    .collect();
     DrawTextW(hdc, &mut head, &mut rc_head, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
 
     // 左カラム（コマンド）の幅を実測して、説明カラムの開始 x を揃える。
     // これで「左＝コマンド / 右＝説明」の表（モーダル）らしい整列になる。
     const LEFT_PAD: i32 = 14;
     const COL_GAP: i32 = 28;
+    // 各行に Ctrl+数字 で選べる番号（1〜9）を付ける。件数は呼び出し側
+    // （command_predictions の limit）で 9 件以下に抑えてあるので、
+    // 常に単一ページで番号キーと一対一に対応する。
+    let numbered: Vec<String> = items
+        .iter()
+        .enumerate()
+        .map(|(i, cmd)| format!("{}  {}", i + 1, cmd))
+        .collect();
     let mut cmd_col_w = 0i32;
-    for cmd in items.iter() {
+    for cmd in numbered.iter() {
         let w: Vec<u16> = cmd.encode_utf16().collect();
         let mut sz = SIZE::default();
         let _ = GetTextExtentPoint32W(hdc, &w, &mut sz);
@@ -377,7 +389,7 @@ pub(crate) unsafe fn paint_command_items(
         let _ = DeleteObject(HGDIOBJ::from(sep));
     }
 
-    for (i, cmd) in items.iter().enumerate() {
+    for (i, cmd) in numbered.iter().enumerate() {
         let top = 4 + ((i + 1) as i32) * CANDIDATE_LINE_HEIGHT;
         let rc_row = RECT {
             left: 4,
@@ -391,7 +403,7 @@ pub(crate) unsafe fn paint_command_items(
             FillRect(hdc, &rc_row, hl);
             let _ = DeleteObject(HGDIOBJ::from(hl));
         }
-        // 左カラム: コマンド本体（明るい文字）
+        // 左カラム: 番号＋コマンド本体（明るい文字）
         SetTextColor(hdc, COLORREF(0x00FFFFFF));
         let mut wcmd: Vec<u16> = cmd.encode_utf16().collect();
         let mut rc_cmd = RECT { left: LEFT_PAD, ..rc_row };
@@ -481,6 +493,31 @@ pub(crate) unsafe fn ensure_candidate_window() -> Option<HWND> {
 /// 戻り値は (x, キャレット上端y, キャレット下端y)（画面座標）。
 /// place_popup がこの上下端を見て、真下に余白があれば下、無ければ真上に出す
 /// （既存IMEと同様の出し分け）。
+/// `caret_screen_pos` が実位置（Win32キャレット or UIAキャッシュ）を返せるか。
+/// 実位置が無い状態は、フォアグラウンド窓の最下行やスクリーン最下部という
+/// 粗いフォールバックに頼ることになる。初回表示だけはこれを避けたい
+/// （後述の呼び出し側を参照）。
+pub(crate) fn has_reliable_caret_pos() -> bool {
+    unsafe {
+        let hwnd_fg = GetForegroundWindow();
+        if hwnd_fg.0.is_null() {
+            return false;
+        }
+        let tid = GetWindowThreadProcessId(hwnd_fg, None);
+        let mut gti = GUITHREADINFO {
+            cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+            ..Default::default()
+        };
+        if GetGUIThreadInfo(tid, &mut gti).is_ok()
+            && !gti.hwndCaret.0.is_null()
+            && (gti.rcCaret.bottom > gti.rcCaret.top || gti.rcCaret.right > gti.rcCaret.left)
+        {
+            return true;
+        }
+        UIA_ANCHOR.lock().map(|c| c.is_some()).unwrap_or(false)
+    }
+}
+
 pub(crate) fn caret_screen_pos() -> (i32, i32, i32) {
     unsafe {
         let hwnd_fg = GetForegroundWindow();

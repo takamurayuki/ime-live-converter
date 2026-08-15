@@ -22,6 +22,8 @@ pub struct UserDictEntry {
     pub created_at: String,
     /// 更新日時
     pub updated_at: String,
+    /// 登録経路（"manual"=Ctrl+Alt+A手動登録／"auto"=隣接漢字複合語の自動登録）
+    pub source: String,
 }
 
 /// 変換履歴エントリ
@@ -130,6 +132,22 @@ impl LearningRepository {
             [],
         )?;
 
+        // 誤字修正テーブル: ユーザーが「もしかして」の提案を実際に採用した
+        // 誤字→修正後の読み・表記を記録する。次回同じ誤字を打ったとき、
+        // あいまい検索をやり直さず即座に同じ修正を出せるようにする
+        // （誤字パターンのユーザーごとの個人最適化）。
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS typo_correction (
+                wrong_reading TEXT NOT NULL,
+                correct_reading TEXT NOT NULL,
+                correct_surface TEXT NOT NULL,
+                frequency INTEGER NOT NULL DEFAULT 1,
+                last_used_at TEXT NOT NULL,
+                UNIQUE(wrong_reading, correct_reading, correct_surface)
+            )",
+            [],
+        )?;
+
         // コマンド履歴テーブル（コマンドモード）
         // ターミナルで実行したコマンド行を記録し、次回の前方一致補完に使う。
         // description は commands.csv 由来の簡易説明（学習コマンドは空）。
@@ -162,6 +180,12 @@ impl LearningRepository {
             "ALTER TABLE command_alias ADD COLUMN auto_run INTEGER NOT NULL DEFAULT 1",
             [],
         );
+        // ユーザーが手で登録したか（manual）、隣接する漢字複合語の反復使用から
+        // 自動登録したか（auto）を区別する。既存行は既定で manual 扱いになる。
+        let _ = self.conn.execute(
+            "ALTER TABLE user_dictionary ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'",
+            [],
+        );
 
         // インデックス作成
         self.conn.execute(
@@ -174,6 +198,10 @@ impl LearningRepository {
         )?;
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_bigram_prev ON word_bigram(prev_surface)",
+            [],
+        )?;
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_typo_wrong ON typo_correction(wrong_reading)",
             [],
         )?;
 
@@ -195,6 +223,22 @@ impl LearningRepository {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// 隣接する漢字複合語の反復使用から自動登録する（`source='auto'`）。
+    /// 手動登録の`add_user_word`とはSQLの`source`列以外は同じ。ユーザーが
+    /// 明示的に登録した語と区別できるようにし、後で見分けたり一括で
+    /// 取り消したりできる余地を残す。
+    pub fn add_auto_compound_word(&self, reading: &str, surface: &str, cost: i32) -> Result<i64> {
+        let now = chrono::Utc::now().to_rfc3339();
+
+        self.conn.execute(
+            "INSERT OR REPLACE INTO user_dictionary (reading, surface, pos, cost, created_at, updated_at, source)
+             VALUES (?1, ?2, ?3, ?4, COALESCE((SELECT created_at FROM user_dictionary WHERE reading = ?1 AND surface = ?2), ?5), ?5, 'auto')",
+            params![reading, surface, Some("名詞-一般-*-*"), cost, now],
+        )?;
+
+        Ok(self.conn.last_insert_rowid())
+    }
+
     /// ユーザー辞書から削除
     pub fn remove_user_word(&self, reading: &str, surface: &str) -> Result<bool> {
         let rows = self.conn.execute(
@@ -207,7 +251,7 @@ impl LearningRepository {
     /// 読みで検索
     pub fn find_user_words(&self, reading: &str) -> Result<Vec<UserDictEntry>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, reading, surface, pos, cost, created_at, updated_at
+            "SELECT id, reading, surface, pos, cost, created_at, updated_at, source
              FROM user_dictionary
              WHERE reading = ?1
              ORDER BY cost ASC"
@@ -222,6 +266,7 @@ impl LearningRepository {
                 cost: row.get(4)?,
                 created_at: row.get(5)?,
                 updated_at: row.get(6)?,
+                source: row.get(7)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -232,7 +277,7 @@ impl LearningRepository {
     /// 前方一致で検索
     pub fn find_user_words_prefix(&self, prefix: &str) -> Result<Vec<UserDictEntry>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, reading, surface, pos, cost, created_at, updated_at
+            "SELECT id, reading, surface, pos, cost, created_at, updated_at, source
              FROM user_dictionary
              WHERE reading LIKE ?1
              ORDER BY cost ASC"
@@ -248,6 +293,7 @@ impl LearningRepository {
                 cost: row.get(4)?,
                 created_at: row.get(5)?,
                 updated_at: row.get(6)?,
+                source: row.get(7)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -258,7 +304,7 @@ impl LearningRepository {
     /// 全ユーザー辞書を取得
     pub fn get_all_user_words(&self) -> Result<Vec<UserDictEntry>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, reading, surface, pos, cost, created_at, updated_at
+            "SELECT id, reading, surface, pos, cost, created_at, updated_at, source
              FROM user_dictionary
              ORDER BY reading ASC, cost ASC"
         )?;
@@ -272,6 +318,7 @@ impl LearningRepository {
                 cost: row.get(4)?,
                 created_at: row.get(5)?,
                 updated_at: row.get(6)?,
+                source: row.get(7)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -444,6 +491,72 @@ impl LearningRepository {
             )
             .ok();
         Ok(freq.unwrap_or(0))
+    }
+
+    // ============ 誤字修正（「もしかして」の学習） ============
+
+    /// ユーザーが実際に採用した誤字修正を記録する（頻度+1）。
+    /// 同じ誤字が別の修正に確定された場合は、それぞれ別行として累積する
+    /// （UNIQUE(wrong_reading, correct_reading, correct_surface)）ため、
+    /// 複数の修正候補があっても頻度で優劣がつく。
+    pub fn record_typo_correction(&self, wrong_reading: &str, correct_reading: &str, correct_surface: &str) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO typo_correction (wrong_reading, correct_reading, correct_surface, frequency, last_used_at)
+             VALUES (?1, ?2, ?3, 1, ?4)
+             ON CONFLICT(wrong_reading, correct_reading, correct_surface) DO UPDATE SET
+                frequency = frequency + 1,
+                last_used_at = ?4",
+            params![wrong_reading, correct_reading, correct_surface, now],
+        )?;
+        Ok(())
+    }
+
+    /// 誤字修正の採用頻度を取得
+    pub fn find_typo_correction_frequency(&self, wrong_reading: &str, correct_reading: &str, correct_surface: &str) -> Result<u32> {
+        let result: std::result::Result<u32, _> = self.conn.query_row(
+            "SELECT frequency FROM typo_correction
+             WHERE wrong_reading = ?1 AND correct_reading = ?2 AND correct_surface = ?3",
+            params![wrong_reading, correct_reading, correct_surface],
+            |row| row.get(0),
+        );
+        Ok(result.unwrap_or(0))
+    }
+
+    /// 誤字修正を1件忘れる（候補一覧の Delete によるリセット用）。消せたら true。
+    pub fn forget_typo_correction(&self, wrong_reading: &str, correct_reading: &str, correct_surface: &str) -> Result<bool> {
+        let rows = self.conn.execute(
+            "DELETE FROM typo_correction
+             WHERE wrong_reading = ?1 AND correct_reading = ?2 AND correct_surface = ?3",
+            params![wrong_reading, correct_reading, correct_surface],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// 全誤字修正（誤字, 修正後の読み, 修正後の表記, 頻度）を取得（起動時の一括ロード用）。
+    /// 同じ wrong_reading に複数の修正がある場合は、頻度が最も高いものだけを返す
+    /// （in-memory の `typo_corrections` は wrong_reading→1件のマップのため）。
+    pub fn all_typo_corrections(&self) -> Result<Vec<(String, String, String, u32)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT wrong_reading, correct_reading, correct_surface, frequency
+             FROM typo_correction t
+             WHERE frequency = (
+                 SELECT MAX(frequency) FROM typo_correction
+                 WHERE wrong_reading = t.wrong_reading
+             )
+             GROUP BY wrong_reading",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, u32>(3)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     // ============ 予測変換 ============

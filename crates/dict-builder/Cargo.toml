@@ -11,3 +11,8 @@ encoding_rs = "0.8"
 flate2 = "1.0"
 indicatif = "0.17"
 anyhow = "1.0"
+# コーパスの分かち書き専用（オフラインツールのみで使用。hook-dll/
+# conversion-service 等の実行時バイナリには一切追加しない。実行時の
+# <300msレイテンシ制約とは無関係な、辞書ビルド時だけの依存）。
+vibrato = "0.5"
+zstd = "0.13"

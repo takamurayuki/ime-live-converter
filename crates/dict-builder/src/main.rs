@@ -434,6 +434,9 @@ fn extend_from_csv(dict: &mut Dictionary, csv_path: &Path) -> Result<usize> {
             .get(2)
             .and_then(|s| s.parse().ok())
             .unwrap_or(4000);
+        // 同じ読み+表記が既にあれば入れ替える（再実行してもコスト更新のみで
+        // 重複エントリが積み重ならないようにする）
+        dict.remove_word(&reading, &surface);
         dict.add_word(WordEntry {
             surface,
             reading,
@@ -447,6 +450,184 @@ fn extend_from_csv(dict: &mut Dictionary, csv_path: &Path) -> Result<usize> {
     Ok(added)
 }
 
+/// 青空文庫のXHTML（Shift_JIS）から地の文だけを取り出す。
+///
+/// 取り除くもの: `<rp>`/`<rt>`（ふりがな本体。`<rb>`側の本文だけ残す）、
+/// その他の全HTMLタグ、`［＃…］`/`[#…]`形式の校正者注記、本文範囲外
+/// （`main_text`より前後のヘッダ・底本情報等）。`<br />`は改行に変換して
+/// 段落構造を残す（文分割・バイグラムの文境界判定に使うため）。
+fn clean_aozora_html(shift_jis_bytes: &[u8]) -> String {
+    let (decoded, _, _) = encoding_rs::SHIFT_JIS.decode(shift_jis_bytes);
+
+    // 本文（main_text）の範囲だけを対象にする。無ければ全体を対象にする
+    // （card*.html等、本文divが無い索引ページは呼び出し側で除外される想定）。
+    let text = decoded.as_ref();
+    let body = match text.find("class=\"main_text\"") {
+        Some(start) => {
+            let after = &text[start..];
+            let end = after
+                .find("class=\"bibliographical_information\"")
+                .or_else(|| after.find("</body>"))
+                .unwrap_or(after.len());
+            &after[..end]
+        }
+        None => text,
+    };
+
+    // バイト位置ベースで前から走査する（Vec<char>への全文字収集や、位置ごとの
+    // 残り文字列の再collectはしない。文書長に対してO(n)にするため。以前の
+    // 実装は各文字位置で残り全体を毎回collectしておりO(n^2)だった）。
+    let mut out = String::with_capacity(body.len());
+    let mut rest = body;
+    while !rest.is_empty() {
+        let Some(tag_start) = rest.find('<') else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..tag_start]);
+        rest = &rest[tag_start..];
+
+        if rest.starts_with("<rp") {
+            // <rp>...</rp>（ふりがな囲みの記号）の中身ごと捨てる
+            match rest.find("</rp>") {
+                Some(end) => rest = &rest[end + "</rp>".len()..],
+                None => break,
+            }
+            continue;
+        }
+        if rest.starts_with("<rt") {
+            // <rt>...</rt>（ふりがな本体）の中身ごと捨てる
+            match rest.find("</rt>") {
+                Some(end) => rest = &rest[end + "</rt>".len()..],
+                None => break,
+            }
+            continue;
+        }
+        if rest[1..].to_ascii_lowercase().starts_with("br") {
+            out.push('\n');
+        }
+        // それ以外のタグはタグ自体（<...>）だけを読み飛ばす
+        match rest.find('>') {
+            Some(tag_end) => rest = &rest[tag_end + 1..],
+            None => break,
+        }
+    }
+
+    // 校正者注記 ［＃…］ / [#…] を中身ごと除去
+    let mut cleaned = String::with_capacity(out.len());
+    let mut chars = out.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '［' || c == '[' {
+            let close = if c == '［' { '］' } else { ']' };
+            for c2 in chars.by_ref() {
+                if c2 == close {
+                    break;
+                }
+            }
+            continue;
+        }
+        cleaned.push(c);
+    }
+    cleaned
+}
+
+/// vibratoのfeature文字列（IPADic互換CSV）から読み（カタカナ、フィールド8番目）を取り出す
+fn feature_reading(feature: &str) -> Option<&str> {
+    feature.split(',').nth(7)
+}
+
+fn feature_pos(feature: &str) -> &str {
+    feature.split(',').next().unwrap_or("")
+}
+
+/// コーパステキストを分かち書きし、(読み,表記)ユニグラム頻度と
+/// (前表記,表記)バイグラム頻度を集計する。
+///
+/// バイグラムは文（。！？で区切る）をまたがない。記号・空白トークンは
+/// 集計対象にせず、直後のバイグラムの「前」もリセットする（不自然な
+/// 語同士の結びつきを学習しないため）。
+fn tokenize_and_aggregate(
+    tokenizer: &vibrato::Tokenizer,
+    text: &str,
+    unigrams: &mut std::collections::HashMap<(String, String), u64>,
+    bigrams: &mut std::collections::HashMap<(String, String), u64>,
+) {
+    let mut worker = tokenizer.new_worker();
+    for line in text.split(['\n', '。', '！', '？']) {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        worker.reset_sentence(line);
+        worker.tokenize();
+        let mut prev_surface: Option<String> = None;
+        for i in 0..worker.num_tokens() {
+            let t = worker.token(i);
+            let feature = t.feature();
+            let pos = feature_pos(feature);
+            if pos == "記号" || pos.is_empty() {
+                prev_surface = None;
+                continue;
+            }
+            let Some(reading_kana) = feature_reading(feature) else {
+                prev_surface = None;
+                continue;
+            };
+            let reading = katakana_to_hiragana(reading_kana);
+            if reading.is_empty()
+                || !reading
+                    .chars()
+                    .all(|c| ('\u{3041}'..='\u{3096}').contains(&c) || c == 'ー')
+            {
+                prev_surface = None;
+                continue;
+            }
+            let surface = t.surface().to_string();
+            *unigrams.entry((reading, surface.clone())).or_insert(0) += 1;
+            if let Some(prev) = prev_surface.take() {
+                *bigrams.entry((prev, surface.clone())).or_insert(0) += 1;
+            }
+            prev_surface = Some(surface);
+        }
+    }
+}
+
+/// コーパスLM(`corpus_lm.dic`)をバイナリ形式で保存（system.dicと同じ
+/// bincode+gzip方式。`crates/common/src/corpus_lm.rs`のCorpusLmと同一形式）
+fn save_corpus_lm(
+    unigrams: &std::collections::HashMap<(String, String), u64>,
+    bigrams: &std::collections::HashMap<(String, String), u64>,
+    min_freq: u64,
+    output_path: &Path,
+) -> Result<()> {
+    let lm = common::CorpusLm {
+        unigrams: unigrams
+            .iter()
+            .filter(|(_, &freq)| freq >= min_freq)
+            .map(|((reading, surface), &freq)| (reading.clone(), surface.clone(), freq as u32))
+            .collect(),
+        bigrams: bigrams
+            .iter()
+            .filter(|(_, &freq)| freq >= min_freq)
+            .map(|((prev, surface), &freq)| (prev.clone(), surface.clone(), freq as u32))
+            .collect(),
+    };
+    println!(
+        "コーパスLM: ユニグラム {} 語 / バイグラム {} 組（頻度{}未満は除外、除外前は{}/{}）",
+        lm.unigrams.len(),
+        lm.bigrams.len(),
+        min_freq,
+        unigrams.len(),
+        bigrams.len()
+    );
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    lm.save(output_path)?;
+    println!("コーパスLMを保存しました: {}", output_path.display());
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
@@ -455,15 +636,21 @@ fn main() -> Result<()> {
         println!("  {} build <IPA辞書ディレクトリ> [出力ファイル] [補助辞書ディレクトリ]", args[0]);
         println!("  {} extend <辞書ファイル> <補助CSV>  (常用語を追加)", args[0]);
         println!("  {} test <辞書ファイル>", args[0]);
+        println!("  {} corpus <vibrato辞書.dic.zst> <コーパステキストディレクトリ> <出力corpus_lm.dic> [最小頻度]", args[0]);
         println!();
         println!("補助辞書ディレクトリ（NEologd等）は、基本辞書に無い語だけを取り込み、");
         println!("固有名詞には出典不明の異常な低コストを補正するペナルティを掛ける。");
+        println!();
+        println!("corpus は実コーパス（青空文庫のXHTML等）を分かち書きし、語頻度から");
+        println!("ViterbiConverter用のコーパス統計データ(corpus_lm.dic)を構築する。");
+        println!("分かち書きにはvibrato（IPADic互換モデル、別途ダウンロードが必要）を使う。");
         println!();
         println!("例:");
         println!("  {} build ./ipadic ./dictionaries/system.dic", args[0]);
         println!("  {} build ./ipadic ./dictionaries/system.dic ./neologd", args[0]);
         println!("  {} extend ./dictionaries/system.dic ./dictionaries/extra.csv", args[0]);
         println!("  {} test ./dictionaries/system.dic", args[0]);
+        println!("  {} corpus ./ipadic-mecab-2_7_0/system.dic.zst ./corpus_raw ./dictionaries/corpus_lm.dic", args[0]);
         return Ok(());
     }
 
@@ -528,6 +715,54 @@ fn main() -> Result<()> {
                 let result = converter.convert_to_string(input);
                 println!("{} → {}", input, result);
             }
+        }
+        "corpus" => {
+            if args.len() < 5 {
+                anyhow::bail!("使い方: corpus <vibrato辞書.dic.zst> <コーパステキストディレクトリ> <出力corpus_lm.dic> [最小頻度]");
+            }
+            let vibrato_dict_path = Path::new(&args[2]);
+            let corpus_dir = Path::new(&args[3]);
+            let output_path = Path::new(&args[4]);
+            let min_freq: u64 = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(3);
+
+            println!("vibrato辞書を読み込んでいます: {}", vibrato_dict_path.display());
+            let reader = zstd::Decoder::new(File::open(vibrato_dict_path)?)?;
+            let vibrato_dict = vibrato::Dictionary::read(reader)?;
+            let tokenizer = vibrato::Tokenizer::new(vibrato_dict);
+
+            let files: Vec<_> = fs::read_dir(corpus_dir)
+                .with_context(|| format!("コーパスディレクトリを開けません: {}", corpus_dir.display()))?
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.extension().map_or(false, |ext| ext == "html" || ext == "txt"))
+                .collect();
+            if files.is_empty() {
+                anyhow::bail!("コーパステキストが見つかりません: {}", corpus_dir.display());
+            }
+
+            let pb = ProgressBar::new(files.len() as u64);
+            pb.set_style(
+                ProgressStyle::default_bar()
+                    .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
+                    .unwrap()
+                    .progress_chars("#>-"),
+            );
+
+            let mut unigrams: std::collections::HashMap<(String, String), u64> = std::collections::HashMap::new();
+            let mut bigrams: std::collections::HashMap<(String, String), u64> = std::collections::HashMap::new();
+            for path in &files {
+                pb.set_message(format!("{}", path.file_name().unwrap_or_default().to_string_lossy()));
+                let bytes = fs::read(path)?;
+                let text = clean_aozora_html(&bytes);
+                tokenize_and_aggregate(&tokenizer, &text, &mut unigrams, &mut bigrams);
+                pb.inc(1);
+            }
+            pb.finish_with_message(format!(
+                "完了: {} ファイル、ユニグラム{}語/バイグラム{}組（頻度フィルタ前）",
+                files.len(), unigrams.len(), bigrams.len()
+            ));
+
+            save_corpus_lm(&unigrams, &bigrams, min_freq, output_path)?;
         }
         _ => {
             anyhow::bail!("不明なコマンド: {}", args[1]);
