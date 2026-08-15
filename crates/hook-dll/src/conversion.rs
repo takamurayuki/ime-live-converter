@@ -1556,3 +1556,234 @@ mod reading_validation_tests {
         assert!(!is_hiragana_reading("react"));
     }
 }
+
+#[cfg(test)]
+mod state_machine_tests {
+    use super::*;
+
+    /// 「きょう」に「今日」「強」の同音語、「がっこう」に「学校」を割り当てた
+    /// テスト用辞書＋変換器。commit_first_word/extend_kana_revert/cycle_candidate
+    /// など複数文節にまたがる状態遷移テストで共有する。
+    fn two_segment_test_converter() -> ViterbiConverter {
+        let mut dict = Dictionary::new();
+        dict.matrix = common::ConnectionMatrix::new(10, 10);
+        for i in 0..10 {
+            for j in 0..10 {
+                dict.matrix.set(i, j, 200);
+            }
+        }
+        dict.add_word(common::WordEntry {
+            surface: "今日".to_string(), reading: "きょう".to_string(),
+            left_id: 1, right_id: 1, cost: 3000, pos: "名詞".to_string(),
+        });
+        dict.add_word(common::WordEntry {
+            surface: "強".to_string(), reading: "きょう".to_string(),
+            left_id: 1, right_id: 1, cost: 4000, pos: "名詞".to_string(),
+        });
+        dict.add_word(common::WordEntry {
+            surface: "学校".to_string(), reading: "がっこう".to_string(),
+            left_id: 1, right_id: 1, cost: 3000, pos: "名詞".to_string(),
+        });
+        ViterbiConverter::new(dict)
+    }
+
+    fn state_with_two_segment_dict() -> LiveConversionState {
+        let mut state = LiveConversionState::new();
+        state.converter = Some(two_segment_test_converter());
+        state
+    }
+
+    /// ローマ字 "kyou" を1文字ずつ add_char に通した後 commit() すると、
+    /// 表示バッファ一式がクリアされ入力世代(generation)が進むことを確認する
+    /// （修正前は commit 後もバッファが残り、次の入力に前回の変換が混入し得た）。
+    #[test]
+    fn add_char_then_commit_clears_buffers_and_advances_generation() {
+        let mut state = state_with_two_segment_dict();
+        for ch in "kyou".chars() {
+            state.add_char(ch);
+        }
+        assert_eq!(state.hiragana_buffer, "きょう");
+        assert!(state.is_composing());
+
+        let gen_before = state.generation;
+        let action = state.commit();
+        // 表示は逐次更新で既に確定形と一致しているため、commit自体は
+        // 追加の差分アクションを返さない（末尾 'n' の特殊処理のみ例外）。
+        assert!(action.is_none());
+        assert!(!state.is_composing());
+        assert_eq!(state.hiragana_buffer, "");
+        assert_eq!(state.romaji_buffer, "");
+        assert_eq!(state.conversion_result, "");
+        assert_eq!(state.kana_tail_len, 0);
+        assert_eq!(state.generation, gen_before + 1);
+    }
+
+    /// Tab連打による同音候補巡回が、末尾で先頭へ・先頭で末尾へ折り返す
+    /// （境界のインデックス計算を回帰対象化する）。
+    #[test]
+    fn cycle_candidate_wraps_around_index_boundaries() {
+        let mut state = state_with_two_segment_dict();
+        state.hiragana_buffer = "きょう".to_string();
+
+        // 初回のTabは一覧生成＋先頭(index 0)選択のみ
+        let first = state.cycle_candidate(false);
+        assert!(first.is_some());
+        assert_eq!(state.candidate_index, 0);
+        let candidate_count = state.candidates.len();
+        assert!(candidate_count >= 2, "「今日」「強」の同音語が候補にあるはず");
+
+        // 末尾まで進める
+        for _ in 1..candidate_count {
+            state.cycle_candidate(false);
+        }
+        assert_eq!(state.candidate_index, candidate_count - 1);
+
+        // 末尾からさらに進めると先頭へ折り返す
+        state.cycle_candidate(false);
+        assert_eq!(state.candidate_index, 0);
+
+        // 先頭から逆方向へ進めると末尾へ折り返す
+        state.cycle_candidate(true);
+        assert_eq!(state.candidate_index, candidate_count - 1);
+    }
+
+    /// Escを繰り返すと末尾の文節から順に一つずつひらがなへ戻り、
+    /// 全て戻し終えたら None（呼び出し側は取消にフォールバック）を返す。
+    #[test]
+    fn extend_kana_revert_reverts_one_segment_at_a_time_then_stops() {
+        let mut state = state_with_two_segment_dict();
+        state.hiragana_buffer = "きょうがっこう".to_string();
+        let total = state.hiragana_buffer.chars().count();
+        assert_eq!(total, 7);
+
+        // 1回目: 末尾の文節（学校＝がっこう、4文字）だけをひらがなに戻す
+        let first = state.extend_kana_revert();
+        assert!(first.is_some());
+        assert_eq!(state.kana_tail_len, 4);
+
+        // 2回目: 残っていた前半（今日＝きょう）も戻り、全体が戻し終わる
+        let second = state.extend_kana_revert();
+        assert!(second.is_some());
+        assert_eq!(state.kana_tail_len, 7);
+
+        // 3回目: これ以上戻すものが無い
+        let third = state.extend_kana_revert();
+        assert!(third.is_none());
+    }
+
+    /// generation は add_char / backspace / commit / cancel のいずれでも
+    /// 単調に増加し続ける（非同期結果を世代で棄却する仕組みの前提）。
+    /// 逆行・据え置きが起きたらここで検出する。
+    #[test]
+    fn generation_counter_strictly_increases_across_mutations() {
+        let mut state = state_with_two_segment_dict();
+        let g0 = state.generation;
+
+        state.add_char('k');
+        let g1 = state.generation;
+        assert!(g1 > g0);
+
+        state.backspace();
+        let g2 = state.generation;
+        assert!(g2 > g1);
+
+        state.add_char('k');
+        let g3 = state.generation;
+        let _ = state.commit();
+        let g4 = state.generation;
+        assert!(g4 > g3);
+
+        let _ = state.cancel();
+        let g5 = state.generation;
+        assert!(g5 > g4);
+    }
+
+    /// commit_first_word は 1-best の先頭語だけを確定済み扱いにし、
+    /// 残りの読みは未変換のまま保持する（前半のみ正しい場合の部分確定用）。
+    #[test]
+    fn commit_first_word_partially_commits_leading_word_only() {
+        let mut state = state_with_two_segment_dict();
+        state.hiragana_buffer = "きょうがっこう".to_string();
+        // 表示は既に1-bestと一致している状態を模す
+        state.conversion_result = "今日学校".to_string();
+
+        state.commit_first_word();
+
+        assert_eq!(state.hiragana_buffer, "がっこう");
+        assert_eq!(state.conversion_result, "学校");
+        assert_eq!(
+            state.committed_segments,
+            vec![("きょう".to_string(), "今日".to_string(), "名詞".to_string())]
+        );
+    }
+
+    /// 予測変換（前方一致補完）の確定: 現在の表示を丸ごと予測表記に
+    /// 置き換えるアクションを返し、last_committed を更新する。
+    #[test]
+    fn commit_prediction_replaces_display_for_prefix_completion() {
+        let mut state = LiveConversionState::new();
+        state.conversion_result = "きょ".to_string();
+        state.hiragana_buffer = "きょ".to_string();
+        state.predictions = vec![("きょう".to_string(), "今日".to_string())];
+
+        let gen_before = state.generation;
+        let action = state
+            .commit_prediction(0)
+            .expect("前方一致予測の確定はアクションを返す");
+        assert_eq!(action.delete_count, 2); // 表示中の "きょ"（2文字）を全削除
+        assert_eq!(action.insert_text, "今日");
+        assert_eq!(state.last_committed, "今日");
+        assert!(state.hiragana_buffer.is_empty());
+        assert!(state.predictions.is_empty());
+        assert_eq!(state.generation, gen_before + 1);
+    }
+
+    /// 予測変換（次単語予測・読み空）の確定: 表示の末尾に追記するだけで
+    /// 削除は発生しない。
+    #[test]
+    fn commit_prediction_appends_for_next_word_prediction() {
+        let mut state = LiveConversionState::new();
+        state.recent_context = "今日".to_string();
+        state.last_committed = "今日".to_string();
+        state.predictions = vec![(String::new(), "は".to_string())];
+
+        let action = state
+            .commit_prediction(0)
+            .expect("次単語予測の確定はアクションを返す");
+        assert_eq!(action.delete_count, 0);
+        assert_eq!(action.insert_text, "は");
+        assert_eq!(state.last_committed, "は");
+    }
+
+    /// 範囲外インデックスの確定は None（消費しない）。
+    #[test]
+    fn commit_prediction_out_of_range_index_returns_none() {
+        let mut state = LiveConversionState::new();
+        state.predictions = vec![("きょう".to_string(), "今日".to_string())];
+        assert!(state.commit_prediction(5).is_none());
+    }
+
+    /// 候補一覧が空のときは誤学習リセットも None（消費しない）。
+    #[test]
+    fn reset_learning_for_selected_returns_none_without_candidates() {
+        let mut state = state_with_two_segment_dict();
+        assert!(state.reset_learning_for_selected().is_none());
+    }
+
+    /// Deleteキーによる誤学習リセット後、候補一覧が再構築され
+    /// 選択位置が先頭（最有力候補）へ戻ることを確認する。
+    #[test]
+    fn reset_learning_for_selected_rebuilds_candidates_and_resets_index() {
+        let mut state = state_with_two_segment_dict();
+        state.hiragana_buffer = "きょう".to_string();
+        state.cycle_candidate(false); // 候補一覧生成＋先頭選択
+        let candidate_count = state.candidates.len();
+        assert!(candidate_count >= 2);
+        state.select_candidate(candidate_count - 1); // 末尾候補を選択＆表示に反映
+
+        let action = state.reset_learning_for_selected();
+        assert!(action.is_some());
+        assert_eq!(state.candidate_index, 0);
+        assert!(!state.candidates.is_empty());
+    }
+}
