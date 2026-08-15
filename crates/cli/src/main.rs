@@ -42,7 +42,17 @@ impl Cli {
         let dict = Dictionary::load(path)
             .with_context(|| format!("辞書のロードに失敗: {}", path.display()))?;
         // LiveConverter と独立の ViterbiConverter の両方にロード
-        self.viterbi = Some(ViterbiConverter::new(Dictionary::load(path)?));
+        // 優先語彙ファイル（同音異義語の優先順位）。hook-dll と同じ既定パスを
+        // 読む。CLI が読まないと `:nbest` での検証が本番と食い違い、修正済みの
+        // 誤変換が「直っていない」ように見える（らいしゅう→来襲 で実測）。
+        let mut viterbi = ViterbiConverter::new(Dictionary::load(path)?);
+        let priority_path = path.with_file_name("word_priority.tsv");
+        match viterbi.load_word_priority_file(&priority_path) {
+            Ok(count) if count > 0 => println!("優先語彙をロード: {}件", count),
+            Ok(_) => {}
+            Err(e) => println!("優先語彙のロードをスキップ: {}", e),
+        }
+        self.viterbi = Some(viterbi);
         self.converter.set_dictionary(dict);
         Ok(())
     }
