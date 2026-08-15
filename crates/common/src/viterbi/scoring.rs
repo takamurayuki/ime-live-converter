@@ -242,14 +242,43 @@ pub(crate) fn symbol_penalty(surface: &str, pos: &str) -> i32 {
 /// 本来は動詞の音便形＋てで読むべき語（「空いて」等）を押しのけてしまう
 /// ことがある。学習の有無に関わらず文法的に常に誤りなので、無条件で
 /// ペナルティを掛ける。
-pub(crate) fn adjective_terminal_then_te_penalty(prev: &WordEntry, cur: &WordEntry) -> i32 {
+///
+/// 固定加算(+5000)では実辞書のコスト差（形容詞と動詞連用形の語彙コスト差
+/// ＋接続コスト差、実測で4335超）を相殺しきれない場合があったため、他の
+/// `*_conn_floor` 系ガードと同様の下限（floor）方式にする。
+pub(crate) fn adjective_terminal_then_te_penalty(
+    prev: &WordEntry,
+    cur: &WordEntry,
+    conn_cost: i32,
+) -> i32 {
+    const FLOOR: i32 = 9000;
     if !prev.pos.starts_with("形容詞") || !prev.surface.ends_with('い') {
-        return 0;
+        return conn_cost;
     }
     if cur.surface != "て" || !cur.pos.starts_with("助詞") {
-        return 0;
+        return conn_cost;
     }
-    5000
+    conn_cost.max(FLOOR)
+}
+
+/// 1文字漢字の表記かつ読みが単独助詞と一致する語（野・葉・尾 等）が、
+/// 文頭以外の位置に出現することへのコストペナルティ（例:「よこのみち」→
+/// 「横」+「野」+「三智」で「横」+「の」+「みち」が押しのけられるのを防ぐ）。
+///
+/// 「の」「は」等の単独助詞と同じ読みを持つ1文字漢字の表記（野・葉・羽 等）
+/// が辞書に実在し、直前の語との接続コストの都合で、正しい助詞としての
+/// 分割より安く見えてしまうことがある。この呼び出しは `find_best_path` の
+/// 無条件ガード節（`prev_node.entry` が `Some` の場合のみ成立する節）内で
+/// 行うため、`cur` が文頭語のケースは構造的に対象外になる（大阪等の
+/// 複合表記固有名詞は2文字以上のため `is_single_kanji_surface` で
+/// そもそも対象外）。
+pub(crate) fn single_kanji_lone_particle_reading_penalty(cur: &WordEntry) -> i32 {
+    const PENALTY: i32 = 2500;
+    if is_single_kanji_surface(&cur.surface) && is_lone_particle(&cur.reading) {
+        PENALTY
+    } else {
+        0
+    }
 }
 
 /// 1文字漢字の表記に対するコストペナルティを返す

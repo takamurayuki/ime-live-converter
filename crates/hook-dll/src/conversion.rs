@@ -745,7 +745,19 @@ impl LiveConversionState {
         match Dictionary::load(path) {
             Ok(dict) => {
                 debug_log!("辞書読み込み成功、ViterbiConverter作成中");
-                self.converter = Some(ViterbiConverter::new(dict));
+                let mut converter = ViterbiConverter::new(dict);
+                // 優先語彙ファイル（辞書に既存の語同士の優先順位）を読み込む。
+                // 不在・パースエラーでも起動を止めない（graceful-skip）。
+                let priority_path = path.with_file_name("word_priority.tsv");
+                match converter.load_word_priority_file(&priority_path) {
+                    Ok(count) => {
+                        debug_log!("優先語彙ファイルを読み込みました: {}件", count);
+                    }
+                    Err(e) => {
+                        debug_log!("優先語彙ファイルの読み込みをスキップ: {}", e);
+                    }
+                }
+                self.converter = Some(converter);
                 // 過去の学習をライブ変換エンジンに反映
                 self.reload_learning_into_converter();
                 // ユーザー登録の単語を辞書へ注入（辞書に無い複合語を変換可能に）
