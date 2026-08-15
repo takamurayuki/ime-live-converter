@@ -3,6 +3,12 @@
 use super::*;
 
 /// ライブ変換用のコンテキスト
+///
+/// 注意: hook-dll の実運用パスからは未参照。hook-dll は
+/// `crates/hook-dll/src/conversion.rs` の `LiveConversionState` が
+/// `ViterbiConverter` を直接使用しており、この型は経由していない
+/// （`lib.rs` の `pub use` と本クレートの自テスト以外に参照がない）。
+/// 公開 API 契約として保護する目的でテストのみ付与している。
 #[derive(Debug)]
 pub struct LiveConversionContext {
     /// 変換エンジン
@@ -75,8 +81,15 @@ impl LiveConversionContext {
 }
 
 /// 差分計算対応のライブ変換エンジン
-/// 
+///
 /// 入力が末尾に追加された場合、前回のラティスを再利用して高速に変換
+///
+/// 注意: hook-dll の実運用パスからは未参照のキャッシング機構。差分計算
+/// （`extend_lattice`/`recompute_viterbi_from`）は未解決の問題により
+/// `convert` から呼ばれておらず常に完全再構築（`rebuild_lattice`）する
+/// （§本ファイル該当メソッドの doc コメント参照）。hook-dll は
+/// `ViterbiConverter` を直接使用しこの型を経由しない。公開 API 契約の
+/// 保護目的でテストのみ付与している。
 #[derive(Debug)]
 pub struct IncrementalViterbi {
     /// 変換エンジン
@@ -340,5 +353,95 @@ impl IncrementalViterbi {
         }
 
         &self.cached_result
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use crate::dictionary::{Dictionary, WordEntry};
+
+    fn test_dictionary() -> Dictionary {
+        let mut dict = Dictionary::new();
+        dict.add_word(WordEntry {
+            surface: "今日".to_string(),
+            reading: "きょう".to_string(),
+            left_id: 1,
+            right_id: 1,
+            cost: 3000,
+            pos: "名詞".to_string(),
+        });
+        dict
+    }
+
+    /// 同一入力を連続で convert すると同じ結果が返る
+    /// （`cached_input` 一致によるキャッシュヒット経路）。
+    #[test]
+    fn convert_returns_identical_result_for_repeated_input() {
+        let mut viterbi = IncrementalViterbi::new(ViterbiConverter::new(test_dictionary()));
+        let first = viterbi.convert_to_string("きょう");
+        let second = viterbi.convert_to_string("きょう");
+        assert_eq!(first, second);
+        assert_eq!(first, "今日");
+    }
+
+    /// clear_cache 後に同じ入力を再変換しても結果は変わらない
+    /// （クリアは状態リセットであり、キャッシュの取り違えを起こさない）。
+    #[test]
+    fn clear_cache_then_reconvert_same_input_yields_same_result() {
+        let mut viterbi = IncrementalViterbi::new(ViterbiConverter::new(test_dictionary()));
+        let before = viterbi.convert_to_string("きょう");
+        viterbi.clear_cache();
+        let after = viterbi.convert_to_string("きょう");
+        assert_eq!(before, after);
+    }
+
+    /// clear_cache 直後は空入力扱いの内部状態に戻る。
+    #[test]
+    fn clear_cache_empties_cached_input_and_result() {
+        let mut viterbi = IncrementalViterbi::new(ViterbiConverter::new(test_dictionary()));
+        viterbi.convert("きょう");
+        viterbi.clear_cache();
+        assert_eq!(viterbi.convert_to_string(""), "");
+    }
+
+    /// backspace で1文字戻した結果は、その短い入力を最初から変換した結果と一致する
+    /// （常に完全再構築のため差分計算とは無関係だが、外部から見た整合性は保たれる）。
+    #[test]
+    fn backspace_result_matches_direct_conversion_of_shorter_input() {
+        let mut a = IncrementalViterbi::new(ViterbiConverter::new(test_dictionary()));
+        a.convert("きょう");
+        let via_backspace: String = a.backspace().iter().map(|e| e.surface.as_str()).collect();
+
+        let mut b = IncrementalViterbi::new(ViterbiConverter::new(test_dictionary()));
+        let via_direct = b.convert_to_string("きょ");
+
+        assert_eq!(via_backspace, via_direct);
+    }
+
+    /// LiveConversionContext: ひらがな追加→確定で入力・変換バッファがクリアされる。
+    #[test]
+    fn live_conversion_context_add_then_commit_roundtrip() {
+        let mut ctx = LiveConversionContext::new(ViterbiConverter::new(test_dictionary()));
+        let conv = ctx.add_hiragana("きょう").to_string();
+        assert_eq!(conv, "今日");
+
+        let committed = ctx.commit();
+        assert_eq!(committed, "今日");
+        assert_eq!(ctx.get_input_buffer(), "");
+        assert_eq!(ctx.get_conversion(), "");
+    }
+
+    /// LiveConversionContext: backspace は入力バッファを1文字戻し、clear は全消去する。
+    #[test]
+    fn live_conversion_context_backspace_and_clear() {
+        let mut ctx = LiveConversionContext::new(ViterbiConverter::new(test_dictionary()));
+        ctx.add_hiragana("きょう");
+        ctx.backspace();
+        assert_eq!(ctx.get_input_buffer(), "きょ");
+
+        ctx.clear();
+        assert_eq!(ctx.get_input_buffer(), "");
+        assert_eq!(ctx.get_conversion(), "");
     }
 }

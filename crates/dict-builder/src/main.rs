@@ -336,6 +336,68 @@ fn build_dictionary(dict_dir: &Path, supplement_dir: Option<&Path>) -> Result<Di
     Ok(dict)
 }
 
+/// 同一 (reading, left_id, right_id) グループでカタカナ表記と漢字を含む
+/// 表記が共存する場合の、カタカナ側への上乗せコストのマージン。
+///
+/// COMMON_WORD_SEED_BONUS(1500の学習1回)で逆転しない程度に小さく、辞書
+/// コストの通常のばらつき（数十〜数百）より大きい値として選定。
+const KATAKANA_KANJI_COST_MARGIN: i32 = 500;
+
+fn is_all_katakana_surface(surface: &str) -> bool {
+    !surface.is_empty()
+        && surface.chars().all(|c| {
+            ('\u{30A1}'..='\u{30FA}').contains(&c) || ('\u{30FC}'..='\u{30FF}').contains(&c)
+        })
+}
+
+fn contains_kanji(surface: &str) -> bool {
+    surface
+        .chars()
+        .any(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c) || ('\u{3400}'..='\u{4DBF}').contains(&c))
+}
+
+/// カタカナ表記が同一読みの漢字表記より辞書コストで勝ってしまう構造的な
+/// 誤変換（カテゴリC）を辞書構築時に機械的に補正する。
+///
+/// IPA辞書は口語的なカタカナ強調表記（クルマ・アタマ 等）を、同じ読み・
+/// 同じ品詞ID（＝同じ接続コストを共有する）の漢字表記（車・頭 等）より
+/// 低コストに調整していることがある。同一 (reading, left_id, right_id)
+/// でグルーピングし、グループ内に漢字を含む表記が存在する場合のみ、
+/// カタカナ側のコストを「漢字側の最安値+マージン」まで引き上げる。
+/// 同一読みに漢字表記が存在しない外来語カタカナ（コーヒー・テレビ 等）は
+/// グループ内に漢字表記が無いため対象外のまま変化しない。
+fn correct_katakana_kanji_cost_collisions(dict: &mut Dictionary) -> usize {
+    let mut words = Vec::new();
+    collect_words_from_trie(&dict.trie, &mut words);
+
+    let mut groups: std::collections::HashMap<(String, u16, u16), Vec<WordEntry>> =
+        std::collections::HashMap::new();
+    for w in words {
+        groups.entry((w.reading.clone(), w.left_id, w.right_id)).or_default().push(w);
+    }
+
+    let mut corrected = 0usize;
+    for ((reading, _left_id, _right_id), entries) in groups {
+        let kanji_min_cost =
+            entries.iter().filter(|e| contains_kanji(&e.surface)).map(|e| e.cost as i32).min();
+        let Some(kanji_min_cost) = kanji_min_cost else {
+            continue; // グループ内に漢字表記が無い→対象外（外来語カタカナ等）
+        };
+        let floor = (kanji_min_cost + KATAKANA_KANJI_COST_MARGIN).min(i16::MAX as i32);
+        for e in &entries {
+            if !is_all_katakana_surface(&e.surface) || (e.cost as i32) >= floor {
+                continue;
+            }
+            dict.remove_word(&reading, &e.surface);
+            let mut fixed = e.clone();
+            fixed.cost = floor as i16;
+            dict.add_word(fixed);
+            corrected += 1;
+        }
+    }
+    corrected
+}
+
 /// 辞書をバイナリ形式で保存
 fn save_dictionary(dict: &Dictionary, output_path: &Path) -> Result<()> {
     // Trieから全単語を抽出
@@ -677,7 +739,9 @@ fn main() -> Result<()> {
             }
 
             println!("IPA辞書を読み込んでいます: {}", dict_dir.display());
-            let dict = build_dictionary(dict_dir, supplement_dir)?;
+            let mut dict = build_dictionary(dict_dir, supplement_dir)?;
+            let corrected = correct_katakana_kanji_cost_collisions(&mut dict);
+            println!("カタカナ/漢字コスト衝突を補正しました: {} 語", corrected);
             save_dictionary(&dict, &output_path)?;
         }
         "extend" => {
@@ -770,4 +834,80 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn word(surface: &str, reading: &str, left_id: u16, right_id: u16, cost: i16, pos: &str) -> WordEntry {
+        WordEntry {
+            surface: surface.to_string(),
+            reading: reading.to_string(),
+            left_id,
+            right_id,
+            cost,
+            pos: pos.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_katakana_kanji_collision_is_corrected() {
+        // 「くるま」: カタカナ「クルマ」(3630) が漢字「車」(6918) より
+        // 同一品詞IDで低コスト → カタカナ側を 6918+500=7418 まで引き上げる
+        let mut dict = Dictionary::new();
+        dict.add_word(word("クルマ", "くるま", 1285, 1285, 3630, "名詞-一般-*-*"));
+        dict.add_word(word("車", "くるま", 1285, 1285, 6918, "名詞-一般-*-*"));
+
+        let corrected = correct_katakana_kanji_cost_collisions(&mut dict);
+        assert_eq!(corrected, 1);
+
+        let entries = dict.lookup("くるま").unwrap();
+        let katakana = entries.iter().find(|e| e.surface == "クルマ").unwrap();
+        let kanji = entries.iter().find(|e| e.surface == "車").unwrap();
+        assert_eq!(katakana.cost, 7418);
+        assert_eq!(kanji.cost, 6918); // 漢字側は変化しない
+    }
+
+    #[test]
+    fn test_katakana_without_kanji_counterpart_is_not_touched() {
+        // 「こーひー」: 漢字表記が同一読みグループに無い外来語カタカナは対象外
+        let mut dict = Dictionary::new();
+        dict.add_word(word("コーヒー", "こーひー", 1285, 1285, 4000, "名詞-一般-*-*"));
+
+        let corrected = correct_katakana_kanji_cost_collisions(&mut dict);
+        assert_eq!(corrected, 0);
+
+        let entries = dict.lookup("こーひー").unwrap();
+        assert_eq!(entries.iter().find(|e| e.surface == "コーヒー").unwrap().cost, 4000);
+    }
+
+    #[test]
+    fn test_katakana_already_above_floor_is_not_touched() {
+        // カタカナ側が既に漢字側+マージン以上のコストなら補正不要（冪等性）
+        let mut dict = Dictionary::new();
+        dict.add_word(word("クルマ", "くるま", 1285, 1285, 8000, "名詞-一般-*-*"));
+        dict.add_word(word("車", "くるま", 1285, 1285, 6918, "名詞-一般-*-*"));
+
+        let corrected = correct_katakana_kanji_cost_collisions(&mut dict);
+        assert_eq!(corrected, 0);
+
+        let entries = dict.lookup("くるま").unwrap();
+        assert_eq!(entries.iter().find(|e| e.surface == "クルマ").unwrap().cost, 8000);
+    }
+
+    #[test]
+    fn test_katakana_kanji_collision_different_pos_id_not_grouped() {
+        // (reading,left_id,right_id) が完全一致しない場合はグルーピング対象外
+        // （品詞IDが異なる=活用形違い等は本補正の対象外という設計の確認）
+        let mut dict = Dictionary::new();
+        dict.add_word(word("クルマ", "くるま", 1285, 1285, 3630, "名詞-一般-*-*"));
+        dict.add_word(word("車", "くるま", 999, 999, 6918, "名詞-一般-*-*"));
+
+        let corrected = correct_katakana_kanji_cost_collisions(&mut dict);
+        assert_eq!(corrected, 0);
+
+        let entries = dict.lookup("くるま").unwrap();
+        assert_eq!(entries.iter().find(|e| e.surface == "クルマ").unwrap().cost, 3630);
+    }
 }

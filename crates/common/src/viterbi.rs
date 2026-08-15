@@ -265,6 +265,44 @@ impl ViterbiConverter {
             .or_insert(COMMON_WORD_SEED_BONUS);
     }
 
+    /// 優先語彙ファイル（`word_priority.tsv`）を読み込み、learned_unigram に
+    /// シードボーナスとして投入する。
+    ///
+    /// `COMMON_WORD_SEED`（Rustのハードコード配列）と同じ仕組みだが、
+    /// データファイル化することでコード変更・再コンパイルなしに辞書に
+    /// 既存の同音語同士の優先順位を追加できるようにする。フォーマットは
+    /// `読み\t表記\tボーナス(省略可)`。`#`始まりの行・空行は無視する。
+    /// ユーザーの実学習値を優先するため `.entry().or_insert()` で書き込む
+    /// （`seed_common_words` の既定シードと同じ規約）。
+    pub fn load_word_priority_file(&mut self, path: &std::path::Path) -> std::io::Result<usize> {
+        let content = std::fs::read_to_string(path)?;
+        let mut count = 0;
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut parts = line.split('\t');
+            let (Some(reading), Some(surface)) = (parts.next(), parts.next()) else {
+                continue;
+            };
+            let reading = reading.trim();
+            let surface = surface.trim();
+            if reading.is_empty() || surface.is_empty() {
+                continue;
+            }
+            let bonus = parts
+                .next()
+                .and_then(|s| s.trim().parse::<i32>().ok())
+                .unwrap_or(COMMON_WORD_SEED_BONUS);
+            self.learned_unigram
+                .entry((reading.to_string(), surface.to_string()))
+                .or_insert(bonus);
+            count += 1;
+        }
+        Ok(count)
+    }
+
     /// 学習データをすべてクリア（頻出語プリセットは残す）
     pub fn clear_learning(&mut self) {
         self.learned_unigram.clear();
@@ -1103,8 +1141,11 @@ impl ViterbiConverter {
                             .saturating_add(katakana_kanji_suffix_penalty(pe, ce));
                         // 形容詞の終止形（〜い）に「て」が直接続くのは文法的に
                         // 常に誤り（正しくは連用形〜くて）なので無条件でペナルティ
+                        conn_cost = adjective_terminal_then_te_penalty(pe, ce, conn_cost);
+                        // 1文字漢字の表記かつ読みが単独助詞と一致する語（野・葉 等）
+                        // が文頭以外に出現するのは不自然なので無条件でペナルティ
                         conn_cost = conn_cost
-                            .saturating_add(adjective_terminal_then_te_penalty(pe, ce));
+                            .saturating_add(single_kanji_lone_particle_reading_penalty(ce));
                     }
                     // 1文字漢字が絡む不自然な接続コスト（学習バイグラム込み）には
                     // 下限を設ける。ただし学習ボーナスでどちらかの単語コストが
