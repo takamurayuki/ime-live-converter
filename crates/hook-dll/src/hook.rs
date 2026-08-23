@@ -506,7 +506,7 @@ pub extern "system" fn LowLevelKeyboardProc(
 
         // 自分のUI（設定ウィンドウ・ファイルダイアログ）にフォーカスがある間は、
         // その入力を横取りしない（設定画面の編集欄に普通に打てるように）。
-        if foreground_is_ours() {
+        if foreground_is_ours() || audit_window_is_foreground() {
             return CallNextHookEx(None, code, wparam, lparam);
         }
 
@@ -528,6 +528,13 @@ pub extern "system" fn LowLevelKeyboardProc(
                 } else {
                     open_settings_window();
                 }
+                return LRESULT(1);
+            }
+
+            // Ctrl+Alt+L: 変換パイプラインの段階別監査ログウィンドウ（モード不問）。
+            // 元のキーはアプリへ漏らさない。
+            if is_ctrl_pressed() && is_alt_pressed() && vk_code == 0x4C {
+                open_audit_log_window();
                 return LRESULT(1);
             }
 
