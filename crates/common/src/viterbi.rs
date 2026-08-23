@@ -162,6 +162,44 @@ impl ViterbiConverter {
             .or_insert(COMMON_WORD_SEED_BONUS);
     }
 
+    /// 優先語彙ファイル（`word_priority.tsv`）を読み込み、learned_unigram に
+    /// シードボーナスとして投入する。
+    ///
+    /// `COMMON_WORD_SEED`（Rustのハードコード配列）と同じ仕組みだが、
+    /// データファイル化することでコード変更・再コンパイルなしに辞書に
+    /// 既存の同音語同士の優先順位を追加できるようにする。フォーマットは
+    /// `読み\t表記\tボーナス(省略可)`。`#`始まりの行・空行は無視する。
+    /// ユーザーの実学習値を優先するため `.entry().or_insert()` で書き込む
+    /// （`seed_common_words` の既定シードと同じ規約）。
+    pub fn load_word_priority_file(&mut self, path: &std::path::Path) -> std::io::Result<usize> {
+        let content = std::fs::read_to_string(path)?;
+        let mut count = 0;
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut parts = line.split('\t');
+            let (Some(reading), Some(surface)) = (parts.next(), parts.next()) else {
+                continue;
+            };
+            let reading = reading.trim();
+            let surface = surface.trim();
+            if reading.is_empty() || surface.is_empty() {
+                continue;
+            }
+            let bonus = parts
+                .next()
+                .and_then(|s| s.trim().parse::<i32>().ok())
+                .unwrap_or(COMMON_WORD_SEED_BONUS);
+            self.learned_unigram
+                .entry((reading.to_string(), surface.to_string()))
+                .or_insert(bonus);
+            count += 1;
+        }
+        Ok(count)
+    }
+
     /// 学習データをすべてクリア（頻出語プリセットは残す）
     pub fn clear_learning(&mut self) {
         self.learned_unigram.clear();
@@ -796,6 +834,137 @@ impl ViterbiConverter {
         }
     }
 
+    /// 2ノード間（前方ノード prev_idx → 後方ノード node_idx）の連接コストを計算する。
+    ///
+    /// 生の連接行列コストに、学習バイグラムの減額と各種無条件・学習依存ガードを
+    /// 適用した値を返す（単語コストは含まない）。find_best_path（1-best探索）と
+    /// n_best_from_lattice（候補一覧生成）の両方から呼ばれる共通ヘルパーであり、
+    /// 「find_best_path にだけガードを足して n_best 側に反映し忘れる」複製ドリフトを
+    /// 構造的に防ぐために抽出している。
+    ///
+    /// grandparent（祖先ノード）は `lattice.nodes[prev_idx].prev_node` から取得する。
+    /// これは forward 1-best 探索（find_best_path）が既に確定させた前駆であり、
+    /// n_best のバックワード探索が呼び出す時点でも find_best_path 実行後のため
+    /// 全ノードで参照可能。find_best_path 自身もこの近似を使うため、両者の
+    /// 辺コスト計算は同一ソースに基づく。
+    pub(crate) fn edge_connection_cost(
+        &self,
+        lattice: &Lattice,
+        prev_idx: usize,
+        node_idx: usize,
+    ) -> i32 {
+        let prev_node = &lattice.nodes[prev_idx];
+        let current_node = &lattice.nodes[node_idx];
+
+        // 連接コスト
+        let mut conn_cost = self
+            .dictionary
+            .matrix
+            .get(prev_node.right_id, current_node.left_id) as i32;
+
+        let mut bigram_bonus = 0i32;
+        let use_bigram = !self.learned_bigram.is_empty();
+        if let (Some(pe), Some(ce)) = (&prev_node.entry, &current_node.entry) {
+            // 学習したバイグラム（語のつながり）は接続コストを減額
+            if use_bigram {
+                if let Some(bonus) = self
+                    .learned_bigram
+                    .get(&(pe.surface.clone(), ce.surface.clone()))
+                {
+                    bigram_bonus = *bonus;
+                    conn_cost = conn_cost.saturating_sub(bigram_bonus);
+                }
+            }
+            // カタカナ語+単独の接尾辞漢字という不自然な組み合わせは
+            // 接続コストを上乗せする（例外は語・人・製 等の外来語に
+            // 実際に付く接尾辞のみ）
+            conn_cost = conn_cost.saturating_add(katakana_kanji_suffix_penalty(pe, ce));
+            // 形容詞の終止形（〜い）に「て」が直接続くのは文法的に
+            // 常に誤り（正しくは連用形〜くて）なので無条件でペナルティ
+            conn_cost = conn_cost.saturating_add(adjective_terminal_then_te_penalty(pe, ce));
+        }
+        // 1文字漢字が絡む不自然な接続コスト（学習バイグラム込み）には
+        // 下限を設ける。ただし学習ボーナスでどちらかの単語コストが
+        // 不自然に下がっている場合のみ（「英語」等、IPA辞書自体が
+        // 正当に認識している複合語まで壊さないため）。文末（EOS）
+        // への接続も対象に含めるため、どちらかが BOS/EOS
+        // （entry なし）でも呼び出す。
+        let bonus_of = |e: Option<&WordEntry>| -> i32 {
+            e.and_then(|w| {
+                self.learned_unigram.get(&(w.reading.clone(), w.surface.clone()))
+            })
+            .copied()
+            .unwrap_or(0)
+        };
+        conn_cost = clamp_single_kanji_pair_conn_cost(
+            prev_node.entry.as_ref(),
+            current_node.entry.as_ref(),
+            bonus_of(prev_node.entry.as_ref()),
+            bonus_of(current_node.entry.as_ref()),
+            conn_cost,
+        );
+        // 「1文字漢字＋1文字漢字の非自立名詞」で文が終わる場合にも
+        // 下限を設ける（祖先ノードも1文字漢字の場合のみ。祖先ノードは
+        // 既に確定済みなので参照できる）。
+        let grandparent_entry = prev_node
+            .prev_node
+            .and_then(|gp_idx| lattice.nodes[gp_idx].entry.as_ref());
+        conn_cost = single_kanji_bound_noun_phrase_end_conn_cost(
+            prev_node.entry.as_ref(),
+            grandparent_entry,
+            bonus_of(prev_node.entry.as_ref()),
+            bonus_of(grandparent_entry),
+            conn_cost,
+        );
+        // 学習ボーナスの乗った1文字漢字の非自立名詞が、助詞等を
+        // 挟まず直接別の内容語に続く場合にも下限を設ける
+        // （例: 「際」+「起動」で「再起動」が押しのけられるのを防ぐ）。
+        conn_cost = single_kanji_bound_noun_then_content_word_conn_cost(
+            prev_node.entry.as_ref(),
+            current_node.entry.as_ref(),
+            bonus_of(prev_node.entry.as_ref()),
+            conn_cost,
+        );
+        // 学習ボーナスの乗った1文字漢字の形容詞語幹（「多い」でなく
+        // 「多」単体 等）が、助詞を挟まず直接別の内容語に続く場合にも
+        // 下限を設ける（例:「おお」+「さか」で「大阪」が
+        // 押しのけられるのを防ぐ）。
+        conn_cost = bonused_adjective_stem_then_content_word_conn_cost(
+            prev_node.entry.as_ref(),
+            bonus_of(prev_node.entry.as_ref()),
+            conn_cost,
+        );
+        // フィラーの直後に学習ボーナスの乗った語が続く場合にも
+        // 下限を設ける
+        conn_cost = filler_then_bonused_word_conn_cost(
+            prev_node.entry.as_ref(),
+            bonus_of(current_node.entry.as_ref()),
+            conn_cost,
+        );
+        // 学習（ユニグラム・バイグラム）が乗った活用語が、極端に
+        // 安い活用接続（形容詞連用形+ない 等）を通じて無関係な
+        // 同音異義語を押しのける場合にも下限を設ける
+        // （例:「酸く」+「ない」で「少ない」が押しのけられるのを防ぐ）。
+        conn_cost = bonused_adjective_inflection_conn_floor(
+            prev_node.entry.as_ref(),
+            current_node.entry.as_ref(),
+            bonus_of(prev_node.entry.as_ref()),
+            bigram_bonus,
+            conn_cost,
+        );
+        // 学習ボーナスの乗った語が接頭詞（お・ご 等）に直接続く
+        // 場合にも下限を設ける
+        // （例:「お」+「中」で「お腹」が押しのけられるのを防ぐ）。
+        conn_cost = bonused_word_after_prefix_conn_floor(
+            prev_node.entry.as_ref(),
+            bonus_of(current_node.entry.as_ref()),
+            bigram_bonus,
+            conn_cost,
+        );
+
+        conn_cost
+    }
+
     /// Viterbiアルゴリズムで最適パスを探索（pub for IncrementalViterbi）
     pub fn find_best_path(&self, lattice: &mut Lattice) {
         let input_len = lattice.input.len();
@@ -804,15 +973,14 @@ impl ViterbiConverter {
         for pos in 0..=input_len {
             // この位置で始まるノードを処理
             let starting_indices: Vec<usize> = lattice.nodes_starting_at[pos].clone();
-            
+
             for &node_idx in &starting_indices {
                 // この位置で終わるノードから連接コストを計算
                 let ending_indices: Vec<usize> = lattice.nodes_ending_at[pos].clone();
-                
+
                 let mut best_cost = i32::MAX;
                 let mut best_prev: Option<usize> = None;
 
-                let use_bigram = !self.learned_bigram.is_empty();
                 for &prev_idx in &ending_indices {
                     let prev_node = &lattice.nodes[prev_idx];
                     if prev_node.total_cost == i32::MAX {
@@ -820,6 +988,9 @@ impl ViterbiConverter {
                     }
 
                     let current_node = &lattice.nodes[node_idx];
+<<<<<<< HEAD
+                    let conn_cost = self.edge_connection_cost(lattice, prev_idx, node_idx);
+=======
 
                     // 連接コスト
                     let mut conn_cost = self.dictionary.matrix.get(
@@ -846,8 +1017,11 @@ impl ViterbiConverter {
                             .saturating_add(katakana_kanji_suffix_penalty(pe, ce));
                         // 形容詞の終止形（〜い）に「て」が直接続くのは文法的に
                         // 常に誤り（正しくは連用形〜くて）なので無条件でペナルティ
+                        conn_cost = adjective_terminal_then_te_penalty(pe, ce, conn_cost);
+                        // 1文字漢字の表記かつ読みが単独助詞と一致する語（野・葉 等）
+                        // が文頭以外に出現するのは不自然なので無条件でペナルティ
                         conn_cost = conn_cost
-                            .saturating_add(adjective_terminal_then_te_penalty(pe, ce));
+                            .saturating_add(single_kanji_lone_particle_reading_penalty(ce));
                     }
                     // 1文字漢字が絡む不自然な接続コスト（学習バイグラム込み）には
                     // 下限を設ける。ただし学習ボーナスでどちらかの単語コストが
@@ -927,6 +1101,7 @@ impl ViterbiConverter {
                         bigram_bonus,
                         conn_cost,
                     );
+>>>>>>> origin/develop
 
                     // 総コスト = 前のノードまでのコスト + 連接コスト + 単語コスト
                     let total = prev_node.total_cost
@@ -992,7 +1167,7 @@ impl ViterbiConverter {
             return Vec::new();
         }
 
-        n_best_from_lattice(&lattice, &self.dictionary, n)
+        n_best_from_lattice(&lattice, self, n)
     }
 
     /// N-best候補を表層形の文字列として取得

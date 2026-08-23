@@ -49,6 +49,21 @@ fn debug_log_enabled() -> bool {
     })
 }
 
+/// 監査ログ（段階別トレース）のメモリ収集が有効か。
+///
+/// 既定で有効。`IME_AUDIT_LOG=0` を明示したときだけ無効になる。
+/// 収集はメモリ内のリングバッファのみで、ファイルへ残るのは監査ログ
+/// ウィンドウからユーザーが明示的にエクスポートしたときだけ。
+pub(crate) fn audit_log_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| audit_log_enabled_from(std::env::var("IME_AUDIT_LOG").ok().as_deref()))
+}
+
+/// `IME_AUDIT_LOG` の値から収集有効かを判定する（テスト用に環境変数から分離）。
+pub(crate) fn audit_log_enabled_from(value: Option<&str>) -> bool {
+    !matches!(value.map(str::trim), Some("0"))
+}
+
 // デバッグログ（UTF-8 BOM付きで出力、IME_DEBUG_LOG=1 のときのみ）
 #[allow(unused_macros)]
 macro_rules! debug_log {
@@ -83,6 +98,7 @@ static mut OUR_ACTIVE: bool = false;
 static mut INITIAL_CHECK_DONE: bool = false;
 
 // 機能別モジュール（詳細は各ファイル先頭の //! を参照）
+mod audit_log_ui;
 mod command_mode;
 mod conversion;
 mod hook;
@@ -91,6 +107,7 @@ mod settings_ui;
 mod uia;
 
 // 旧単一ファイル時代からの相互参照が多いため、クレート内へフラットに再公開する
+pub(crate) use audit_log_ui::*;
 pub(crate) use command_mode::*;
 pub(crate) use conversion::*;
 pub(crate) use hook::*;
@@ -284,5 +301,23 @@ pub unsafe extern "C" fn try_handle_dialog_message(msg: *const MSG) -> bool {
     if msg.is_null() {
         return false;
     }
-    settings_ui::try_handle_dialog_message(&*msg)
+    unsafe {
+        let msg = &*msg;
+        settings_ui::try_handle_dialog_message(msg)
+            || audit_log_ui::try_handle_audit_dialog_message(msg)
+    }
+}
+
+#[cfg(test)]
+mod audit_log_enabled_tests {
+    use super::audit_log_enabled_from;
+
+    #[test]
+    fn enabled_by_default_and_disabled_only_by_zero() {
+        assert!(audit_log_enabled_from(None));
+        assert!(audit_log_enabled_from(Some("1")));
+        assert!(audit_log_enabled_from(Some("")));
+        assert!(!audit_log_enabled_from(Some("0")));
+        assert!(!audit_log_enabled_from(Some(" 0 ")));
+    }
 }
