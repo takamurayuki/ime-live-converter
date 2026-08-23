@@ -368,6 +368,59 @@ fn test_common_word_seed_applied() {
 }
 
 #[test]
+fn test_load_word_priority_file_applies_bonus_with_default_and_override() {
+    let path = std::env::temp_dir()
+        .join(format!("ime_test_word_priority_{}.tsv", std::process::id()));
+    std::fs::write(
+        &path,
+        "# コメント行\n\nはたち\t二十歳\t3000\nらいしゅう\t来週\n",
+    )
+    .unwrap();
+    let mut converter = ViterbiConverter::new(create_test_dictionary());
+    let count = converter.load_word_priority_file(&path).unwrap();
+    std::fs::remove_file(&path).ok();
+    assert_eq!(count, 2);
+    // コスト列を明示した行はその値が使われる
+    assert_eq!(
+        converter.learned_unigram.get(&("はたち".to_string(), "二十歳".to_string())),
+        Some(&3000)
+    );
+    // コスト列省略時は COMMON_WORD_SEED_BONUS(1500) が既定値になる
+    assert_eq!(
+        converter.learned_unigram.get(&("らいしゅう".to_string(), "来週".to_string())),
+        Some(&COMMON_WORD_SEED_BONUS)
+    );
+}
+
+#[test]
+fn test_load_word_priority_file_does_not_override_user_learning() {
+    // ユーザーの実学習値が既にある場合はそれを優先する
+    // （`.entry().or_insert()` の既定シードと同じ規約）。
+    let path = std::env::temp_dir()
+        .join(format!("ime_test_word_priority_no_override_{}.tsv", std::process::id()));
+    std::fs::write(&path, "はたち\t二十歳\t3000\n").unwrap();
+    let mut converter = ViterbiConverter::new(create_test_dictionary());
+    converter.learn_unigram("はたち", "二十歳", 1); // ユーザー学習で500相当
+    let before = *converter
+        .learned_unigram
+        .get(&("はたち".to_string(), "二十歳".to_string()))
+        .unwrap();
+    converter.load_word_priority_file(&path).unwrap();
+    std::fs::remove_file(&path).ok();
+    assert_eq!(
+        converter.learned_unigram.get(&("はたち".to_string(), "二十歳".to_string())),
+        Some(&before)
+    );
+}
+
+#[test]
+fn test_load_word_priority_file_missing_path_is_graceful_skip() {
+    let mut converter = ViterbiConverter::new(create_test_dictionary());
+    let missing = std::env::temp_dir().join("ime_test_word_priority_does_not_exist.tsv");
+    assert!(converter.load_word_priority_file(&missing).is_err());
+}
+
+#[test]
 fn test_single_kanji_penalty_prefers_common_word() {
     // 1文字漢字ペナルティにより、同音の複合語が優先される
     let mut dict = Dictionary::new();
@@ -745,6 +798,151 @@ fn test_adjective_terminal_then_te_penalty() {
     // 「酸い」の方が生コストは低いが、終止形+てにはペナルティが掛かるため
     // 「梳い」が選ばれる
     assert_eq!(converter.convert_to_string("すいて"), "梳いて");
+}
+
+#[test]
+fn test_adjective_terminal_then_te_penalty_floor_overcomes_large_cost_gap() {
+    // 実辞書相当の大きなコスト差（形容詞側の接続コストが極端に有利）では、
+    // 旧実装の固定加算(+5000)では相殺しきれず「酸いて」系が勝ったままになる
+    // 回帰を防ぐ。floor方式（下限9000）なら、接続コストがどれだけ有利でも
+    // 「形容詞終止形+て」の合計コストが必ず高くなることを確認する。
+    let mut dict = Dictionary::new();
+    dict.matrix = crate::dictionary::ConnectionMatrix::new(10, 10);
+    for i in 0..10 {
+        for j in 0..10 {
+            dict.matrix.set(i, j, 200);
+        }
+    }
+    dict.matrix.set(1, 3, -8500); // 形容詞終止形→て（実辞書相当の極端に有利な接続）
+    dict.matrix.set(2, 3, -3200); // 動詞音便形→て
+    dict.add_word(WordEntry {
+        surface: "酸い".to_string(), reading: "すい".to_string(),
+        left_id: 1, right_id: 1, cost: 3000, pos: "形容詞-自立-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "梳い".to_string(), reading: "すい".to_string(),
+        left_id: 2, right_id: 2, cost: 3200, pos: "動詞-自立-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "て".to_string(), reading: "て".to_string(),
+        left_id: 3, right_id: 3, cost: 3000, pos: "助詞-接続助詞-*-*".to_string(),
+    });
+    let mut converter = ViterbiConverter::new(dict);
+    converter.enable_katakana_fallback = false;
+    // 固定加算(+5000)では 3000-8500+5000=-500 < 3200-3200=0 のため
+    // 「酸いて」が勝ってしまうが、floor(9000)では 3000+9000=12000 > 0 となり
+    // 「梳いて」が選ばれる
+    assert_eq!(converter.convert_to_string("すいて"), "梳いて");
+}
+
+#[test]
+fn test_single_kanji_lone_particle_reading_penalty_fixes_mid_sentence_split() {
+    // 実例: 「よこのみち」が「横」+「野」(1文字漢字, 読み「の」)に誤分割
+    // され、正しい助詞分割「横」+「の」を押しのけてしまう問題を再現する。
+    // 「野」が文頭以外（直前に「横」という実語がある）に出現する場合、
+    // ペナルティにより正しい助詞分割が選ばれることを確認する。
+    let mut dict = Dictionary::new();
+    dict.matrix = crate::dictionary::ConnectionMatrix::new(10, 10);
+    for i in 0..10 {
+        for j in 0..10 {
+            dict.matrix.set(i, j, 200);
+        }
+    }
+    dict.add_word(WordEntry {
+        surface: "横".to_string(), reading: "よこ".to_string(),
+        left_id: 1, right_id: 1, cost: 3000, pos: "名詞-固有名詞-地域-一般".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "野".to_string(), reading: "の".to_string(),
+        left_id: 2, right_id: 2, cost: 1500, pos: "名詞-一般-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "の".to_string(), reading: "の".to_string(),
+        left_id: 3, right_id: 3, cost: 2200, pos: "助詞-連体化-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "みち".to_string(), reading: "みち".to_string(),
+        left_id: 4, right_id: 4, cost: 3000, pos: "名詞-一般-*-*".to_string(),
+    });
+    let mut converter = ViterbiConverter::new(dict);
+    converter.enable_katakana_fallback = false;
+    // 「横」は COMMON_WORD_SEED に含まれる語のため、そのままだと無関係な
+    // 学習ボーナス由来のfloor(bonused_adjective_stem_then_content_word_conn_cost)
+    // が発火し本テストの検証対象と混線する。本テストの対象外なので消しておく。
+    converter.forget_unigram("よこ", "横");
+    // ペナルティが無ければ「野」(単語コスト1500+単独漢字ペナルティ400=1900)が
+    // 「の」(2200)より安いため「横野みち」が勝つが、「横」(実語)の直後に
+    // 「野」が来る接続にペナルティ(2500)が掛かるため逆転し「横のみち」が
+    // 選ばれる
+    assert_eq!(converter.convert_to_string("よこのみち"), "横のみち");
+}
+
+#[test]
+fn test_single_kanji_lone_particle_reading_penalty_not_applied_at_sentence_start() {
+    // 「野」が文頭（直前に実語が無い）に出現する場合はペナルティが
+    // 適用されないことを確認する（無条件ガード節が `prev_node.entry`
+    // が `Some` の場合のみ成立することによる、追加フラグ不要の設計）。
+    let mut dict = Dictionary::new();
+    dict.matrix = crate::dictionary::ConnectionMatrix::new(10, 10);
+    for i in 0..10 {
+        for j in 0..10 {
+            dict.matrix.set(i, j, 200);
+        }
+    }
+    dict.add_word(WordEntry {
+        surface: "野".to_string(), reading: "の".to_string(),
+        left_id: 2, right_id: 2, cost: 1500, pos: "名詞-一般-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "の".to_string(), reading: "の".to_string(),
+        left_id: 3, right_id: 3, cost: 2200, pos: "助詞-連体化-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "みち".to_string(), reading: "みち".to_string(),
+        left_id: 4, right_id: 4, cost: 3000, pos: "名詞-一般-*-*".to_string(),
+    });
+    let mut converter = ViterbiConverter::new(dict);
+    converter.enable_katakana_fallback = false;
+    // 文頭では「野」(実効コスト1900)が「の」(2200)より安いままなので、
+    // ペナルティ非適用により「野みち」が選ばれる
+    assert_eq!(converter.convert_to_string("のみち"), "野みち");
+}
+
+#[test]
+fn test_n_best_applies_same_unconditional_guards_as_find_best_path() {
+    // LiveConverter::generate_candidates は convert_to_string ではなく
+    // n_best を使う（候補一覧・実際の変換結果の生成経路）。n_best は
+    // 従来 dict.matrix の生の連接コストしか見ておらず、find_best_path が
+    // 適用する無条件ガード（カテゴリF/G等、学習非依存のもの）が反映
+    // されない実装差異があった。この回帰を防ぐため、n_best 経由でも
+    // 同じ結果になることを確認する。
+    let mut dict = Dictionary::new();
+    dict.matrix = crate::dictionary::ConnectionMatrix::new(10, 10);
+    for i in 0..10 {
+        for j in 0..10 {
+            dict.matrix.set(i, j, 200);
+        }
+    }
+    dict.add_word(WordEntry {
+        surface: "扉".to_string(), reading: "とびら".to_string(),
+        left_id: 1, right_id: 1, cost: 3000, pos: "名詞-一般-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "野".to_string(), reading: "の".to_string(),
+        left_id: 2, right_id: 2, cost: 1500, pos: "名詞-一般-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "の".to_string(), reading: "の".to_string(),
+        left_id: 3, right_id: 3, cost: 2200, pos: "助詞-連体化-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "みち".to_string(), reading: "みち".to_string(),
+        left_id: 4, right_id: 4, cost: 3000, pos: "名詞-一般-*-*".to_string(),
+    });
+    let mut converter = ViterbiConverter::new(dict);
+    converter.enable_katakana_fallback = false;
+    let n_best = converter.n_best_strings("とびらのみち", 5);
+    assert_eq!(n_best[0], "扉のみち", "n_best={:?}", n_best);
 }
 
 #[test]

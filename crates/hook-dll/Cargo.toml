@@ -25,5 +25,8 @@ common = { path = "../common" }
 zeroize = "1.7"
 tracing = "0.1"
 
+[dev-dependencies]
+serial_test = "3"
+
 [lib]
 crate-type = ["cdylib"]

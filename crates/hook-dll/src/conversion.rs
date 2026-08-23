@@ -74,6 +74,12 @@ pub(crate) struct LiveConversionState {
     pub(crate) learning: Option<LearningRepository>,
     /// 変換が有効かどうか
     pub(crate) enabled: bool,
+    /// 段階別監査ログ（直近50変換のリングバッファ）。ホットパスでは
+    /// このメモリ構造への追記だけを行い、表示・保存は監査ログウィンドウ側で行う。
+    pub(crate) trace_buffer: common::TraceBuffer,
+    /// add_char が記録した「入力」「前処理」段階。直後の update_conversion が
+    /// 取り出して「エンジン選定」「出力」と合わせ1トレースにする。
+    pub(crate) trace_pending: Vec<common::StageRecord>,
 }
 
 impl LiveConversionState {
@@ -103,6 +109,8 @@ impl LiveConversionState {
             generation: 0,
             learning: None,
             enabled: true,
+            trace_buffer: common::TraceBuffer::new(),
+            trace_pending: Vec::new(),
         }
     }
 
@@ -745,7 +753,19 @@ impl LiveConversionState {
         match Dictionary::load(path) {
             Ok(dict) => {
                 debug_log!("辞書読み込み成功、ViterbiConverter作成中");
-                self.converter = Some(ViterbiConverter::new(dict));
+                let mut converter = ViterbiConverter::new(dict);
+                // 優先語彙ファイル（辞書に既存の語同士の優先順位）を読み込む。
+                // 不在・パースエラーでも起動を止めない（graceful-skip）。
+                let priority_path = path.with_file_name("word_priority.tsv");
+                match converter.load_word_priority_file(&priority_path) {
+                    Ok(count) => {
+                        debug_log!("優先語彙ファイルを読み込みました: {}件", count);
+                    }
+                    Err(e) => {
+                        debug_log!("優先語彙ファイルの読み込みをスキップ: {}", e);
+                    }
+                }
+                self.converter = Some(converter);
                 // 過去の学習をライブ変換エンジンに反映
                 self.reload_learning_into_converter();
                 // ユーザー登録の単語を辞書へ注入（辞書に無い複合語を変換可能に）
@@ -779,8 +799,12 @@ impl LiveConversionState {
         self.clear_candidates();
         self.generation = self.generation.wrapping_add(1);
 
+        let tracing = audit_log_enabled();
+        let t_input = std::time::Instant::now();
         self.romaji_buffer.push(ch);
         debug_log!("入力: '{}' → ローマ字バッファ: '{}'", ch, self.romaji_buffer);
+        let romaji_before_split = if tracing { self.romaji_buffer.clone() } else { String::new() };
+        let t_pre = std::time::Instant::now();
 
         // ローマ字バッファを「確定ひらがな」と「保留ローマ字」に分割
         // （先頭に変換不能な英字が残っても以降が全てローマ字化しないよう、
@@ -789,6 +813,25 @@ impl LiveConversionState {
         if !settled.is_empty() {
             self.hiragana_buffer.push_str(&settled);
             self.romaji_buffer = pending;
+        }
+
+        if tracing {
+            let t_done = std::time::Instant::now();
+            self.trace_pending.clear();
+            self.trace_pending.push(common::StageRecord {
+                stage: common::StageKind::Input,
+                input: ch.to_string(),
+                output: romaji_before_split.clone(),
+                duration_micros: (t_pre - t_input).as_micros() as u64,
+                applied_rule: Some("romaji_buffer_append".to_string()),
+            });
+            self.trace_pending.push(common::StageRecord {
+                stage: common::StageKind::Preprocess,
+                input: romaji_before_split,
+                output: format!("かな='{}' 保留='{}'", self.hiragana_buffer, self.romaji_buffer),
+                duration_micros: (t_done - t_pre).as_micros() as u64,
+                applied_rule: Some("romaji_split".to_string()),
+            });
         }
 
         debug_log!("現在の状態: ひらがな='{}', ローマ字='{}'", self.hiragana_buffer, self.romaji_buffer);
@@ -836,11 +879,17 @@ impl LiveConversionState {
     /// 末尾だけ更新できる。旧実装(毎回全削除→再挿入)は cursor が頻繁に左に飛び、
     /// 視覚的に「後の入力が前を上書きする」ように見える原因だった。
     pub(crate) fn update_conversion(&mut self) -> Option<ConversionAction> {
+        // 監査ログ: 空入力（ひらがな無し）は記録しない。add_char が積んだ
+        // 入力/前処理段階は、記録しない場合も必ず捨てて次の変換に混ざらないようにする。
+        let pending = std::mem::take(&mut self.trace_pending);
+        let tracing = audit_log_enabled() && !self.hiragana_buffer.is_empty();
+        let t_engine = std::time::Instant::now();
+
         // ひらがなバッファのみを漢字変換
         // ローマ字バッファはそのまま末尾に追加
-        let converted_hiragana = if let Some(converter) = &self.converter {
+        let (converted_hiragana, engine_rule) = if let Some(converter) = &self.converter {
             if self.hiragana_buffer.is_empty() {
-                String::new()
+                (String::new(), "empty")
             } else if self.kana_tail_len > 0 {
                 // Escで戻した末尾はひらがなのまま、前半だけ変換する
                 let total = self.hiragana_buffer.chars().count();
@@ -852,20 +901,75 @@ impl LiveConversionState {
                 } else {
                     converter.convert_context_aware_to_string(&prefix)
                 };
-                format!("{}{}", conv, tail)
+                (format!("{}{}", conv, tail), "context_viterbi+kana_tail")
             } else {
                 // 文脈（内容語の繋がり）を考慮して尤もらしい変換を選ぶ
-                converter.convert_context_aware_to_string(&self.hiragana_buffer)
+                (
+                    converter.convert_context_aware_to_string(&self.hiragana_buffer),
+                    "context_viterbi",
+                )
             }
         } else {
             // 辞書がない場合はひらがなのまま
             debug_log!("辞書なし: ひらがなのまま '{}'", self.hiragana_buffer);
-            self.hiragana_buffer.clone()
+            (self.hiragana_buffer.clone(), "no_dictionary_passthrough")
         };
 
         // 変換結果 + ローマ字（未確定）
         let new_result = format!("{}{}", converted_hiragana, self.romaji_buffer);
-        self.apply_new_result(new_result)
+        if !tracing {
+            return self.apply_new_result(new_result);
+        }
+
+        let t_output = std::time::Instant::now();
+        let engine_rule = if self.kana_tail_len > 0 {
+            format!("{}({})", engine_rule, self.kana_tail_len)
+        } else {
+            engine_rule.to_string()
+        };
+        let mut trace = common::ConversionTrace::new(std::time::SystemTime::now());
+        if pending.is_empty() {
+            // add_char 以外（Backspace / Esc 戻し等）からの再変換: 入力段階はキー無し
+            trace.stages.push(common::StageRecord {
+                stage: common::StageKind::Input,
+                input: String::new(),
+                output: self.romaji_buffer.clone(),
+                duration_micros: 0,
+                applied_rule: Some("reconvert".to_string()),
+            });
+            trace.stages.push(common::StageRecord {
+                stage: common::StageKind::Preprocess,
+                input: self.romaji_buffer.clone(),
+                output: format!("かな='{}' 保留='{}'", self.hiragana_buffer, self.romaji_buffer),
+                duration_micros: 0,
+                applied_rule: Some("buffer_state".to_string()),
+            });
+        } else {
+            trace.stages.extend(pending);
+        }
+        trace.stages.push(common::StageRecord {
+            stage: common::StageKind::EngineSelect,
+            input: self.hiragana_buffer.clone(),
+            output: converted_hiragana,
+            duration_micros: (t_output - t_engine).as_micros() as u64,
+            applied_rule: Some(engine_rule),
+        });
+
+        let previous = self.conversion_result.clone();
+        let action = self.apply_new_result(new_result.clone());
+        let output_desc = match &action {
+            Some(a) => format!("delete={} insert='{}'", a.delete_count, a.insert_text),
+            None => "変化なし".to_string(),
+        };
+        trace.stages.push(common::StageRecord {
+            stage: common::StageKind::Output,
+            input: format!("前='{}' 新='{}'", previous, new_result),
+            output: output_desc,
+            duration_micros: t_output.elapsed().as_micros() as u64,
+            applied_rule: Some("common_prefix_diff".to_string()),
+        });
+        self.trace_buffer.push(trace);
+        action
     }
 
     /// 表示テキストを new_result に差し替えるための差分アクションを作る
@@ -1534,6 +1638,96 @@ mod build_candidates_tests {
 }
 
 #[cfg(test)]
+mod audit_trace_tests {
+    use super::*;
+    use common::{StageKind, TRACE_BUFFER_CAPACITY};
+
+    fn converter_with_kyou() -> ViterbiConverter {
+        let mut dict = Dictionary::new();
+        dict.matrix = common::ConnectionMatrix::new(10, 10);
+        for i in 0..10 {
+            for j in 0..10 {
+                dict.matrix.set(i, j, 200);
+            }
+        }
+        dict.add_word(common::WordEntry {
+            surface: "今日".to_string(), reading: "きょう".to_string(),
+            left_id: 1, right_id: 1, cost: 3000, pos: "名詞".to_string(),
+        });
+        ViterbiConverter::new(dict)
+    }
+
+    /// 「きょう」を1キーずつ打つと、最後のキーで4段階のトレースが記録される。
+    #[test]
+    fn kyou_records_four_stages_with_io_and_rule() {
+        let mut state = LiveConversionState::new();
+        state.converter = Some(converter_with_kyou());
+        for ch in "kyou".chars() {
+            state.add_char(ch);
+        }
+        let trace = state.trace_buffer.back().expect("トレースが記録される");
+        assert_eq!(trace.stages.len(), 4);
+        assert_eq!(trace.stages[0].stage, StageKind::Input);
+        // "kyo" の時点で「きょ」が確定しローマ字バッファは空になるため、
+        // 最後のキー 'u' の入力段階は 'u' → ローマ字バッファ 'u'。
+        assert_eq!(trace.stages[0].input, "u");
+        assert_eq!(trace.stages[0].output, "u");
+        assert_eq!(trace.stages[1].stage, StageKind::Preprocess);
+        assert_eq!(trace.stages[1].input, "u");
+        assert!(trace.stages[1].output.contains("きょう"), "{}", trace.stages[1].output);
+        assert_eq!(trace.stages[2].stage, StageKind::EngineSelect);
+        assert_eq!(trace.stages[2].input, "きょう");
+        assert_eq!(trace.stages[2].output, "今日");
+        assert_eq!(trace.stages[2].applied_rule.as_deref(), Some("context_viterbi"));
+        assert_eq!(trace.stages[3].stage, StageKind::Output);
+        assert!(trace.stages[3].output.contains("今日"), "{}", trace.stages[3].output);
+        assert!(trace.total_micros() > 0, "所要時間が計測されている");
+    }
+
+    /// ひらがなバッファが空（保留ローマ字だけ）の間はトレースを記録しない。
+    #[test]
+    fn empty_hiragana_buffer_records_nothing() {
+        let mut state = LiveConversionState::new();
+        state.converter = Some(converter_with_kyou());
+        state.add_char('k');
+        assert!(state.trace_buffer.is_empty());
+        // 記録しなかった入力/前処理段階は捨てられ、次の変換に混ざらない
+        assert!(state.trace_pending.is_empty());
+    }
+
+    /// 51回変換しても直近50件だけが保持される。
+    #[test]
+    fn buffer_is_bounded_to_capacity() {
+        let mut state = LiveConversionState::new();
+        state.converter = Some(converter_with_kyou());
+        for _ in 0..(TRACE_BUFFER_CAPACITY + 1) {
+            state.add_char('a');
+        }
+        assert_eq!(state.trace_buffer.len(), TRACE_BUFFER_CAPACITY);
+    }
+
+    /// Backspace からの再変換も4段階で記録される（入力段階はキー無し）。
+    #[test]
+    fn backspace_reconversion_is_traced() {
+        let mut state = LiveConversionState::new();
+        state.converter = Some(converter_with_kyou());
+        // 「今日今日」→ Backspace で末尾の文節「今日」だけ消え「きょう」が残る
+        for ch in "kyoukyou".chars() {
+            state.add_char(ch);
+        }
+        let before = state.trace_buffer.len();
+        state.backspace();
+        assert_eq!(state.hiragana_buffer, "きょう");
+        assert_eq!(state.trace_buffer.len(), before + 1);
+        let trace = state.trace_buffer.back().unwrap();
+        assert_eq!(trace.stages.len(), 4);
+        assert_eq!(trace.stages[0].applied_rule.as_deref(), Some("reconvert"));
+        assert_eq!(trace.stages[2].input, "きょう");
+        assert_eq!(trace.stages[2].output, "今日");
+    }
+}
+
+#[cfg(test)]
 mod reading_validation_tests {
     use super::is_hiragana_reading;
 
@@ -1554,5 +1748,236 @@ mod reading_validation_tests {
     fn rejects_katakana_and_ascii() {
         assert!(!is_hiragana_reading("ソート"));
         assert!(!is_hiragana_reading("react"));
+    }
+}
+
+#[cfg(test)]
+mod state_machine_tests {
+    use super::*;
+
+    /// 「きょう」に「今日」「強」の同音語、「がっこう」に「学校」を割り当てた
+    /// テスト用辞書＋変換器。commit_first_word/extend_kana_revert/cycle_candidate
+    /// など複数文節にまたがる状態遷移テストで共有する。
+    fn two_segment_test_converter() -> ViterbiConverter {
+        let mut dict = Dictionary::new();
+        dict.matrix = common::ConnectionMatrix::new(10, 10);
+        for i in 0..10 {
+            for j in 0..10 {
+                dict.matrix.set(i, j, 200);
+            }
+        }
+        dict.add_word(common::WordEntry {
+            surface: "今日".to_string(), reading: "きょう".to_string(),
+            left_id: 1, right_id: 1, cost: 3000, pos: "名詞".to_string(),
+        });
+        dict.add_word(common::WordEntry {
+            surface: "強".to_string(), reading: "きょう".to_string(),
+            left_id: 1, right_id: 1, cost: 4000, pos: "名詞".to_string(),
+        });
+        dict.add_word(common::WordEntry {
+            surface: "学校".to_string(), reading: "がっこう".to_string(),
+            left_id: 1, right_id: 1, cost: 3000, pos: "名詞".to_string(),
+        });
+        ViterbiConverter::new(dict)
+    }
+
+    fn state_with_two_segment_dict() -> LiveConversionState {
+        let mut state = LiveConversionState::new();
+        state.converter = Some(two_segment_test_converter());
+        state
+    }
+
+    /// ローマ字 "kyou" を1文字ずつ add_char に通した後 commit() すると、
+    /// 表示バッファ一式がクリアされ入力世代(generation)が進むことを確認する
+    /// （修正前は commit 後もバッファが残り、次の入力に前回の変換が混入し得た）。
+    #[test]
+    fn add_char_then_commit_clears_buffers_and_advances_generation() {
+        let mut state = state_with_two_segment_dict();
+        for ch in "kyou".chars() {
+            state.add_char(ch);
+        }
+        assert_eq!(state.hiragana_buffer, "きょう");
+        assert!(state.is_composing());
+
+        let gen_before = state.generation;
+        let action = state.commit();
+        // 表示は逐次更新で既に確定形と一致しているため、commit自体は
+        // 追加の差分アクションを返さない（末尾 'n' の特殊処理のみ例外）。
+        assert!(action.is_none());
+        assert!(!state.is_composing());
+        assert_eq!(state.hiragana_buffer, "");
+        assert_eq!(state.romaji_buffer, "");
+        assert_eq!(state.conversion_result, "");
+        assert_eq!(state.kana_tail_len, 0);
+        assert_eq!(state.generation, gen_before + 1);
+    }
+
+    /// Tab連打による同音候補巡回が、末尾で先頭へ・先頭で末尾へ折り返す
+    /// （境界のインデックス計算を回帰対象化する）。
+    #[test]
+    fn cycle_candidate_wraps_around_index_boundaries() {
+        let mut state = state_with_two_segment_dict();
+        state.hiragana_buffer = "きょう".to_string();
+
+        // 初回のTabは一覧生成＋先頭(index 0)選択のみ
+        let first = state.cycle_candidate(false);
+        assert!(first.is_some());
+        assert_eq!(state.candidate_index, 0);
+        let candidate_count = state.candidates.len();
+        assert!(candidate_count >= 2, "「今日」「強」の同音語が候補にあるはず");
+
+        // 末尾まで進める
+        for _ in 1..candidate_count {
+            state.cycle_candidate(false);
+        }
+        assert_eq!(state.candidate_index, candidate_count - 1);
+
+        // 末尾からさらに進めると先頭へ折り返す
+        state.cycle_candidate(false);
+        assert_eq!(state.candidate_index, 0);
+
+        // 先頭から逆方向へ進めると末尾へ折り返す
+        state.cycle_candidate(true);
+        assert_eq!(state.candidate_index, candidate_count - 1);
+    }
+
+    /// Escを繰り返すと末尾の文節から順に一つずつひらがなへ戻り、
+    /// 全て戻し終えたら None（呼び出し側は取消にフォールバック）を返す。
+    #[test]
+    fn extend_kana_revert_reverts_one_segment_at_a_time_then_stops() {
+        let mut state = state_with_two_segment_dict();
+        state.hiragana_buffer = "きょうがっこう".to_string();
+        let total = state.hiragana_buffer.chars().count();
+        assert_eq!(total, 7);
+
+        // 1回目: 末尾の文節（学校＝がっこう、4文字）だけをひらがなに戻す
+        let first = state.extend_kana_revert();
+        assert!(first.is_some());
+        assert_eq!(state.kana_tail_len, 4);
+
+        // 2回目: 残っていた前半（今日＝きょう）も戻り、全体が戻し終わる
+        let second = state.extend_kana_revert();
+        assert!(second.is_some());
+        assert_eq!(state.kana_tail_len, 7);
+
+        // 3回目: これ以上戻すものが無い
+        let third = state.extend_kana_revert();
+        assert!(third.is_none());
+    }
+
+    /// generation は add_char / backspace / commit / cancel のいずれでも
+    /// 単調に増加し続ける（非同期結果を世代で棄却する仕組みの前提）。
+    /// 逆行・据え置きが起きたらここで検出する。
+    #[test]
+    fn generation_counter_strictly_increases_across_mutations() {
+        let mut state = state_with_two_segment_dict();
+        let g0 = state.generation;
+
+        state.add_char('k');
+        let g1 = state.generation;
+        assert!(g1 > g0);
+
+        state.backspace();
+        let g2 = state.generation;
+        assert!(g2 > g1);
+
+        state.add_char('k');
+        let g3 = state.generation;
+        let _ = state.commit();
+        let g4 = state.generation;
+        assert!(g4 > g3);
+
+        let _ = state.cancel();
+        let g5 = state.generation;
+        assert!(g5 > g4);
+    }
+
+    /// commit_first_word は 1-best の先頭語だけを確定済み扱いにし、
+    /// 残りの読みは未変換のまま保持する（前半のみ正しい場合の部分確定用）。
+    #[test]
+    fn commit_first_word_partially_commits_leading_word_only() {
+        let mut state = state_with_two_segment_dict();
+        state.hiragana_buffer = "きょうがっこう".to_string();
+        // 表示は既に1-bestと一致している状態を模す
+        state.conversion_result = "今日学校".to_string();
+
+        state.commit_first_word();
+
+        assert_eq!(state.hiragana_buffer, "がっこう");
+        assert_eq!(state.conversion_result, "学校");
+        assert_eq!(
+            state.committed_segments,
+            vec![("きょう".to_string(), "今日".to_string(), "名詞".to_string())]
+        );
+    }
+
+    /// 予測変換（前方一致補完）の確定: 現在の表示を丸ごと予測表記に
+    /// 置き換えるアクションを返し、last_committed を更新する。
+    #[test]
+    fn commit_prediction_replaces_display_for_prefix_completion() {
+        let mut state = LiveConversionState::new();
+        state.conversion_result = "きょ".to_string();
+        state.hiragana_buffer = "きょ".to_string();
+        state.predictions = vec![("きょう".to_string(), "今日".to_string())];
+
+        let gen_before = state.generation;
+        let action = state
+            .commit_prediction(0)
+            .expect("前方一致予測の確定はアクションを返す");
+        assert_eq!(action.delete_count, 2); // 表示中の "きょ"（2文字）を全削除
+        assert_eq!(action.insert_text, "今日");
+        assert_eq!(state.last_committed, "今日");
+        assert!(state.hiragana_buffer.is_empty());
+        assert!(state.predictions.is_empty());
+        assert_eq!(state.generation, gen_before + 1);
+    }
+
+    /// 予測変換（次単語予測・読み空）の確定: 表示の末尾に追記するだけで
+    /// 削除は発生しない。
+    #[test]
+    fn commit_prediction_appends_for_next_word_prediction() {
+        let mut state = LiveConversionState::new();
+        state.recent_context = "今日".to_string();
+        state.last_committed = "今日".to_string();
+        state.predictions = vec![(String::new(), "は".to_string())];
+
+        let action = state
+            .commit_prediction(0)
+            .expect("次単語予測の確定はアクションを返す");
+        assert_eq!(action.delete_count, 0);
+        assert_eq!(action.insert_text, "は");
+        assert_eq!(state.last_committed, "は");
+    }
+
+    /// 範囲外インデックスの確定は None（消費しない）。
+    #[test]
+    fn commit_prediction_out_of_range_index_returns_none() {
+        let mut state = LiveConversionState::new();
+        state.predictions = vec![("きょう".to_string(), "今日".to_string())];
+        assert!(state.commit_prediction(5).is_none());
+    }
+
+    /// 候補一覧が空のときは誤学習リセットも None（消費しない）。
+    #[test]
+    fn reset_learning_for_selected_returns_none_without_candidates() {
+        let mut state = state_with_two_segment_dict();
+        assert!(state.reset_learning_for_selected().is_none());
+    }
+
+    /// Deleteキーによる誤学習リセット後、候補一覧が再構築され
+    /// 選択位置が先頭（最有力候補）へ戻ることを確認する。
+    #[test]
+    fn reset_learning_for_selected_rebuilds_candidates_and_resets_index() {
+        let mut state = state_with_two_segment_dict();
+        state.hiragana_buffer = "きょう".to_string();
+        state.cycle_candidate(false); // 候補一覧生成＋先頭選択
+        let candidate_count = state.candidates.len();
+        assert!(candidate_count >= 2);
+        state.select_candidate(candidate_count - 1); // 末尾候補を選択＆表示に反映
+
+        let action = state.reset_learning_for_selected();
+        assert!(action.is_some());
+        assert_eq!(state.candidate_index, 0);
+        assert!(!state.candidates.is_empty());
     }
 }
