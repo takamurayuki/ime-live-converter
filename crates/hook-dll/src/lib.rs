@@ -226,8 +226,12 @@ pub extern "C" fn uninstall_hook() -> bool {
 }
 
 /// 辞書をロード
+///
+/// # Safety
+/// `path_ptr` は `path_len` バイト分の有効なメモリ領域を指す必要がある
+/// (呼び出し側がそれを保証する)。ヌルポインタや長さ0は関数内でチェックする。
 #[no_mangle]
-pub extern "C" fn load_dictionary(path_ptr: *const u8, path_len: usize) -> bool {
+pub unsafe extern "C" fn load_dictionary(path_ptr: *const u8, path_len: usize) -> bool {
     unsafe {
         debug_log!("辞書ロード開始: ptr={:?}, len={}", path_ptr, path_len);
         
@@ -288,8 +292,12 @@ pub extern "C" fn is_enabled() -> bool {
 /// 想定（true が返ったらそちらは呼ばない）。これが無いと、Tab での
 /// コントロール間移動などダイアログ標準のキー操作がカスタムウィンドウ
 /// では効かない。
+///
+/// # Safety
+/// `msg` は有効な `MSG` 構造体を指すか、ヌルポインタである必要がある
+/// (ヌルの場合は関数内でチェックしてfalseを返す)。
 #[no_mangle]
-pub extern "C" fn try_handle_dialog_message(msg: *const MSG) -> bool {
+pub unsafe extern "C" fn try_handle_dialog_message(msg: *const MSG) -> bool {
     if msg.is_null() {
         return false;
     }
