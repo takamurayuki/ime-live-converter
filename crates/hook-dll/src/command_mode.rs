@@ -393,3 +393,76 @@ pub(crate) unsafe fn handle_command_mode(vk_code: u32, shift: bool) -> Option<LR
     }
     None
 }
+
+#[cfg(test)]
+mod pure_fn_tests {
+    use super::*;
+
+    /// 母音 k 個の全組合せは 5^k 通り、各要素の長さは k になる
+    /// （ローマ字補正の母音補完/置換で組合せ数の前提が崩れていないか）。
+    #[test]
+    fn vowel_combos_produces_5_pow_k_combinations_of_length_k() {
+        for k in 0..=3usize {
+            let combos = vowel_combos(k);
+            assert_eq!(combos.len(), 5usize.pow(k as u32));
+            assert!(combos.iter().all(|c| c.len() == k));
+        }
+    }
+
+    #[test]
+    fn vowel_combos_k1_contains_all_five_vowels_without_duplicates() {
+        let mut combos: Vec<char> = vowel_combos(1).into_iter().map(|c| c[0]).collect();
+        combos.sort();
+        assert_eq!(combos, vec!['a', 'e', 'i', 'o', 'u']);
+    }
+
+    #[test]
+    fn vk_to_ascii_maps_letters_and_shift_case() {
+        assert_eq!(vk_to_ascii(0x41, false), Some('a'));
+        assert_eq!(vk_to_ascii(0x41, true), Some('A'));
+        assert_eq!(vk_to_ascii(0x5A, false), Some('z'));
+    }
+
+    #[test]
+    fn vk_to_ascii_maps_digits_with_and_without_shift() {
+        assert_eq!(vk_to_ascii(0x31, false), Some('1'));
+        assert_eq!(vk_to_ascii(0x31, true), Some('!')); // Shift+1
+        assert_eq!(vk_to_ascii(0x30, false), Some('0'));
+        assert_eq!(vk_to_ascii(0x30, true), Some(')')); // Shift+0
+    }
+
+    #[test]
+    fn vk_to_ascii_maps_numpad_digits() {
+        assert_eq!(vk_to_ascii(0x60, false), Some('0')); // VK_NUMPAD0
+        assert_eq!(vk_to_ascii(0x69, false), Some('9')); // VK_NUMPAD9
+    }
+
+    #[test]
+    fn vk_to_ascii_returns_none_for_unmapped_vk() {
+        assert_eq!(vk_to_ascii(0x1B, false), None); // VK_ESCAPE は対象外
+    }
+
+    #[test]
+    fn is_line_edit_vk_matches_cursor_and_edit_keys_only() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            VK_DELETE, VK_END, VK_HOME, VK_INSERT, VK_LEFT, VK_NEXT, VK_PRIOR,
+        };
+        assert!(is_line_edit_vk(VK_LEFT.0 as u32));
+        assert!(is_line_edit_vk(VK_HOME.0 as u32));
+        assert!(is_line_edit_vk(VK_END.0 as u32));
+        assert!(is_line_edit_vk(VK_DELETE.0 as u32));
+        assert!(is_line_edit_vk(VK_PRIOR.0 as u32));
+        assert!(is_line_edit_vk(VK_NEXT.0 as u32));
+        assert!(is_line_edit_vk(VK_INSERT.0 as u32));
+        assert!(!is_line_edit_vk(0x41)); // 'A' は行編集キーではない
+    }
+
+    #[test]
+    fn is_terminal_class_matches_known_terminal_window_classes() {
+        assert!(is_terminal_class("CASCADIA_HOSTING_WINDOW_CLASS")); // Windows Terminal
+        assert!(is_terminal_class("ConsoleWindowClass")); // conhost / cmd
+        assert!(is_terminal_class("PseudoConsoleWindow"));
+        assert!(is_terminal_class("mintty-1")); // Git Bash 系（前方一致）
+        assert!(!is_terminal_class("Chrome_WidgetWin_1")); // VSCode等の統合アプリ窓
+    }
+}

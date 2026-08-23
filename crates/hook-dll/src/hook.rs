@@ -944,3 +944,188 @@ pub extern "system" fn LowLevelKeyboardProc(
         CallNextHookEx(None, code, wparam, lparam)
     }
 }
+
+#[cfg(test)]
+mod hook_pure_fn_tests {
+    use super::*;
+
+    #[test]
+    fn vk_to_char_maps_lowercase_letters_without_shift() {
+        assert_eq!(vk_to_char(0x41, 0, false), Some('a')); // VK 'A'
+        assert_eq!(vk_to_char(0x5A, 0, false), Some('z')); // VK 'Z'
+    }
+
+    #[test]
+    fn vk_to_char_maps_uppercase_letters_with_shift() {
+        assert_eq!(vk_to_char(0x41, 0, true), Some('A'));
+        assert_eq!(vk_to_char(0x5A, 0, true), Some('Z'));
+    }
+
+    #[test]
+    fn vk_to_char_maps_oem_punctuation() {
+        assert_eq!(vk_to_char(0xBC, 0, false), Some(',')); // VK_OEM_COMMA → 、
+        assert_eq!(vk_to_char(0xBE, 0, false), Some('.')); // VK_OEM_PERIOD → 。
+        assert_eq!(vk_to_char(0xBD, 0, false), Some('-')); // VK_OEM_MINUS → ー
+        assert_eq!(vk_to_char(0xBF, 0, false), Some('/')); // VK_OEM_2 → ・
+        assert_eq!(vk_to_char(0xBF, 0, true), Some('?')); // VK_OEM_2 + shift → ？
+        assert_eq!(vk_to_char(0x31, 0, true), Some('!')); // '1' + shift → ！
+        assert_eq!(vk_to_char(0xDB, 0, false), Some('[')); // VK_OEM_4 → 「
+        assert_eq!(vk_to_char(0xDD, 0, false), Some(']')); // VK_OEM_6 → 」
+    }
+
+    #[test]
+    fn vk_to_char_returns_none_for_unmapped_or_shifted_oem_vk() {
+        // shift付きの VK_OEM_COMMA はマッピング対象外（半角のまま素通しさせる想定）
+        assert_eq!(vk_to_char(0xBC, 0, true), None);
+        // VK_BACK 等、そもそも対応表に無いキー
+        assert_eq!(vk_to_char(0x08, 0, false), None);
+    }
+
+    #[test]
+    fn is_commit_char_accepts_only_punctuation_marks() {
+        assert!(is_commit_char(','));
+        assert!(is_commit_char('.'));
+        assert!(is_commit_char('?'));
+        assert!(is_commit_char('!'));
+        assert!(!is_commit_char('a'));
+        assert!(!is_commit_char('-'));
+    }
+
+    #[test]
+    fn is_ime_toggle_vk_matches_known_toggle_keys_only() {
+        assert!(is_ime_toggle_vk(0x19)); // VK_KANJI / VK_HANJA
+        assert!(is_ime_toggle_vk(0xF3)); // VK_DBE_DBCSCHAR / VK_OEM_AUTO
+        assert!(is_ime_toggle_vk(0xF4)); // VK_DBE_SBCSCHAR / VK_OEM_ENLW
+        assert!(!is_ime_toggle_vk(0x41)); // 'A' は対象外
+    }
+
+    #[test]
+    fn is_shift_vk_matches_left_and_right_shift_only() {
+        assert!(is_shift_vk(0x10)); // VK_SHIFT
+        assert!(is_shift_vk(0xA0)); // VK_LSHIFT
+        assert!(is_shift_vk(0xA1)); // VK_RSHIFT
+        assert!(!is_shift_vk(0x11)); // VK_CONTROL は対象外
+    }
+}
+
+#[cfg(test)]
+mod shift_state_tests {
+    use super::*;
+    use serial_test::serial;
+
+    /// plan.md Step 2 の「キー状態追跡（旧称 `track_key_repeat`）の追試」に対応する。
+    /// 現コードでキーイベントから状態を追跡する関数は `track_shift_state` のみで、
+    /// OS のオートリピート（keyup を挟まず WM_KEYDOWN が連続する）を含む
+    /// keydown/keyup 遷移を `SHIFT_HELD` に正しく反映することを検証する。
+    /// 共有 static `SHIFT_HELD` に触れるため `#[serial]` で直列化する。
+    #[test]
+    #[serial]
+    fn track_shift_state_follows_keydown_and_keyup() {
+        unsafe {
+            SHIFT_HELD = false;
+            track_shift_state(0xA0, WM_KEYDOWN); // VK_LSHIFT down
+            assert!(is_shift_pressed());
+            track_shift_state(0xA0, WM_KEYUP); // VK_LSHIFT up
+            assert!(!is_shift_pressed());
+        }
+    }
+
+    /// Alt 併用時は WM_SYSKEYDOWN/WM_SYSKEYUP で届くため、SYS 系イベントでも
+    /// 同じ遷移になることを検証する。
+    #[test]
+    #[serial]
+    fn track_shift_state_follows_sys_key_events() {
+        unsafe {
+            SHIFT_HELD = false;
+            track_shift_state(0xA1, WM_SYSKEYDOWN); // VK_RSHIFT down (Alt併用)
+            assert!(is_shift_pressed());
+            track_shift_state(0xA1, WM_SYSKEYUP);
+            assert!(!is_shift_pressed());
+        }
+    }
+
+    /// OS オートリピート相当: keyup を挟まず keydown が連続しても押下状態は
+    /// true のまま安定し、最初の keyup で false に戻ること（リピート境界）。
+    #[test]
+    #[serial]
+    fn track_shift_state_stays_held_across_auto_repeat_keydowns() {
+        unsafe {
+            SHIFT_HELD = false;
+            track_shift_state(0x10, WM_KEYDOWN); // VK_SHIFT down
+            track_shift_state(0x10, WM_KEYDOWN); // オートリピート 2回目
+            track_shift_state(0x10, WM_KEYDOWN); // オートリピート 3回目
+            assert!(is_shift_pressed());
+            track_shift_state(0x10, WM_KEYUP);
+            assert!(!is_shift_pressed());
+        }
+    }
+
+    /// Shift 以外の vkCode（修飾キー Ctrl を含む）は `SHIFT_HELD` を変化させない
+    /// （キーごとの独立性）。
+    #[test]
+    #[serial]
+    fn track_shift_state_ignores_non_shift_keys() {
+        unsafe {
+            SHIFT_HELD = false;
+            track_shift_state(0x11, WM_KEYDOWN); // VK_CONTROL
+            track_shift_state(0x41, WM_KEYDOWN); // 'A'
+            assert!(!is_shift_pressed());
+
+            SHIFT_HELD = true;
+            track_shift_state(0x11, WM_KEYUP); // 他キーの keyup でも解除されない
+            assert!(is_shift_pressed());
+            SHIFT_HELD = false; // 後始末
+        }
+    }
+}
+
+#[cfg(test)]
+mod window_modes_tests {
+    use super::*;
+    use serial_test::serial;
+
+    /// `sync_window_mode`（`hook.rs`）内部で行う「hwnd をキーに検索し、無ければ
+    /// 追加・あれば更新する」ロジックを `WINDOW_MODES` に対して直接検証する。
+    /// `sync_window_mode` 自体は `GetForegroundWindow` 等の実 Win32 呼び出しに
+    /// 依存し単体テストできないため、共有状態コンテナの不変条件
+    /// （hwnd ごとにモード・コマンド行が独立して保持される）をここで担保する。
+    /// 共有 static のため `#[serial]` でテスト間の干渉を防ぐ。
+    #[test]
+    #[serial]
+    fn window_modes_store_independent_state_per_hwnd() {
+        WINDOW_MODES.lock().unwrap().clear();
+
+        // ウィンドウA: 日本語入力ON + コマンド行 "foo"
+        WINDOW_MODES.lock().unwrap().push((111, true, "foo".to_string()));
+        // ウィンドウB: 日本語入力OFF + コマンド行 "bar"
+        WINDOW_MODES.lock().unwrap().push((222, false, "bar".to_string()));
+
+        let m = WINDOW_MODES.lock().unwrap();
+        let a = m.iter().find(|(h, _, _)| *h == 111).unwrap();
+        let b = m.iter().find(|(h, _, _)| *h == 222).unwrap();
+        assert_eq!((a.1, a.2.as_str()), (true, "foo"));
+        assert_eq!((b.1, b.2.as_str()), (false, "bar"));
+    }
+
+    #[test]
+    #[serial]
+    fn window_modes_update_existing_entry_in_place_without_duplicating() {
+        WINDOW_MODES.lock().unwrap().clear();
+        WINDOW_MODES.lock().unwrap().push((333, true, "old".to_string()));
+
+        // sync_window_mode の「既存 hwnd なら find で見つけて上書き」相当の操作
+        {
+            let mut m = WINDOW_MODES.lock().unwrap();
+            if let Some(e) = m.iter_mut().find(|(h, _, _)| *h == 333) {
+                e.1 = false;
+                e.2 = "new".to_string();
+            } else {
+                m.push((333, false, "new".to_string()));
+            }
+        }
+
+        let m = WINDOW_MODES.lock().unwrap();
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0], (333, false, "new".to_string()));
+    }
+}
