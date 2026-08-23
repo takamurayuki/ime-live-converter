@@ -1131,6 +1131,127 @@ fn test_n_best_empty_input() {
 }
 
 #[test]
+fn test_n_best_first_matches_convert() {
+    // n_best(x, k)[0] の表層は常に1-best探索 convert_to_string(x) と一致するはず
+    // （両者が同一の辺コスト計算 edge_connection_cost を共有しているため）。
+    let dict = create_test_dictionary();
+    let converter = ViterbiConverter::new(dict);
+
+    for input in ["きょうはいいてんきです", "きょうは", "てんきです"] {
+        let best = converter.convert_to_string(input);
+        let n_best_top = converter.n_best_strings(input, 3);
+        assert_eq!(n_best_top[0], best, "入力「{}」でn_best[0]が1-bestと不一致", input);
+    }
+}
+
+#[test]
+fn test_n_best_first_matches_convert_katakana_kanji_guard() {
+    // find_best_pathが適用する無条件ガード katakana_kanji_suffix_penalty により
+    // 「じんせい」は「ジン」+「性」ではなく「人生」になる。この結果が
+    // n_best[0]にも反映されることを確認する（nbest.rsが生の連接コストのみを
+    // 見ていた旧実装ではこのガードが反映されず、n_best[0]がconvert()と
+    // 食い違い得た）。
+    let mut dict = Dictionary::new();
+    dict.matrix = crate::dictionary::ConnectionMatrix::new(10, 10);
+    for i in 0..10 {
+        for j in 0..10 {
+            dict.matrix.set(i, j, 200);
+        }
+    }
+    dict.matrix.set(1, 2, -600);
+    dict.add_word(WordEntry {
+        surface: "人生".to_string(), reading: "じんせい".to_string(),
+        left_id: 3, right_id: 3, cost: 4000, pos: "名詞-一般-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "ジン".to_string(), reading: "じん".to_string(),
+        left_id: 1, right_id: 1, cost: 3000, pos: "名詞-一般-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "性".to_string(), reading: "せい".to_string(),
+        left_id: 2, right_id: 2, cost: 3800, pos: "名詞-接尾-一般-*".to_string(),
+    });
+    let mut converter = ViterbiConverter::new(dict);
+    converter.learn_unigram("せい", "性", 3);
+
+    let best = converter.convert_to_string("じんせい");
+    assert_eq!(best, "人生");
+    let n_best_top = converter.n_best_strings("じんせい", 3);
+    assert_eq!(n_best_top[0], best);
+}
+
+#[test]
+fn test_n_best_first_matches_convert_adjective_te_guard() {
+    // find_best_pathが適用する無条件ガード adjective_terminal_then_te_penalty
+    // （形容詞終止形+「て」は文法的に誤り）が n_best[0] にも反映されることを
+    // 確認する。
+    let mut dict = Dictionary::new();
+    dict.matrix = crate::dictionary::ConnectionMatrix::new(10, 10);
+    for i in 0..10 {
+        for j in 0..10 {
+            dict.matrix.set(i, j, 200);
+        }
+    }
+    dict.matrix.set(1, 3, -4000);
+    dict.matrix.set(2, 3, -4000);
+    dict.add_word(WordEntry {
+        surface: "酸い".to_string(), reading: "すい".to_string(),
+        left_id: 1, right_id: 1, cost: 3000, pos: "形容詞-自立-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "梳い".to_string(), reading: "すい".to_string(),
+        left_id: 2, right_id: 2, cost: 3200, pos: "動詞-自立-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "て".to_string(), reading: "て".to_string(),
+        left_id: 3, right_id: 3, cost: 3000, pos: "助詞-接続助詞-*-*".to_string(),
+    });
+    let mut converter = ViterbiConverter::new(dict);
+    converter.enable_katakana_fallback = false;
+
+    let best = converter.convert_to_string("すいて");
+    assert_eq!(best, "梳いて");
+    let n_best_top = converter.n_best_strings("すいて", 3);
+    assert_eq!(n_best_top[0], best);
+}
+
+#[test]
+fn test_n_best_first_matches_convert_learned_prefix_guard() {
+    // 学習依存ガード bonused_word_after_prefix_conn_floor が n_best[0] にも
+    // 反映されることを確認する（学習状態はViterbiConverterが持つため、
+    // n_best_from_latticeが&ViterbiConverterを受け取れるようになったことの検証）。
+    let mut dict = Dictionary::new();
+    dict.matrix = crate::dictionary::ConnectionMatrix::new(10, 10);
+    for i in 0..10 {
+        for j in 0..10 {
+            dict.matrix.set(i, j, 200);
+        }
+    }
+    dict.matrix.set(1, 2, -3000);
+    dict.matrix.set(2, 0, -2000);
+    dict.add_word(WordEntry {
+        surface: "お腹".to_string(), reading: "おなか".to_string(),
+        left_id: 3, right_id: 3, cost: 5000, pos: "名詞-一般-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "お".to_string(), reading: "お".to_string(),
+        left_id: 1, right_id: 1, cost: 4000, pos: "接頭詞-名詞接続-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "中".to_string(), reading: "なか".to_string(),
+        left_id: 2, right_id: 2, cost: 5000, pos: "名詞-非自立-副詞可能-*".to_string(),
+    });
+    let mut converter = ViterbiConverter::new(dict);
+    converter.enable_katakana_fallback = false;
+    converter.learn_unigram("なか", "中", 10);
+
+    let best = converter.convert_to_string("おなか");
+    assert_eq!(best, "お腹");
+    let n_best_top = converter.n_best_strings("おなか", 3);
+    assert_eq!(n_best_top[0], best);
+}
+
+#[test]
 fn test_live_conversion_context() {
     let dict = create_test_dictionary();
     let converter = ViterbiConverter::new(dict);
