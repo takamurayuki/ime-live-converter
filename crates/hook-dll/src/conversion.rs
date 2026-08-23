@@ -74,6 +74,12 @@ pub(crate) struct LiveConversionState {
     pub(crate) learning: Option<LearningRepository>,
     /// 変換が有効かどうか
     pub(crate) enabled: bool,
+    /// 段階別監査ログ（直近50変換のリングバッファ）。ホットパスでは
+    /// このメモリ構造への追記だけを行い、表示・保存は監査ログウィンドウ側で行う。
+    pub(crate) trace_buffer: common::TraceBuffer,
+    /// add_char が記録した「入力」「前処理」段階。直後の update_conversion が
+    /// 取り出して「エンジン選定」「出力」と合わせ1トレースにする。
+    pub(crate) trace_pending: Vec<common::StageRecord>,
 }
 
 impl LiveConversionState {
@@ -103,6 +109,8 @@ impl LiveConversionState {
             generation: 0,
             learning: None,
             enabled: true,
+            trace_buffer: common::TraceBuffer::new(),
+            trace_pending: Vec::new(),
         }
     }
 
@@ -779,8 +787,12 @@ impl LiveConversionState {
         self.clear_candidates();
         self.generation = self.generation.wrapping_add(1);
 
+        let tracing = audit_log_enabled();
+        let t_input = std::time::Instant::now();
         self.romaji_buffer.push(ch);
         debug_log!("入力: '{}' → ローマ字バッファ: '{}'", ch, self.romaji_buffer);
+        let romaji_before_split = if tracing { self.romaji_buffer.clone() } else { String::new() };
+        let t_pre = std::time::Instant::now();
 
         // ローマ字バッファを「確定ひらがな」と「保留ローマ字」に分割
         // （先頭に変換不能な英字が残っても以降が全てローマ字化しないよう、
@@ -789,6 +801,25 @@ impl LiveConversionState {
         if !settled.is_empty() {
             self.hiragana_buffer.push_str(&settled);
             self.romaji_buffer = pending;
+        }
+
+        if tracing {
+            let t_done = std::time::Instant::now();
+            self.trace_pending.clear();
+            self.trace_pending.push(common::StageRecord {
+                stage: common::StageKind::Input,
+                input: ch.to_string(),
+                output: romaji_before_split.clone(),
+                duration_micros: (t_pre - t_input).as_micros() as u64,
+                applied_rule: Some("romaji_buffer_append".to_string()),
+            });
+            self.trace_pending.push(common::StageRecord {
+                stage: common::StageKind::Preprocess,
+                input: romaji_before_split,
+                output: format!("かな='{}' 保留='{}'", self.hiragana_buffer, self.romaji_buffer),
+                duration_micros: (t_done - t_pre).as_micros() as u64,
+                applied_rule: Some("romaji_split".to_string()),
+            });
         }
 
         debug_log!("現在の状態: ひらがな='{}', ローマ字='{}'", self.hiragana_buffer, self.romaji_buffer);
@@ -836,11 +867,17 @@ impl LiveConversionState {
     /// 末尾だけ更新できる。旧実装(毎回全削除→再挿入)は cursor が頻繁に左に飛び、
     /// 視覚的に「後の入力が前を上書きする」ように見える原因だった。
     pub(crate) fn update_conversion(&mut self) -> Option<ConversionAction> {
+        // 監査ログ: 空入力（ひらがな無し）は記録しない。add_char が積んだ
+        // 入力/前処理段階は、記録しない場合も必ず捨てて次の変換に混ざらないようにする。
+        let pending = std::mem::take(&mut self.trace_pending);
+        let tracing = audit_log_enabled() && !self.hiragana_buffer.is_empty();
+        let t_engine = std::time::Instant::now();
+
         // ひらがなバッファのみを漢字変換
         // ローマ字バッファはそのまま末尾に追加
-        let converted_hiragana = if let Some(converter) = &self.converter {
+        let (converted_hiragana, engine_rule) = if let Some(converter) = &self.converter {
             if self.hiragana_buffer.is_empty() {
-                String::new()
+                (String::new(), "empty")
             } else if self.kana_tail_len > 0 {
                 // Escで戻した末尾はひらがなのまま、前半だけ変換する
                 let total = self.hiragana_buffer.chars().count();
@@ -852,20 +889,75 @@ impl LiveConversionState {
                 } else {
                     converter.convert_context_aware_to_string(&prefix)
                 };
-                format!("{}{}", conv, tail)
+                (format!("{}{}", conv, tail), "context_viterbi+kana_tail")
             } else {
                 // 文脈（内容語の繋がり）を考慮して尤もらしい変換を選ぶ
-                converter.convert_context_aware_to_string(&self.hiragana_buffer)
+                (
+                    converter.convert_context_aware_to_string(&self.hiragana_buffer),
+                    "context_viterbi",
+                )
             }
         } else {
             // 辞書がない場合はひらがなのまま
             debug_log!("辞書なし: ひらがなのまま '{}'", self.hiragana_buffer);
-            self.hiragana_buffer.clone()
+            (self.hiragana_buffer.clone(), "no_dictionary_passthrough")
         };
 
         // 変換結果 + ローマ字（未確定）
         let new_result = format!("{}{}", converted_hiragana, self.romaji_buffer);
-        self.apply_new_result(new_result)
+        if !tracing {
+            return self.apply_new_result(new_result);
+        }
+
+        let t_output = std::time::Instant::now();
+        let engine_rule = if self.kana_tail_len > 0 {
+            format!("{}({})", engine_rule, self.kana_tail_len)
+        } else {
+            engine_rule.to_string()
+        };
+        let mut trace = common::ConversionTrace::new(std::time::SystemTime::now());
+        if pending.is_empty() {
+            // add_char 以外（Backspace / Esc 戻し等）からの再変換: 入力段階はキー無し
+            trace.stages.push(common::StageRecord {
+                stage: common::StageKind::Input,
+                input: String::new(),
+                output: self.romaji_buffer.clone(),
+                duration_micros: 0,
+                applied_rule: Some("reconvert".to_string()),
+            });
+            trace.stages.push(common::StageRecord {
+                stage: common::StageKind::Preprocess,
+                input: self.romaji_buffer.clone(),
+                output: format!("かな='{}' 保留='{}'", self.hiragana_buffer, self.romaji_buffer),
+                duration_micros: 0,
+                applied_rule: Some("buffer_state".to_string()),
+            });
+        } else {
+            trace.stages.extend(pending);
+        }
+        trace.stages.push(common::StageRecord {
+            stage: common::StageKind::EngineSelect,
+            input: self.hiragana_buffer.clone(),
+            output: converted_hiragana,
+            duration_micros: (t_output - t_engine).as_micros() as u64,
+            applied_rule: Some(engine_rule),
+        });
+
+        let previous = self.conversion_result.clone();
+        let action = self.apply_new_result(new_result.clone());
+        let output_desc = match &action {
+            Some(a) => format!("delete={} insert='{}'", a.delete_count, a.insert_text),
+            None => "変化なし".to_string(),
+        };
+        trace.stages.push(common::StageRecord {
+            stage: common::StageKind::Output,
+            input: format!("前='{}' 新='{}'", previous, new_result),
+            output: output_desc,
+            duration_micros: t_output.elapsed().as_micros() as u64,
+            applied_rule: Some("common_prefix_diff".to_string()),
+        });
+        self.trace_buffer.push(trace);
+        action
     }
 
     /// 表示テキストを new_result に差し替えるための差分アクションを作る
@@ -1530,6 +1622,96 @@ mod build_candidates_tests {
 
         let (candidates, ..) = state.build_candidates();
         assert_ne!(candidates.first().map(String::as_str), Some("χ"), "記号が先頭に来てはいけない");
+    }
+}
+
+#[cfg(test)]
+mod audit_trace_tests {
+    use super::*;
+    use common::{StageKind, TRACE_BUFFER_CAPACITY};
+
+    fn converter_with_kyou() -> ViterbiConverter {
+        let mut dict = Dictionary::new();
+        dict.matrix = common::ConnectionMatrix::new(10, 10);
+        for i in 0..10 {
+            for j in 0..10 {
+                dict.matrix.set(i, j, 200);
+            }
+        }
+        dict.add_word(common::WordEntry {
+            surface: "今日".to_string(), reading: "きょう".to_string(),
+            left_id: 1, right_id: 1, cost: 3000, pos: "名詞".to_string(),
+        });
+        ViterbiConverter::new(dict)
+    }
+
+    /// 「きょう」を1キーずつ打つと、最後のキーで4段階のトレースが記録される。
+    #[test]
+    fn kyou_records_four_stages_with_io_and_rule() {
+        let mut state = LiveConversionState::new();
+        state.converter = Some(converter_with_kyou());
+        for ch in "kyou".chars() {
+            state.add_char(ch);
+        }
+        let trace = state.trace_buffer.back().expect("トレースが記録される");
+        assert_eq!(trace.stages.len(), 4);
+        assert_eq!(trace.stages[0].stage, StageKind::Input);
+        // "kyo" の時点で「きょ」が確定しローマ字バッファは空になるため、
+        // 最後のキー 'u' の入力段階は 'u' → ローマ字バッファ 'u'。
+        assert_eq!(trace.stages[0].input, "u");
+        assert_eq!(trace.stages[0].output, "u");
+        assert_eq!(trace.stages[1].stage, StageKind::Preprocess);
+        assert_eq!(trace.stages[1].input, "u");
+        assert!(trace.stages[1].output.contains("きょう"), "{}", trace.stages[1].output);
+        assert_eq!(trace.stages[2].stage, StageKind::EngineSelect);
+        assert_eq!(trace.stages[2].input, "きょう");
+        assert_eq!(trace.stages[2].output, "今日");
+        assert_eq!(trace.stages[2].applied_rule.as_deref(), Some("context_viterbi"));
+        assert_eq!(trace.stages[3].stage, StageKind::Output);
+        assert!(trace.stages[3].output.contains("今日"), "{}", trace.stages[3].output);
+        assert!(trace.total_micros() > 0, "所要時間が計測されている");
+    }
+
+    /// ひらがなバッファが空（保留ローマ字だけ）の間はトレースを記録しない。
+    #[test]
+    fn empty_hiragana_buffer_records_nothing() {
+        let mut state = LiveConversionState::new();
+        state.converter = Some(converter_with_kyou());
+        state.add_char('k');
+        assert!(state.trace_buffer.is_empty());
+        // 記録しなかった入力/前処理段階は捨てられ、次の変換に混ざらない
+        assert!(state.trace_pending.is_empty());
+    }
+
+    /// 51回変換しても直近50件だけが保持される。
+    #[test]
+    fn buffer_is_bounded_to_capacity() {
+        let mut state = LiveConversionState::new();
+        state.converter = Some(converter_with_kyou());
+        for _ in 0..(TRACE_BUFFER_CAPACITY + 1) {
+            state.add_char('a');
+        }
+        assert_eq!(state.trace_buffer.len(), TRACE_BUFFER_CAPACITY);
+    }
+
+    /// Backspace からの再変換も4段階で記録される（入力段階はキー無し）。
+    #[test]
+    fn backspace_reconversion_is_traced() {
+        let mut state = LiveConversionState::new();
+        state.converter = Some(converter_with_kyou());
+        // 「今日今日」→ Backspace で末尾の文節「今日」だけ消え「きょう」が残る
+        for ch in "kyoukyou".chars() {
+            state.add_char(ch);
+        }
+        let before = state.trace_buffer.len();
+        state.backspace();
+        assert_eq!(state.hiragana_buffer, "きょう");
+        assert_eq!(state.trace_buffer.len(), before + 1);
+        let trace = state.trace_buffer.back().unwrap();
+        assert_eq!(trace.stages.len(), 4);
+        assert_eq!(trace.stages[0].applied_rule.as_deref(), Some("reconvert"));
+        assert_eq!(trace.stages[2].input, "きょう");
+        assert_eq!(trace.stages[2].output, "今日");
     }
 }
 

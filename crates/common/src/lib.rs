@@ -7,7 +7,9 @@ pub mod typo;
 pub mod converter;
 pub mod learning;
 pub mod rerank;
+pub mod audit_trace;
 
+pub use audit_trace::{ConversionTrace, StageKind, StageRecord, TraceBuffer, TRACE_BUFFER_CAPACITY};
 pub use dictionary::{Dictionary, WordEntry, TrieNode, ConnectionMatrix, CharCategory, PosId};
 pub use viterbi::{ViterbiConverter, LiveConversionContext, Lattice, LatticeNode, IncrementalViterbi};
 pub use candidate::{Candidate, CandidateKind, hiragana_to_katakana, katakana_to_hiragana};
