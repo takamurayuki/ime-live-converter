@@ -29,7 +29,11 @@ impl PartialOrd for PartialPath {
 }
 
 /// ラティスからN-bestパスを取り出す
-pub(crate) fn n_best_from_lattice(lattice: &Lattice, dict: &Dictionary, n: usize) -> Vec<Vec<WordEntry>> {
+pub(crate) fn n_best_from_lattice(
+    lattice: &Lattice,
+    converter: &ViterbiConverter,
+    n: usize,
+) -> Vec<Vec<WordEntry>> {
     use std::collections::BinaryHeap;
 
     let mut heap: BinaryHeap<PartialPath> = BinaryHeap::new();
@@ -75,7 +79,6 @@ pub(crate) fn n_best_from_lattice(lattice: &Lattice, dict: &Dictionary, n: usize
         let head = &lattice.nodes[current.head_node];
         let pos = head.start;
         let head_word_cost = head.word_cost as i64;
-        let head_left_id = head.left_id;
 
         for &prev_idx in &lattice.nodes_ending_at[pos] {
             let prev = &lattice.nodes[prev_idx];
@@ -83,7 +86,9 @@ pub(crate) fn n_best_from_lattice(lattice: &Lattice, dict: &Dictionary, n: usize
                 continue;
             }
 
-            let conn_cost = dict.matrix.get(prev.right_id, head_left_id) as i64;
+            // find_best_pathと同一の辺コスト計算（学習ボーナス・各種ガード込み）を
+            // 共有することで、n_bestの候補順位と1-best探索の結果が食い違わないようにする
+            let conn_cost = converter.edge_connection_cost(lattice, prev_idx, current.head_node) as i64;
             // step_cost(prev → head) = conn_cost + head.word_cost
             let step_cost = conn_cost + head_word_cost;
             let new_cost = current.cost + step_cost;
