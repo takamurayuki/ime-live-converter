@@ -79,11 +79,6 @@ pub(crate) fn n_best_from_lattice(
         let head = &lattice.nodes[current.head_node];
         let pos = head.start;
         let head_word_cost = head.word_cost as i64;
-<<<<<<< HEAD
-=======
-        let head_left_id = head.left_id;
-        let head_entry = head.entry.as_ref();
->>>>>>> origin/develop
 
         for &prev_idx in &lattice.nodes_ending_at[pos] {
             let prev = &lattice.nodes[prev_idx];
@@ -91,27 +86,9 @@ pub(crate) fn n_best_from_lattice(
                 continue;
             }
 
-<<<<<<< HEAD
             // find_best_pathと同一の辺コスト計算（学習ボーナス・各種ガード込み）を
             // 共有することで、n_bestの候補順位と1-best探索の結果が食い違わないようにする
             let conn_cost = converter.edge_connection_cost(lattice, prev_idx, current.head_node) as i64;
-=======
-            let mut conn_cost = dict.matrix.get(prev.right_id, head_left_id) as i32;
-            // find_best_path と同じ無条件ガード（学習ボーナス非依存のもの）を
-            // ここにも適用する。N-best（候補一覧・LiveConverterが実際に使う
-            // 経路）は本来 find_best_path と同じ接続コストで探索すべきだが、
-            // 従来は辞書の生の連接行列のみを見ており、この無条件ガード群が
-            // 反映されていなかった（カテゴリF/Gの修正が候補一覧に出ない
-            // 原因）。学習ボーナス依存のfloor系（clamp_single_kanji_pair_conn_cost
-            // 等）は ViterbiConverter の学習状態が必要なため対象外のまま。
-            if let (Some(pe), Some(ce)) = (&prev.entry, head_entry) {
-                conn_cost = conn_cost.saturating_add(katakana_kanji_suffix_penalty(pe, ce));
-                conn_cost = adjective_terminal_then_te_penalty(pe, ce, conn_cost);
-                conn_cost =
-                    conn_cost.saturating_add(single_kanji_lone_particle_reading_penalty(ce));
-            }
-            let conn_cost = conn_cost as i64;
->>>>>>> origin/develop
             // step_cost(prev → head) = conn_cost + head.word_cost
             let step_cost = conn_cost + head_word_cost;
             let new_cost = current.cost + step_cost;
