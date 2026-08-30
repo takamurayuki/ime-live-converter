@@ -838,12 +838,25 @@ impl LiveConversionState {
                 let combined_reading = format!("{}{}", pair[0].0, pair[1].0);
                 if combined_reading.chars().count() <= AUTO_COMPOUND_MAX_READING_LEN {
                     let combined_surface = format!("{}{}", prev, next);
-                    let already_exists = self
+                    let existing = self
                         .converter
                         .as_ref()
-                        .and_then(|c| c.dictionary.lookup(&combined_reading))
+                        .and_then(|c| c.dictionary.lookup(&combined_reading));
+                    let already_exists = existing
                         .is_some_and(|entries| entries.iter().any(|e| e.surface == combined_surface));
-                    if !already_exists {
+                    // 同じ読みが既に別表記で辞書に載っているなら登録しない。
+                    // 「再」+「起動」の隣接確定が、過去のライブ変換の不具合で
+                    // 本来「再起動」と読むべき語を「際」+「起動」に誤分割した
+                    // ものだった場合、その誤分割を繰り返し確定しただけで
+                    // 「際起動」が複合語として自動登録されてしまい、正しい
+                    // 「再起動」と並んで予測変換に出続ける事故があった
+                    // （実例）。「辞書に無い複合語を登録する」という本来の
+                    // 目的からしても、読みが既に何らかの語で埋まっているなら
+                    // 対象外でよい（同音異義語の複合語は base IPADic 側で
+                    // 別途カバーされる想定）。
+                    let has_other_coverage = existing
+                        .is_some_and(|entries| entries.iter().any(|e| e.surface != combined_surface));
+                    if !already_exists && !has_other_coverage {
                         auto_compound_candidates.push((combined_reading, combined_surface));
                     }
                 }
@@ -1945,6 +1958,58 @@ mod auto_compound_tests {
             .find(|w| w.reading == "さいきどう" && w.surface == "再起動")
             .expect("DBにも登録されているはず");
         assert_eq!(auto.source, "auto");
+    }
+
+    /// 実例:「再」+「起動」の隣接確定を繰り返した読み(さいきどう)に、既に
+    /// 別表記（再起動。ユーザー登録語や過去の自動登録で辞書に入っている
+    /// 想定）が存在するなら、同じ読みへ2つ目の複合語（際起動）を自動登録
+    /// しない。過去のライブ変換の不具合で「再起動」を「際」+「起動」に
+    /// 誤分割したまま繰り返し確定してしまうと、正しい「再起動」と並んで
+    /// 「際起動」が予測変換に出続けてしまう事故があった。
+    #[test]
+    fn auto_compound_skipped_when_reading_already_has_other_surface() {
+        let mut dict = common::Dictionary::new();
+        dict.add_word(common::WordEntry {
+            surface: "際".to_string(), reading: "さい".to_string(),
+            left_id: 1, right_id: 1, cost: 4000, pos: "名詞-一般-*-*".to_string(),
+        });
+        dict.add_word(common::WordEntry {
+            surface: "起動".to_string(), reading: "きどう".to_string(),
+            left_id: 1, right_id: 1, cost: 4000, pos: "名詞-サ変接続-*-*".to_string(),
+        });
+        // 既に正しい表記が辞書にある（ユーザー登録語や過去の自動登録を想定）
+        dict.add_word(common::WordEntry {
+            surface: "再起動".to_string(), reading: "さいきどう".to_string(),
+            left_id: 1, right_id: 1, cost: 2000, pos: "名詞-一般-*-*".to_string(),
+        });
+        let mut state = LiveConversionState::new();
+        state.converter = Some(ViterbiConverter::new(dict));
+        state.learning = common::LearningRepository::in_memory().ok();
+
+        let segments = vec![
+            ("さい".to_string(), "際".to_string(), "名詞-一般-*-*".to_string()),
+            ("きどう".to_string(), "起動".to_string(), "名詞-サ変接続-*-*".to_string()),
+        ];
+        for _ in 0..5 {
+            state.learn_from_segments(&segments);
+        }
+
+        let has_bad_entry = state
+            .converter
+            .as_ref()
+            .unwrap()
+            .dictionary
+            .lookup("さいきどう")
+            .unwrap()
+            .iter()
+            .any(|e| e.surface == "際起動");
+        assert!(!has_bad_entry, "既存の「再起動」と並ぶ「際起動」を自動登録してはいけない");
+
+        let words = state.learning.as_ref().unwrap().get_all_user_words().unwrap();
+        assert!(
+            !words.iter().any(|w| w.surface == "際起動"),
+            "DBにも「際起動」を登録してはいけない"
+        );
     }
 
     /// 助詞や単独ひらがなを挟むペアは自動登録しない
