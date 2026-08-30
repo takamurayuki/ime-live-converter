@@ -2,10 +2,12 @@ use crate::candidate::hiragana_to_katakana;
 use crate::dictionary::{Dictionary, WordEntry, PosId};
 use std::collections::HashMap;
 
+mod fragment_repair;
 mod incremental;
 mod lattice;
 mod nbest;
 mod scoring;
+mod stabilize;
 #[cfg(test)]
 mod tests;
 
@@ -13,6 +15,7 @@ pub use incremental::*;
 pub use lattice::*;
 pub(crate) use nbest::*;
 pub use scoring::*;
+pub use stabilize::*;
 
 /// Viterbi変換エンジン
 #[derive(Debug)]
@@ -54,6 +57,12 @@ pub struct ViterbiConverter {
     ///
     /// ユーザーが確定した文の語のつながりを学習し、文全体の整合性を上げる。
     pub learned_bigram: HashMap<(String, String), i32>,
+    /// `learned_bigram` に「前の表記」として登録されている表記の集合。
+    /// `base_connection_cost` は辺ごとに呼ばれるため、(String, String) の
+    /// キーを毎回作ってから引くと 5万辺規模の長文で無視できない
+    /// アロケーションになる。まず &str でこの集合を引き、無ければ
+    /// キーを作らずに済ませる。
+    bigram_prev_surfaces: std::collections::HashSet<String>,
     /// 学習した内容語の連想: (前の内容語, 次の内容語) → スコア
     ///
     /// 助詞・助動詞を飛ばした「内容語どうしの結びつき」。
@@ -138,6 +147,7 @@ impl ViterbiConverter {
             single_kanji_penalty: 400,
             learned_unigram: HashMap::new(),
             learned_bigram: HashMap::new(),
+            bigram_prev_surfaces: std::collections::HashSet::new(),
             learned_assoc: HashMap::new(),
             learned_hiragana: HashMap::new(),
             trusted_phrase_bonus: HashMap::new(),
@@ -307,6 +317,7 @@ impl ViterbiConverter {
     pub fn clear_learning(&mut self) {
         self.learned_unigram.clear();
         self.learned_bigram.clear();
+        self.bigram_prev_surfaces.clear();
         self.learned_assoc.clear();
         self.learned_hiragana.clear();
         self.typo_corrections.clear();
@@ -337,6 +348,7 @@ impl ViterbiConverter {
     pub fn forget_unigram(&mut self, reading: &str, surface: &str) {
         self.learned_unigram.remove(&(reading.to_string(), surface.to_string()));
         self.learned_bigram.retain(|(p, s), _| p != surface && s != surface);
+        self.bigram_prev_surfaces = self.learned_bigram.keys().map(|(p, _)| p.clone()).collect();
         self.learned_assoc.retain(|(p, c), _| p != surface && c != surface);
     }
 
@@ -380,6 +392,7 @@ impl ViterbiConverter {
         let bonus = frequency_to_bonus(freq).min(BIGRAM_BONUS_CAP);
         self.learned_bigram
             .insert((prev_surface.to_string(), surface.to_string()), bonus);
+        self.bigram_prev_surfaces.insert(prev_surface.to_string());
     }
 
     /// コーパス由来の語頻度データ（`corpus_lm.dic`）を読み込む
@@ -438,7 +451,14 @@ impl ViterbiConverter {
     }
 
     /// 学習した内容語連想で 1-best を微調整する（差し替え）
-    fn rerank_by_assoc(&self, mut base: Vec<WordEntry>) -> Vec<WordEntry> {
+    fn rerank_by_assoc(&self, base: Vec<WordEntry>) -> Vec<WordEntry> {
+        self.rerank_by_assoc_from(base, 0)
+    }
+
+    /// `rerank_by_assoc` の、先頭 `first_mutable` 文節を差し替え対象にしない版
+    /// （固定した先頭文節は文脈として参照するだけで書き換えない。
+    ///  `convert_context_aware_pinned` から使う）。
+    pub(crate) fn rerank_by_assoc_from(&self, mut base: Vec<WordEntry>, first_mutable: usize) -> Vec<WordEntry> {
         if self.learned_assoc.is_empty() || base.len() < 2 {
             return base;
         }
@@ -453,6 +473,9 @@ impl ViterbiConverter {
 
         // 各内容語について、連想が強まる別表記へ差し替えを検討する
         for &(i, _) in &content {
+            if i < first_mutable {
+                continue;
+            }
             let cur = base[i].clone();
             let Some(alts) = self.dictionary.lookup(&cur.reading) else {
                 continue;
@@ -800,7 +823,10 @@ impl ViterbiConverter {
         self.find_best_path(&mut lattice);
 
         let cost = lattice.nodes[lattice.eos_index].total_cost;
-        (self.extract_result(&lattice), cost)
+        // 「1文字漢字＋後続の漢字語」に割れた断片を辞書語に置換する
+        // （`fragment_repair.rs`。総コストはラティス上の最適パスのまま）
+        let path = self.repair_single_kanji_fragments(self.extract_result(&lattice));
+        (path, cost)
     }
 
     /// ラティスを構築
@@ -914,6 +940,20 @@ impl ViterbiConverter {
         // 入力中に該当する読みが現れたら、その範囲にひらがなノードを
         // 低コストで足し、既存語（例: 慕い）より優先させる。
         self.add_learned_hiragana_nodes(&mut lattice, input);
+
+        // 各ノードの学習ユニグラムボーナスをここで1回だけ引いておく
+        // （`find_best_path` のガード群が辺ごとに引き直さないため）
+        if !self.learned_unigram.is_empty() {
+            for node in lattice.nodes.iter_mut() {
+                if let Some(e) = &node.entry {
+                    node.learned_bonus = self
+                        .learned_unigram
+                        .get(&(e.reading.clone(), e.surface.clone()))
+                        .copied()
+                        .unwrap_or(0);
+                }
+            }
+        }
 
         lattice
     }
@@ -1051,7 +1091,7 @@ impl ViterbiConverter {
         let mut conn_cost = self.dictionary.matrix.get(prev_right_id, cur_left_id) as i32;
         let mut bigram_bonus = 0i32;
         if let Some(prev_surface) = prev_surface {
-            if !self.learned_bigram.is_empty() {
+            if !self.learned_bigram.is_empty() && self.bigram_prev_surfaces.contains(prev_surface) {
                 if let Some(bonus) = self
                     .learned_bigram
                     .get(&(prev_surface.to_string(), cur_surface.to_string()))
@@ -1104,9 +1144,10 @@ impl ViterbiConverter {
             // この位置で始まるノードを処理
             let starting_indices: Vec<usize> = lattice.nodes_starting_at[pos].clone();
             
+            // この位置で終わるノード（開始ノードごとにクローンし直さない）
+            let ending_indices: Vec<usize> = lattice.nodes_ending_at[pos].clone();
+
             for &node_idx in &starting_indices {
-                // この位置で終わるノードから連接コストを計算
-                let ending_indices: Vec<usize> = lattice.nodes_ending_at[pos].clone();
                 
                 let mut best_cost = i32::MAX;
                 let mut best_prev: Option<usize> = None;
@@ -1173,19 +1214,13 @@ impl ViterbiConverter {
                     // 無視できないコストになる（実測: 短い候補文字列でも1回の
                     // 変換に数ms〜10ms超）。ここで1辺につき最大3回（前・現在・
                     // 祖先）だけ計算し、全て0ならガード群を丸ごとスキップする。
-                    let bonus_of = |e: Option<&WordEntry>| -> i32 {
-                        e.and_then(|w| {
-                            self.learned_unigram.get(&(w.reading.clone(), w.surface.clone()))
-                        })
-                        .copied()
-                        .unwrap_or(0)
-                    };
-                    let prev_bonus = bonus_of(prev_node.entry.as_ref());
-                    let cur_bonus = bonus_of(current_node.entry.as_ref());
-                    let grandparent_entry = prev_node
-                        .prev_node
-                        .and_then(|gp_idx| lattice.nodes[gp_idx].entry.as_ref());
-                    let grandparent_bonus = bonus_of(grandparent_entry);
+                    // （現在は `build_lattice` がノードごとに1回だけ引いて
+                    //  `learned_bonus` に持たせているので、ここでは参照するだけ）
+                    let prev_bonus = prev_node.learned_bonus;
+                    let cur_bonus = current_node.learned_bonus;
+                    let grandparent_node = prev_node.prev_node.map(|gp_idx| &lattice.nodes[gp_idx]);
+                    let grandparent_entry = grandparent_node.and_then(|n| n.entry.as_ref());
+                    let grandparent_bonus = grandparent_node.map_or(0, |n| n.learned_bonus);
                     let prev_is_utterance_start = prev_node.prev_node == Some(lattice.bos_index);
                     if prev_bonus != 0 || cur_bonus != 0 || grandparent_bonus != 0 || bigram_bonus != 0 {
                         conn_cost = clamp_single_kanji_pair_conn_cost(
@@ -1333,4 +1368,4 @@ impl ViterbiConverter {
             .map(|entries| entries.iter().map(|e| e.surface.as_str()).collect())
             .collect()
     }
-}
+}

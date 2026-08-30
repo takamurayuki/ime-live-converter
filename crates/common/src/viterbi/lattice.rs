@@ -21,6 +21,10 @@ pub struct LatticeNode {
     pub total_cost: i32,
     /// 最適パスの前のノードのインデックス
     pub prev_node: Option<usize>,
+    /// この語の学習ユニグラムボーナス（`build_lattice` の最後に一括で埋める）。
+    /// `find_best_path` のガード群が辺ごとに (読み, 表記) の String を
+    /// クローンして HashMap を引いていたのを、ノードごと1回の参照に置き換える。
+    pub learned_bonus: i32,
 }
 
 impl LatticeNode {
@@ -35,6 +39,7 @@ impl LatticeNode {
             word_cost: 0,
             total_cost: 0,
             prev_node: None,
+            learned_bonus: 0,
         }
     }
 
@@ -49,6 +54,7 @@ impl LatticeNode {
             word_cost: 0,
             total_cost: i32::MAX,
             prev_node: None,
+            learned_bonus: 0,
         }
     }
 
@@ -62,6 +68,7 @@ impl LatticeNode {
             word_cost: entry.cost as i32,
             total_cost: i32::MAX,
             prev_node: None,
+            learned_bonus: 0,
             entry: Some(entry),
         }
     }
@@ -84,6 +91,7 @@ impl LatticeNode {
             word_cost: cost,
             total_cost: i32::MAX,
             prev_node: None,
+            learned_bonus: 0,
         }
     }
 }

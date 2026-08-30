@@ -300,6 +300,7 @@ pub(crate) unsafe fn sync_window_mode() {
         if let Ok(mut c) = cm.try_lock() {
             c.romaji_buffer.clear();
             c.hiragana_buffer.clear();
+            c.pinned.clear();
             c.conversion_result.clear();
             c.last_sent_length = 0;
         }
@@ -336,6 +337,7 @@ pub(crate) fn toggle_our_active() {
                 if let Ok(mut c) = context_mutex.try_lock() {
                     c.romaji_buffer.clear();
                     c.hiragana_buffer.clear();
+                    c.pinned.clear();
                     c.conversion_result.clear();
                     c.last_sent_length = 0;
                 }
@@ -570,6 +572,67 @@ pub(crate) fn execute_action(action: ConversionAction) {
 
 /// キーボードフックのコールバック関数
 #[no_mangle]
+/// 低レベルマウスフックで「ボタン押下」として扱うメッセージか
+/// （左/右/中/サイドボタンの押下。移動やホイールでは何もしない）
+pub(crate) fn is_mouse_button_down_message(msg: u32) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_RBUTTONDOWN, WM_XBUTTONDOWN,
+    };
+    msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN || msg == WM_XBUTTONDOWN
+}
+
+/// ポップアップの外側がクリックされたときの下書きの後始末。
+///
+/// 日本語入力の下書き（候補一覧で選択中を含む）があれば確定扱いにして、
+/// 内部状態を画面から切り離す。クリックでキャレットが別の場所へ移った後に
+/// Backspace や次の打鍵が「古い下書きに対する差分編集」として送られ、
+/// 無関係な文字を消したり上書きしたりするのを防ぐ（一般的なIMEでも
+/// クリックは変換中の文字列の確定として扱われる）。確定した場合 true。
+pub(crate) fn settle_composition_on_click(state: &mut LiveConversionState) -> bool {
+    if !(state.is_composing() || !state.candidates.is_empty()) {
+        return false;
+    }
+    // 末尾の未確定 'n' があると commit は「ん」への置換アクションを返すが、
+    // キャレットはもうクリック先に移っているので画面には送らない。
+    let _ = state.commit();
+    true
+}
+
+/// ポップアップの外側がクリックされた: 下書きを確定扱いにしてポップアップを閉じる
+pub(crate) fn on_click_outside_popup() {
+    if let Some(cm) = LIVE_CONTEXT.get() {
+        if let Ok(mut c) = cm.try_lock() {
+            let settled = settle_composition_on_click(&mut c);
+            debug_log!("ポップアップ外クリック: 下書き確定={}", settled);
+        }
+    }
+    hide_candidate_window();
+}
+
+/// 低レベルマウスフック（WH_MOUSE_LL）。
+///
+/// 予測変換・候補一覧・コマンド候補のポップアップ表示中に、ポップアップの
+/// 外側でマウスボタンが押されたらポップアップを閉じる。ポップアップ自身の
+/// クリック（コマンドモードの「設定」ボタン等）は矩形内なので対象外。
+/// マウス移動・ホイールはボタン押下でないため即座に次のフックへ渡す。
+#[allow(non_snake_case)]
+pub extern "system" fn LowLevelMouseProc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    unsafe {
+        if code >= 0 && is_mouse_button_down_message(wparam.0 as u32) && candidate_window_visible() {
+            use windows::Win32::UI::WindowsAndMessaging::MSLLHOOKSTRUCT;
+            let info = lparam.0 as *const MSLLHOOKSTRUCT;
+            if !info.is_null() {
+                let pt = (*info).pt;
+                if !popup_contains_screen_point(pt.x, pt.y) {
+                    on_click_outside_popup();
+                }
+            }
+        }
+        CallNextHookEx(None, code, wparam, lparam)
+    }
+}
+
+#[allow(non_snake_case)] // Win32 のコールバック名（LowLevelMouseProc と同じ流儀）
 pub extern "system" fn LowLevelKeyboardProc(
     code: i32,
     wparam: WPARAM,
@@ -653,6 +716,7 @@ pub extern "system" fn LowLevelKeyboardProc(
                         if let Ok(mut context) = context_mutex.try_lock() {
                             context.romaji_buffer.clear();
                             context.hiragana_buffer.clear();
+                            context.pinned.clear();
                             context.conversion_result.clear();
                             context.last_sent_length = 0;
                         }
@@ -1284,5 +1348,61 @@ mod window_modes_tests {
         let m = WINDOW_MODES.lock().unwrap();
         assert_eq!(m.len(), 1);
         assert_eq!(m[0], (333, false, "new".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod mouse_hook_tests {
+    use super::*;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_XBUTTONDOWN,
+    };
+
+    #[test]
+    fn only_button_down_messages_count_as_clicks() {
+        assert!(is_mouse_button_down_message(WM_LBUTTONDOWN));
+        assert!(is_mouse_button_down_message(WM_RBUTTONDOWN));
+        assert!(is_mouse_button_down_message(WM_XBUTTONDOWN));
+        assert!(!is_mouse_button_down_message(WM_LBUTTONUP));
+        assert!(!is_mouse_button_down_message(WM_MOUSEMOVE));
+        assert!(!is_mouse_button_down_message(WM_MOUSEWHEEL));
+    }
+
+    #[test]
+    fn point_in_rect_excludes_right_and_bottom_edges() {
+        let rc = RECT { left: 10, top: 20, right: 110, bottom: 60 };
+        assert!(point_in_rect(10, 20, &rc));
+        assert!(point_in_rect(109, 59, &rc));
+        assert!(!point_in_rect(110, 30, &rc));
+        assert!(!point_in_rect(50, 60, &rc));
+        assert!(!point_in_rect(9, 30, &rc));
+    }
+
+    /// ポップアップ窓が無ければ、どの座標も「ポップアップ内」ではない
+    #[test]
+    fn popup_without_window_contains_nothing() {
+        let hwnd = unsafe { CANDIDATE_HWND }; // static mut への参照を避けるため値コピー
+        if hwnd.is_none() {
+            assert!(!popup_contains_screen_point(0, 0));
+        }
+    }
+
+    /// 下書き中のクリックは確定扱い（バッファが空になり、学習用の文節列も
+    /// 消化される）。下書きが無ければ何もしない。
+    #[test]
+    fn settle_composition_on_click_commits_only_while_composing() {
+        let mut state = LiveConversionState::new();
+        assert!(!settle_composition_on_click(&mut state));
+
+        for ch in "kyou".chars() {
+            let _ = state.add_char(ch);
+        }
+        assert!(state.is_composing());
+        assert!(settle_composition_on_click(&mut state));
+        assert!(!state.is_composing());
+        assert!(state.hiragana_buffer.is_empty());
+        assert!(state.candidates.is_empty());
+        // 2回目は下書きが無いので何もしない
+        assert!(!settle_composition_on_click(&mut state));
     }
 }

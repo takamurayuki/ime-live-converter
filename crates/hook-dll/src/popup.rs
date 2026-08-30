@@ -57,6 +57,31 @@ pub(crate) const WM_APP_RESHOW_COMMAND: u32 = 0x8000 + 1;
 /// ターミナル窓が閉じられた（破棄された）ので、打鍵を待たずにモーダルを
 /// 閉じる（WM_APP+2）。
 pub(crate) const WM_APP_TERMINAL_CLOSED: u32 = 0x8000 + 2;
+/// フック→自スレッドのメッセージループへの通知: 確定時に溜めた学習
+/// （DB書き込み）を処理する（WM_APP+3）。キーボードフックの中で行うと
+/// 応答上限(300ms)を超えて生キーが漏れるため、フックから戻った後に行う。
+pub(crate) const WM_APP_FLUSH_LEARNING: u32 = 0x8000 + 3;
+
+/// 溜めた学習の処理をメッセージループへ依頼する。依頼できたら true
+/// （候補ウィンドウが無く作れない場合は false → 呼び出し側は同期で学習する）。
+pub(crate) fn request_deferred_learning() -> bool {
+    unsafe {
+        let hwnd = match CANDIDATE_HWND {
+            Some(h) => Some(h),
+            None => ensure_candidate_window(),
+        };
+        let Some(hwnd) = hwnd else {
+            return false;
+        };
+        windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+            hwnd,
+            WM_APP_FLUSH_LEARNING,
+            WPARAM(0),
+            LPARAM(0),
+        )
+        .is_ok()
+    }
+}
 
 pub(crate) extern "system" fn candidate_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -106,6 +131,19 @@ pub(crate) extern "system" fn candidate_wndproc(hwnd: HWND, msg: u32, wparam: WP
                 b.clear();
             }
             hide_candidate_window();
+            LRESULT(0)
+        }
+        // フックから戻った後に、確定時に溜めた学習（DB書き込み）を処理する。
+        // ロックが取れなければ（別スレッドが参照中）後で再試行する。
+        WM_APP_FLUSH_LEARNING => {
+            if let Some(cm) = LIVE_CONTEXT.get() {
+                match cm.try_lock() {
+                    Ok(mut c) => c.flush_pending_learning(),
+                    Err(_) => {
+                        let _ = request_deferred_learning();
+                    }
+                }
+            }
             LRESULT(0)
         }
         // Z順が変更されるたびに「最前面(HWND_TOPMOST)」を強制し、他ウィンドウに
@@ -736,6 +774,30 @@ pub(crate) fn hide_candidate_window() {
             }
         }
     }
+}
+
+/// スクリーン座標 (x, y) が候補ポップアップのウィンドウ矩形内か
+/// （マウスフックが「ポップアップの外側をクリックした」を判定するのに使う。
+///  ウィンドウが未生成・非表示なら false）
+pub(crate) fn popup_contains_screen_point(x: i32, y: i32) -> bool {
+    unsafe {
+        let Some(hwnd) = CANDIDATE_HWND else {
+            return false;
+        };
+        if !candidate_window_visible() {
+            return false;
+        }
+        let mut rc = RECT::default();
+        if windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut rc).is_err() {
+            return false;
+        }
+        point_in_rect(x, y, &rc)
+    }
+}
+
+/// 点 (x, y) が矩形 `rc` の内側か（右辺・下辺は含まない。Win32 の慣例）
+pub(crate) fn point_in_rect(x: i32, y: i32, rc: &RECT) -> bool {
+    x >= rc.left && x < rc.right && y >= rc.top && y < rc.bottom
 }
 
 /// 候補一覧が表示中か

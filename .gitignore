@@ -1,5 +1,9 @@
 /target
 ime-learning.db
+# WAL モード（learning.rs）が作るランタイムファイル。ime-learning.db 本体と同様、
+# ユーザーの入力履歴を含むためコミットしない
+ime-learning.db-wal
+ime-learning.db-shm
 # hook-dll のデバッグログ（IME_DEBUG_LOG=1 で生成。キー入力が平文で残るため絶対にコミットしない）
 hook_debug.log
 # IPA辞書から生成されるバイナリ辞書（README の手順で再生成可能）

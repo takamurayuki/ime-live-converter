@@ -51,9 +51,30 @@ impl LearningRepository {
     /// データベースを開く（または作成）
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let conn = Connection::open(path)?;
+        // 書き込み遅延の削減。ライブ変換の確定（句読点・Enter）はキーボード
+        // フックの中で行われ、1文分（十数文節）のユニグラム/バイグラム/連想の
+        // 記録が既定設定（ロールバックジャーナル＋文ごとに fsync）では実測
+        // 約400msかかり、フックの応答上限(300ms)を超えて生キーが漏れる
+        // （句読点が「.。」「,、」と二重に出る）。WAL＋synchronous=NORMAL で
+        // コミットごとの fsync を避ける（電源断時に直近数コミットを失い得るが、
+        // 学習データなので許容）。設定できなくても続行する。
+        let _ = conn.pragma_update(None, "journal_mode", "WAL");
+        let _ = conn.pragma_update(None, "synchronous", "NORMAL");
         let repo = Self { conn };
         repo.initialize()?;
         Ok(repo)
+    }
+
+    /// 複数の記録を1トランザクションにまとめる（`end_batch` と対で使う）。
+    /// 確定1回分の記録を文ごとにコミットせず一括で書き、フック内の待ち時間を
+    /// 減らす。既にトランザクション中なら何もしない（`BEGIN` の失敗は無視）。
+    pub fn begin_batch(&self) {
+        let _ = self.conn.execute_batch("BEGIN IMMEDIATE");
+    }
+
+    /// `begin_batch` で始めた記録をまとめてコミットする
+    pub fn end_batch(&self) {
+        let _ = self.conn.execute_batch("COMMIT");
     }
 
     /// インメモリデータベースを作成
@@ -988,6 +1009,30 @@ impl LearningRepository {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ファイルDBを開くと WAL モードになる（フック内の確定でDB書き込みが
+    /// 300ms上限を超えないための前提）
+    #[test]
+    fn open_enables_wal_journal_mode() {
+        let path = std::env::temp_dir().join(format!("ime_test_wal_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let repo = LearningRepository::open(&path).unwrap();
+            let mode: String = repo
+                .conn
+                .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(mode.to_lowercase(), "wal");
+            repo.begin_batch();
+            repo.record_commit("きょう", "今日", None).unwrap();
+            repo.record_commit("きょう", "今日", None).unwrap();
+            repo.end_batch();
+            assert_eq!(repo.find_frequency("きょう", "今日").unwrap(), 2);
+        }
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
 
     #[test]
     fn test_alias_roundtrip() -> Result<()> {

@@ -73,6 +73,8 @@ macro_rules! debug_log {
 
 // グローバル変数
 static mut HOOK_HANDLE: Option<HHOOK> = None;
+/// 低レベルマウスフック（ポップアップ外クリックで閉じるため。`hook::LowLevelMouseProc`）
+static mut MOUSE_HOOK_HANDLE: Option<HHOOK> = None;
 /// 変換状態（OnceLock: `static mut` への参照は未定義動作の恐れがあり警告になるため）。
 /// 解放はできないため、アンインストール後も保持したまま（プロセス終了で回収）。
 static LIVE_CONTEXT: OnceLock<Mutex<LiveConversionState>> = OnceLock::new();
@@ -84,6 +86,7 @@ static mut INITIAL_CHECK_DONE: bool = false;
 
 // 機能別モジュール（詳細は各ファイル先頭の //! を参照）
 mod command_mode;
+mod brackets;
 mod conversion;
 mod hook;
 mod popup;
@@ -105,6 +108,8 @@ pub extern "C" fn install_hook() -> bool {
         debug_log!("install_hook: デバッグログ有効（IME_DEBUG_LOG=1）");
         // コンテキストを初期化
         let mut state = LiveConversionState::new();
+        // 確定時の学習（DB書き込み）はフックの外（メッセージループ）で処理する
+        state.defer_learning = true;
         // 学習DBをオープン（CLIと共有。失敗しても変換は継続できる）
         match LearningRepository::open("ime-learning.db") {
             Ok(learning) => {
@@ -170,6 +175,22 @@ pub extern "C" fn install_hook() -> bool {
             Ok(h) => {
                 HOOK_HANDLE = Some(h);
                 println!("Keyboard hook installed successfully");
+                // ポップアップ（予測変換・候補一覧・コマンド候補）の外側をクリック
+                // したら閉じるためのマウスフック。失敗しても変換自体は動くので警告のみ。
+                match SetWindowsHookExW(
+                    WINDOWS_HOOK_ID(14), // WH_MOUSE_LL
+                    Some(LowLevelMouseProc),
+                    hinstance,
+                    0,
+                ) {
+                    Ok(mh) => {
+                        MOUSE_HOOK_HANDLE = Some(mh);
+                        println!("Mouse hook installed successfully");
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: Failed to install mouse hook (popup will not close on outside click): {:?}", e);
+                    }
+                }
                 true
             }
             Err(e) => {
@@ -195,6 +216,10 @@ pub extern "C" fn uninstall_hook() -> bool {
             let _ = DestroyWindow(hwnd);
         }
 
+        if let Some(mh) = MOUSE_HOOK_HANDLE {
+            let _ = UnhookWindowsHookEx(mh);
+            MOUSE_HOOK_HANDLE = None;
+        }
         if let Some(hook) = HOOK_HANDLE {
             let result = UnhookWindowsHookEx(hook);
             HOOK_HANDLE = None;

@@ -367,7 +367,7 @@ pub(crate) fn single_kanji_penalty(surface: &str, penalty: i32) -> i32 {
 /// 「語・人・製・風・式・系・産・型・教・街・圏・流・調」は外来語（国名・
 /// 地名・言語名等）に実際によく付く接尾辞なので例外として許容する。
 /// 表記がちょうど1文字の漢字か
-fn is_single_kanji_surface(surface: &str) -> bool {
+pub(crate) fn is_single_kanji_surface(surface: &str) -> bool {
     let mut chars = surface.chars();
     let (Some(c), None) = (chars.next(), chars.next()) else {
         return false;

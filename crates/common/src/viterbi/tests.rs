@@ -1795,4 +1795,201 @@ fn test_live_conversion_context() {
     context.add_hiragana("は");
     let conversion = context.get_conversion();
     assert!(conversion.contains("今日") || conversion.contains("は"));
-}
+}
+// ---------------------------------------------------------------------------
+// 1文字漢字＋後続の漢字語への断片化を辞書語で修復する後処理（fragment_repair.rs）
+// ---------------------------------------------------------------------------
+
+/// 接続コストが一律200の辞書（断片化の是非を単語コストと学習だけで決められる）
+fn flat_matrix_dict() -> Dictionary {
+    let mut dict = Dictionary::new();
+    dict.matrix = crate::dictionary::ConnectionMatrix::new(10, 10);
+    for i in 0..10 {
+        for j in 0..10 {
+            dict.matrix.set(i, j, 200);
+        }
+    }
+    dict
+}
+
+fn word(surface: &str, reading: &str, id: PosId, cost: i16, pos: &str) -> WordEntry {
+    WordEntry {
+        surface: surface.to_string(),
+        reading: reading.to_string(),
+        left_id: id,
+        right_id: id,
+        cost,
+        pos: pos.to_string(),
+    }
+}
+
+#[test]
+fn test_fragment_repair_replaces_single_kanji_plus_word_with_dictionary_word() {
+    // 実例: 「ぜんかく」が学習ボーナス付きの接頭詞「前」＋「核」に割れる
+    // （辞書に「全角」があるのに、「前」のコストが学習で0まで下がっているため）。
+    let mut dict = flat_matrix_dict();
+    dict.add_word(word("前", "ぜん", 1, 5052, "接頭詞-名詞接続-*-*"));
+    dict.add_word(word("核", "かく", 2, 3422, "名詞-一般-*-*"));
+    dict.add_word(word("全角", "ぜんかく", 3, 5622, "名詞-一般-*-*"));
+    let mut converter = ViterbiConverter::new(dict);
+    converter.learn_unigram("ぜん", "前", 10);
+    // 前提: ラティス上は断片パスの方が安い（前=0 + 核≈3822 < 全角≈6022）
+    let (path, _) = converter.convert_with_cost("ぜんかく");
+    // 「前核」は辞書に無い無意味な組み合わせなので「全角」に置換される
+    assert_eq!(path.len(), 1, "path={:?}", path);
+    assert_eq!(path[0].surface, "全角");
+    assert_eq!(converter.convert_to_string("ぜんかく"), "全角");
+}
+
+#[test]
+fn test_fragment_repair_keeps_combination_that_is_itself_a_dictionary_word() {
+    // 「左」+「側」のように、結合した表記が辞書語（左側）なら意味のある
+    // 複合語なので、同じ読みの別語があっても触らない。
+    let mut dict = flat_matrix_dict();
+    dict.add_word(word("左", "ひだり", 1, 3000, "名詞-一般-*-*"));
+    dict.add_word(word("側", "がわ", 2, 3000, "名詞-接尾-一般-*"));
+    dict.add_word(word("左側", "ひだりがわ", 3, 9000, "名詞-一般-*-*"));
+    dict.add_word(word("干狩", "ひだりがわ", 3, 4000, "名詞-一般-*-*"));
+    let mut converter = ViterbiConverter::new(dict);
+    converter.learn_unigram("ひだり", "左", 10);
+    converter.learn_unigram("がわ", "側", 10);
+    assert_eq!(converter.convert_to_string("ひだりがわ"), "左側");
+}
+
+#[test]
+fn test_fragment_repair_numeral_head_only_replaced_by_learned_word() {
+    // 数詞＋名詞（三県）は生産的な組み合わせ。辞書に同じ読みの語（散見）が
+    // あっても、ユーザーが確定したことの無い語には置き換えない。
+    let mut dict = flat_matrix_dict();
+    dict.add_word(word("三", "さん", 1, 2725, "名詞-数-*-*"));
+    dict.add_word(word("県", "けん", 2, 2283, "名詞-一般-*-*"));
+    dict.add_word(word("散見", "さんけん", 3, 4491, "名詞-サ変接続-*-*"));
+    let mut converter = ViterbiConverter::new(dict);
+    converter.learn_unigram("さん", "三", 10);
+    assert_eq!(converter.convert_to_string("さんけん"), "三県");
+
+    // 一方、実例「コマンド一覧の一|欄」: ユーザーが「一覧」を何度も確定
+    // しているのに、学習ボーナス付きの「一」+「欄」に割れる。学習済みの
+    // 語への置換は数詞が先頭でも行う。
+    let mut dict = flat_matrix_dict();
+    dict.add_word(word("一", "いち", 1, 3485, "名詞-数-*-*"));
+    dict.add_word(word("欄", "らん", 2, 4911, "名詞-一般-*-*"));
+    dict.add_word(word("一覧", "いちらん", 3, 3975, "名詞-サ変接続-*-*"));
+    let mut converter = ViterbiConverter::new(dict);
+    converter.learn_unigram("いち", "一", 10);
+    converter.learn_unigram("らん", "欄", 10);
+    converter.learn_unigram("いちらん", "一覧", 1);
+    let (path, _) = converter.convert_with_cost("いちらん");
+    assert_eq!(path.len(), 1, "path={:?}", path);
+    assert_eq!(path[0].surface, "一覧");
+}
+
+#[test]
+fn test_fragment_repair_skips_single_char_and_proper_noun_replacements() {
+    // 「前」+「核」: 同じ読みの辞書語が1文字語しか無ければ触らない
+    // （1文字漢字を別の1文字漢字に置き換えても意味のある語にはならない）
+    let mut dict = flat_matrix_dict();
+    dict.add_word(word("前", "ぜん", 1, 5052, "接頭詞-名詞接続-*-*"));
+    dict.add_word(word("核", "かく", 2, 3422, "名詞-一般-*-*"));
+    dict.add_word(word("龕", "ぜんかく", 3, 6000, "名詞-一般-*-*"));
+    let mut converter = ViterbiConverter::new(dict);
+    converter.learn_unigram("ぜん", "前", 10);
+    assert_eq!(converter.convert_to_string("ぜんかく"), "前核");
+
+    // 「過」+「苦行」: 同じ読みの辞書語が固有名詞（角行）しか無ければ触らない
+    let mut dict = flat_matrix_dict();
+    dict.add_word(word("過", "か", 1, 6658, "接頭詞-名詞接続-*-*"));
+    dict.add_word(word("苦行", "くぎょう", 2, 4475, "名詞-サ変接続-*-*"));
+    dict.add_word(word("角行", "かくぎょう", 3, 8462, "名詞-固有名詞-人名-名"));
+    let mut converter = ViterbiConverter::new(dict);
+    converter.learn_unigram("か", "過", 10);
+    assert_eq!(converter.convert_to_string("かくぎょう"), "過苦行");
+}
+
+#[test]
+fn test_fragment_repair_skips_implausible_unlearned_word_and_non_kanji_tail() {
+    // 学習の無い語への置換は、1文字あたりコストが妥当な語に限る
+    // （希少語で置き換えても別の誤変換になるだけ）。
+    let mut dict = flat_matrix_dict();
+    dict.add_word(word("手", "て", 1, 2000, "名詞-一般-*-*"));
+    dict.add_word(word("手", "て", 1, 2000, "名詞-一般-*-*"));
+    dict.add_word(word("氐々", "てて", 3, 12000, "名詞-一般-*-*"));
+    let mut converter = ViterbiConverter::new(dict);
+    converter.learn_unigram("て", "手", 10);
+    assert_eq!(converter.convert_to_string("てて"), "手手");
+
+    // 後続がひらがな（助詞）なら断片化ではないので触らない
+    let mut dict = flat_matrix_dict();
+    dict.add_word(word("前", "ぜん", 1, 5052, "接頭詞-名詞接続-*-*"));
+    dict.add_word(word("か", "か", 2, 3000, "助詞-副助詞-*-*"));
+    dict.add_word(word("全課", "ぜんか", 3, 5000, "名詞-一般-*-*"));
+    let mut converter = ViterbiConverter::new(dict);
+    converter.learn_unigram("ぜん", "前", 10);
+    assert_eq!(converter.convert_to_string("ぜんか"), "前か");
+}
+
+#[test]
+fn test_fragment_repair_handles_three_segment_span() {
+    // 実例: 「さいせんたん」が「再」+「選炭」に割れる（3文節に割れる
+    // 「最」+「先」+「端」も同様に、結合読みの辞書語「最先端」にまとめる）
+    let mut dict = flat_matrix_dict();
+    dict.add_word(word("最", "さい", 1, 5000, "接頭詞-名詞接続-*-*"));
+    dict.add_word(word("先", "せん", 2, 3000, "名詞-一般-*-*"));
+    dict.add_word(word("端", "たん", 2, 3000, "名詞-一般-*-*"));
+    dict.add_word(word("最先端", "さいせんたん", 3, 2582, "名詞-一般-*-*"));
+    let mut converter = ViterbiConverter::new(dict);
+    converter.learn_unigram("さい", "最", 10);
+    converter.learn_unigram("せん", "先", 10);
+    converter.learn_unigram("たん", "端", 10);
+    let (path, _) = converter.convert_with_cost("さいせんたん");
+    assert_eq!(path.len(), 1, "path={:?}", path);
+    assert_eq!(path[0].surface, "最先端");
+}
+
+#[test]
+fn test_fragment_repair_short_reading_two_kanji_head() {
+    // 実例: 「いち」を「位置」と学習していると、「コマンド一覧の一覧」の
+    // 2つ目が「位置」+「欄」に割れる（連想リランク後の表示は「一欄」）。
+    // 先頭が1文字漢字でなくても、読み2文字以下の短い漢字語なら同じ断片化
+    // として辞書語（学習済みの「一覧」）にまとめる。
+    let mut dict = flat_matrix_dict();
+    dict.add_word(word("位置", "いち", 1, 5356, "名詞-サ変接続-*-*"));
+    dict.add_word(word("欄", "らん", 2, 4911, "名詞-一般-*-*"));
+    dict.add_word(word("一覧", "いちらん", 3, 3975, "名詞-サ変接続-*-*"));
+    let mut converter = ViterbiConverter::new(dict);
+    converter.learn_unigram("いち", "位置", 10);
+    converter.learn_unigram("らん", "欄", 10);
+    converter.learn_unigram("いちらん", "一覧", 1);
+    assert_eq!(converter.convert_to_string("いちらん"), "一覧");
+}
+
+#[test]
+fn test_fragment_repair_does_not_touch_inflected_word_followed_by_noun() {
+    // 「ではない気がする」の打鍵途中「…ではないき」: 「無い」+「気」は
+    // 活用語＋名詞の正しい文節の切れ目。読み2文字の漢字語が先頭でも、
+    // 名詞でなければ断片扱いせず「内記」に置き換えない。
+    // （文頭の短い語には接続コスト下限ガードが別途効くため、後処理だけを
+    //  直接検証する）
+    let mut dict = flat_matrix_dict();
+    let nai = word("無い", "ない", 1, 3000, "形容詞-自立-*-*");
+    let ki = word("気", "き", 2, 3000, "名詞-一般-*-*");
+    dict.add_word(nai.clone());
+    dict.add_word(ki.clone());
+    dict.add_word(word("内記", "ないき", 3, 5000, "名詞-一般-*-*"));
+    let converter = ViterbiConverter::new(dict);
+    let repaired = converter.repair_single_kanji_fragments(vec![nai, ki]);
+    let surfaces: Vec<&str> = repaired.iter().map(|e| e.surface.as_str()).collect();
+    assert_eq!(surfaces, vec!["無い", "気"]);
+
+    // 対照: 先頭が名詞（読み2文字）なら同じ形でも修復対象になる
+    let mut dict = flat_matrix_dict();
+    let oko = word("烏滸", "おこ", 1, 6000, "名詞-一般-*-*");
+    let nai2 = word("無い", "ない", 2, 3000, "形容詞-自立-*-*");
+    dict.add_word(oko.clone());
+    dict.add_word(nai2.clone());
+    dict.add_word(word("行い", "おこない", 3, 4000, "名詞-一般-*-*"));
+    let converter = ViterbiConverter::new(dict);
+    let repaired = converter.repair_single_kanji_fragments(vec![oko, nai2]);
+    let surfaces: Vec<&str> = repaired.iter().map(|e| e.surface.as_str()).collect();
+    assert_eq!(surfaces, vec!["行い"]);
+}

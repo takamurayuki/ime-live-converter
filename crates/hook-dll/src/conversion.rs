@@ -61,6 +61,24 @@ pub(crate) struct LiveConversionState {
     pub(crate) committed_segments: Vec<(String, String, String)>,
     /// 直近に確定したテキスト（LLM変換へ渡す前後文脈。末尾数十文字を保持）
     pub(crate) recent_context: String,
+    /// 固定した先頭側の文節列（`common::viterbi::stabilize`）。
+    /// 読みが長くなったら文節の切れ目で先頭側を固定し、以降の再変換では
+    /// この分解を強制する。後続入力で離れた前方の語が書き換わる
+    /// 「変換の崩れ」を防ぐ。表示・候補一覧・Backspace・学習のすべてが
+    /// `convert_buffer` を通してこの分解を共有する。確定・取消で空になる。
+    pub(crate) pinned: Vec<common::WordEntry>,
+    /// 確定時の学習（DB書き込み）をフックの外へ遅延させるか。
+    /// hook-dll の実運用（`install_hook`）では true。確定はキーボードフック内で
+    /// 行われるため、学習の記録はここに溜めておき、フックから戻った後に
+    /// メッセージループ側（`WM_APP_FLUSH_LEARNING`）で `flush_pending_learning`
+    /// が処理する。テストや遅延先が無い場合は従来どおり同期で学習する。
+    pub(crate) defer_learning: bool,
+    /// 遅延させた学習の文節列（確定1回分ごと）
+    pub(crate) pending_learning: Vec<Vec<(String, String, String)>>,
+    /// 閉じ括弧の自動対応に使う確定済みテキスト（末尾数百文字）。
+    /// `recent_context` より長く保持し、セリフのように長い括弧内でも
+    /// 対応する開き括弧（「『【（ 等）の種類を見つけられるようにする。
+    pub(crate) bracket_context: String,
     /// 予測変換の候補（読み, 表記）。読みが空なら「次単語予測（追記）」。
     /// 打鍵中は前方一致補完、確定直後は次単語予測を入れる。番号キーで選ぶ。
     pub(crate) predictions: Vec<(String, String)>,
@@ -108,6 +126,10 @@ impl LiveConversionState {
             cand_suffix_reading: String::new(),
             committed_segments: Vec::new(),
             recent_context: String::new(),
+            bracket_context: String::new(),
+            defer_learning: false,
+            pending_learning: Vec::new(),
+            pinned: Vec::new(),
             predictions: Vec::new(),
             prediction_top_is_fuzzy: false,
             prediction_top_is_learned_typo: false,
@@ -611,12 +633,14 @@ impl LiveConversionState {
         if chars.len() > 60 {
             self.recent_context = chars[chars.len() - 60..].iter().collect();
         }
+        self.push_bracket_context(&surface);
         self.last_committed = surface;
         self.romaji_buffer.clear();
         self.hiragana_buffer.clear();
         self.conversion_result.clear();
         self.last_sent_length = 0;
         self.committed_segments.clear();
+        self.pinned.clear();
         self.kana_tail_len = 0;
         self.generation = self.generation.wrapping_add(1);
         self.clear_candidates();
@@ -714,10 +738,7 @@ impl LiveConversionState {
     /// 候補選択中なら先頭文節はその選択表記、残りは1-best。
     /// 未選択なら全体を1-bestで分解する。学習の記録に使う。
     pub(crate) fn segment_remaining(&self) -> Vec<(String, String, String)> {
-        let Some(conv) = self.converter.as_ref() else {
-            return Vec::new();
-        };
-        if self.hiragana_buffer.is_empty() {
+        if self.converter.is_none() || self.hiragana_buffer.is_empty() {
             return Vec::new();
         }
         let mut out = Vec::new();
@@ -726,13 +747,13 @@ impl LiveConversionState {
             && !self.cand_seg_reading.is_empty()
         {
             // 候補選択あり: 前半 + 選択した対象文節 + 後半 で分解
-            for e in conv.convert(&self.cand_prefix_reading) {
+            for e in self.convert_buffer(&self.cand_prefix_reading) {
                 out.push((e.reading.clone(), e.surface.clone(), e.pos.clone()));
             }
             let seg_surface = self.cand_seg_surfaces[self.candidate_index].clone();
             // 候補選択した語は内容語とみなす（品詞は名詞相当を既定に）
             out.push((self.cand_seg_reading.clone(), seg_surface, "名詞-一般".to_string()));
-            for e in conv.convert(&self.cand_suffix_reading) {
+            for e in self.convert_buffer(&self.cand_suffix_reading) {
                 out.push((e.reading.clone(), e.surface.clone(), e.pos.clone()));
             }
         } else if self.kana_tail_len > 0 {
@@ -740,7 +761,7 @@ impl LiveConversionState {
             let total = self.hiragana_buffer.chars().count();
             let keep = total.saturating_sub(self.kana_tail_len);
             let prefix: String = self.hiragana_buffer.chars().take(keep).collect();
-            for e in conv.convert(&prefix) {
+            for e in self.convert_buffer(&prefix) {
                 out.push((e.reading.clone(), e.surface.clone(), e.pos.clone()));
             }
             let tail: String = self.hiragana_buffer.chars().skip(keep).collect();
@@ -748,7 +769,7 @@ impl LiveConversionState {
                 out.push((tail.clone(), tail, "名詞-一般".to_string()));
             }
         } else {
-            for e in conv.convert(&self.hiragana_buffer) {
+            for e in self.convert_buffer(&self.hiragana_buffer) {
                 out.push((e.reading.clone(), e.surface.clone(), e.pos.clone()));
             }
         }
@@ -764,6 +785,8 @@ impl LiveConversionState {
         let Some(learning) = self.learning.as_ref() else {
             return;
         };
+        // 1文分の記録を1トランザクションにまとめる（文ごとの fsync を避ける）
+        learning.begin_batch();
         // ユニグラム（読み→表記）
         for (reading, surface, pos) in segments {
             if reading == surface {
@@ -848,6 +871,9 @@ impl LiveConversionState {
         for (reading, surface) in auto_compound_candidates {
             self.register_auto_compound(&reading, &surface);
         }
+        if let Some(learning) = self.learning.as_ref() {
+            learning.end_batch();
+        }
     }
 
     /// 辞書をロード
@@ -930,6 +956,9 @@ impl LiveConversionState {
         //  末尾の英字断片のみを保留にする）
         let (settled, pending) = self.romaji.split(&self.romaji_buffer);
         if !settled.is_empty() {
+            // 閉じ括弧 `]`（→」）は、直前の未対応の開き括弧の種類に合わせる
+            // （『 を選んでいれば 』、【 なら 】。開き括弧が無ければ 」のまま）
+            let settled = self.match_closing_brackets(&settled);
             self.hiragana_buffer.push_str(&settled);
             self.romaji_buffer = pending;
         }
@@ -938,6 +967,63 @@ impl LiveConversionState {
 
         // ひらがな→漢字変換（ライブ変換）
         self.update_conversion()
+    }
+
+    /// 入力された閉じ括弧「」」を、確定済みテキスト＋入力中の読みの中で
+    /// まだ閉じられていない開き括弧に対応する閉じ括弧に置き換える。
+    fn match_closing_brackets(&self, settled: &str) -> String {
+        if !settled.contains('」') {
+            return settled.to_string();
+        }
+        let mut text = format!("{}{}", self.bracket_context, self.hiragana_buffer);
+        let mut out = String::with_capacity(settled.len());
+        for c in settled.chars() {
+            let mapped = if c == '」' {
+                brackets::unmatched_opener(&text)
+                    .and_then(brackets::matching_closer)
+                    .unwrap_or(c)
+            } else {
+                c
+            };
+            text.push(mapped);
+            out.push(mapped);
+        }
+        out
+    }
+
+    /// 確定1回分の学習を、遅延が有効なら溜めてフックの外で処理し、
+    /// そうでなければその場で行う。遅延先（候補ウィンドウのメッセージ
+    /// ループ）へ通知できなければ同期に戻す（学習を落とさない）。
+    fn learn_segments_or_defer(&mut self, segments: &[(String, String, String)]) {
+        if self.defer_learning {
+            self.pending_learning.push(segments.to_vec());
+            if request_deferred_learning() {
+                return;
+            }
+            self.pending_learning.pop();
+        }
+        self.learn_from_segments(segments);
+    }
+
+    /// 溜めておいた確定分の学習をまとめて処理する（メッセージループ側から呼ぶ）
+    pub(crate) fn flush_pending_learning(&mut self) {
+        let pending = std::mem::take(&mut self.pending_learning);
+        for segments in pending {
+            self.learn_from_segments(&segments);
+        }
+    }
+
+    /// 確定したテキストを閉じ括弧の自動対応用に蓄積する（末尾500文字）
+    fn push_bracket_context(&mut self, committed: &str) {
+        if committed.is_empty() {
+            return;
+        }
+        self.bracket_context.push_str(committed);
+        const KEEP: usize = 500;
+        let len = self.bracket_context.chars().count();
+        if len > KEEP {
+            self.bracket_context = self.bracket_context.chars().skip(len - KEEP).collect();
+        }
     }
 
     /// バックスペース処理
@@ -956,9 +1042,9 @@ impl LiveConversionState {
         } else if !self.hiragana_buffer.is_empty() {
             // 変換済みの部分は「最後の変換単語（文節）」ごと削除する
             let last_len = self
-                .converter
-                .as_ref()
-                .and_then(|c| c.convert(&self.hiragana_buffer).last().map(|e| e.reading.chars().count()))
+                .convert_buffer(&self.hiragana_buffer)
+                .last()
+                .map(|e| e.reading.chars().count())
                 .filter(|&n| n > 0)
                 .unwrap_or(1);
             let total = self.hiragana_buffer.chars().count();
@@ -968,8 +1054,44 @@ impl LiveConversionState {
             return None; // 削除するものがない
         }
 
+        self.truncate_pinned_to_buffer();
         debug_log!("バックスペース後: ひらがな='{}', ローマ字='{}'", self.hiragana_buffer, self.romaji_buffer);
         self.update_conversion()
+    }
+
+    /// 読み `reading` をライブ表示と同じ分解で変換する（固定した先頭文節
+    /// `pinned` を反映。`reading` の先頭と一致しない固定文節は無視される）。
+    /// 表示・候補一覧・Backspace・学習のすべてがこの分解を共有する。
+    pub(crate) fn convert_buffer(&self, reading: &str) -> Vec<common::WordEntry> {
+        match self.converter.as_ref() {
+            Some(c) => c.convert_context_aware_pinned(reading, &self.pinned),
+            None => Vec::new(),
+        }
+    }
+
+    /// 固定した先頭文節を、現在の読みバッファの先頭と一致する範囲に切り詰める
+    /// （Backspace で固定領域まで削った場合）
+    fn truncate_pinned_to_buffer(&mut self) {
+        let n = common::viterbi::matching_pinned_prefix(&self.hiragana_buffer, &self.pinned).len();
+        self.pinned.truncate(n);
+    }
+
+    /// 読みが長くなったら、文節の切れ目で先頭側の文節を固定する
+    /// （`stable_prefix_segments`。固定済みより後ろまで伸びるときだけ更新）
+    fn extend_pinned(&mut self, entries: &[common::WordEntry]) {
+        let n = common::viterbi::stable_prefix_segments(
+            entries,
+            common::viterbi::STABILIZE_MIN_READING_CHARS,
+            common::viterbi::STABILIZE_KEEP_TAIL_CHARS,
+        );
+        if n > self.pinned.len() {
+            self.pinned = entries[..n].to_vec();
+            debug_log!(
+                "先頭文節を固定: '{}' ({}文節)",
+                self.pinned.iter().map(|e| e.surface.as_str()).collect::<String>(),
+                n
+            );
+        }
     }
 
     /// 変換を更新（macOS方式：ひらがな確定時のみ漢字変換）
@@ -981,29 +1103,31 @@ impl LiveConversionState {
     pub(crate) fn update_conversion(&mut self) -> Option<ConversionAction> {
         // ひらがなバッファのみを漢字変換
         // ローマ字バッファはそのまま末尾に追加
-        let converted_hiragana = if let Some(converter) = &self.converter {
-            if self.hiragana_buffer.is_empty() {
-                String::new()
-            } else if self.kana_tail_len > 0 {
-                // Escで戻した末尾はひらがなのまま、前半だけ変換する
-                let total = self.hiragana_buffer.chars().count();
-                let keep = total.saturating_sub(self.kana_tail_len);
-                let prefix: String = self.hiragana_buffer.chars().take(keep).collect();
-                let tail: String = self.hiragana_buffer.chars().skip(keep).collect();
-                let conv = if prefix.is_empty() {
-                    String::new()
-                } else {
-                    converter.convert_context_aware_to_string(&prefix)
-                };
-                format!("{}{}", conv, tail)
-            } else {
-                // 文脈（内容語の繋がり）を考慮して尤もらしい変換を選ぶ
-                converter.convert_context_aware_to_string(&self.hiragana_buffer)
-            }
-        } else {
+        let converted_hiragana = if self.converter.is_none() {
             // 辞書がない場合はひらがなのまま
             debug_log!("辞書なし: ひらがなのまま '{}'", self.hiragana_buffer);
             self.hiragana_buffer.clone()
+        } else if self.hiragana_buffer.is_empty() {
+            String::new()
+        } else if self.kana_tail_len > 0 {
+            // Escで戻した末尾はひらがなのまま、前半だけ変換する
+            let total = self.hiragana_buffer.chars().count();
+            let keep = total.saturating_sub(self.kana_tail_len);
+            let prefix: String = self.hiragana_buffer.chars().take(keep).collect();
+            let tail: String = self.hiragana_buffer.chars().skip(keep).collect();
+            let conv: String = if prefix.is_empty() {
+                String::new()
+            } else {
+                self.convert_buffer(&prefix).iter().map(|e| e.surface.as_str()).collect()
+            };
+            format!("{}{}", conv, tail)
+        } else {
+            // 文脈（内容語の繋がり）と固定した先頭文節を考慮して変換する。
+            // 読みが長くなったら先頭側の文節を固定し、以降の入力で前方が
+            // 書き換わらないようにする（`stabilize.rs`）。
+            let entries = self.convert_buffer(&self.hiragana_buffer);
+            self.extend_pinned(&entries);
+            entries.iter().map(|e| e.surface.as_str()).collect()
         };
 
         // 変換結果 + ローマ字（未確定）
@@ -1160,10 +1284,10 @@ impl LiveConversionState {
         // まだ変換されている前半 = 先頭から (total - kana_tail_len) 文字
         let keep = total - self.kana_tail_len;
         let prefix: String = self.hiragana_buffer.chars().take(keep).collect();
-        let Some(converter) = self.converter.as_ref() else {
+        if self.converter.is_none() {
             return None;
-        };
-        let entries = converter.convert(&prefix);
+        }
+        let entries = self.convert_buffer(&prefix);
         // 前半の「最後の変換された文節」以降を、ひらがな末尾に加える
         let revert_len: usize = if let Some(idx) =
             entries.iter().rposition(|e| e.surface != e.reading)
@@ -1208,6 +1332,32 @@ impl LiveConversionState {
         let entries = converter.convert_context_aware(&self.hiragana_buffer);
         if entries.is_empty() {
             return empty();
+        }
+
+        // 末尾が括弧なら、同音語ではなく括弧の種類（「」『』【】（）…）の
+        // 切替候補を出す（`brackets.rs`）。選択時は `select_candidate` が
+        // 読みバッファ内の括弧文字も書き換える。
+        if let Some(current) = entries.last().and_then(|e| brackets::single_bracket_char(&e.surface)) {
+            let n = entries.len() - 1;
+            let prefix_surface: String = entries[..n].iter().map(|e| e.surface.as_str()).collect();
+            let prefix_reading: String = entries[..n].iter().map(|e| e.reading.as_str()).collect();
+            let seg_surfaces: Vec<String> = brackets::bracket_variants(current)
+                .into_iter()
+                .map(|c| c.to_string())
+                .collect();
+            let candidates = seg_surfaces
+                .iter()
+                .map(|s| format!("{}{}", prefix_surface, s))
+                .collect();
+            return (
+                candidates,
+                current.to_string(),
+                seg_surfaces,
+                prefix_surface,
+                prefix_reading,
+                String::new(),
+                String::new(),
+            );
         }
 
         // 対象は「最後の“変換された”文節」。表層==読み（＝ひらがなのまま）の
@@ -1319,10 +1469,36 @@ impl LiveConversionState {
         }
         self.candidate_index = index;
 
+        // 候補の対象文節が固定した先頭文節に掛かる場合は、そこから先の固定を外す
+        // （固定分解と表示が食い違わないように）
+        let keep = common::viterbi::matching_pinned_prefix(&self.cand_prefix_reading, &self.pinned).len();
+        self.pinned.truncate(keep);
+
         debug_log!(
             "候補選択: {}/{} '{}'",
             index + 1, self.candidates.len(), self.candidates[index]
         );
+
+        // 括弧の種類切替: 表示だけでなく読みバッファ内の括弧文字も置き換える。
+        // 括弧は変換を素通りする文字なので、バッファを書き換えれば以降の
+        // 再変換（次の打鍵）でも選んだ種類が維持され、閉じ括弧の自動対応
+        // （`match_closing_brackets`）もこの種類を見る。
+        if brackets::single_bracket_char(&self.cand_seg_reading).is_some() {
+            if let Some(new_c) = self
+                .cand_seg_surfaces
+                .get(index)
+                .and_then(|s| brackets::single_bracket_char(s))
+            {
+                let pos = self.cand_prefix_reading.chars().count();
+                let mut chars: Vec<char> = self.hiragana_buffer.chars().collect();
+                if let Some(slot) = chars.get_mut(pos) {
+                    if brackets::single_bracket_char(&slot.to_string()).is_some() {
+                        *slot = new_c;
+                        self.hiragana_buffer = chars.into_iter().collect();
+                    }
+                }
+            }
+        }
 
         let new_result = format!("{}{}", self.candidates[index], self.romaji_buffer);
         self.apply_new_result(new_result)
@@ -1339,11 +1515,11 @@ impl LiveConversionState {
         if !self.enabled || self.hiragana_buffer.is_empty() {
             return actions;
         }
-        let Some(converter) = &self.converter else {
+        if self.converter.is_none() {
             return actions;
-        };
+        }
 
-        let entries = converter.convert(&self.hiragana_buffer);
+        let entries = self.convert_buffer(&self.hiragana_buffer);
         let Some(first) = entries.first() else {
             return actions;
         };
@@ -1368,6 +1544,7 @@ impl LiveConversionState {
             .to_string();
         self.last_sent_length = self.conversion_result.chars().count();
         self.hiragana_buffer = self.hiragana_buffer.chars().skip(reading_len).collect();
+        self.pinned.clear();
         self.clear_candidates();
 
         debug_log!(
@@ -1415,7 +1592,7 @@ impl LiveConversionState {
         // （文全体の整合性）も学習される。
         let mut segments = std::mem::take(&mut self.committed_segments);
         segments.extend(self.segment_remaining());
-        self.learn_from_segments(&segments);
+        self.learn_segments_or_defer(&segments);
 
         // Escでひらがなに戻した末尾は「この読みはひらがな優先」として学習。
         // 次回から その読みをひらがなのまま出しやすくする（例: したい）。
@@ -1452,6 +1629,7 @@ impl LiveConversionState {
                 self.recent_context = chars[chars.len() - 60..].iter().collect();
             }
         }
+        self.push_bracket_context(&committed);
         // 次単語予測のため、最後の文節の表記を覚える
         if let Some((_, s, _)) = segments.last() {
             self.last_committed = s.clone();
@@ -1463,6 +1641,7 @@ impl LiveConversionState {
         self.conversion_result.clear();
         self.last_sent_length = 0;
         self.committed_segments.clear();
+        self.pinned.clear();
         self.kana_tail_len = 0;
         self.generation = self.generation.wrapping_add(1);
         self.clear_candidates();
@@ -1485,6 +1664,7 @@ impl LiveConversionState {
         self.conversion_result.clear();
         self.last_sent_length = 0;
         self.committed_segments.clear();
+        self.pinned.clear();
         self.kana_tail_len = 0;
         self.generation = self.generation.wrapping_add(1);
         self.clear_candidates();
@@ -1936,6 +2116,174 @@ mod state_machine_tests {
         let mut state = LiveConversionState::new();
         state.converter = Some(two_segment_test_converter());
         state
+    }
+
+    fn type_str(state: &mut LiveConversionState, s: &str) {
+        for ch in s.chars() {
+            let _ = state.add_char(ch);
+        }
+    }
+
+    /// `[` の直後に Tab（cycle_candidate）で括弧の種類を切り替えると、表示だけで
+    /// なく読みバッファ内の括弧文字も置き換わり、以降の打鍵で元に戻らない。
+    /// さらに `]` はその種類に対応する閉じ括弧（『→』）になる。
+    #[test]
+    fn bracket_variant_selection_persists_and_closer_matches() {
+        let mut state = state_with_two_segment_dict();
+        type_str(&mut state, "[");
+        assert_eq!(state.conversion_result, "「");
+
+        // 一覧を開く（候補1=「 が選択状態）→ 次候補 『
+        let _ = state.cycle_candidate(false);
+        assert_eq!(state.candidates[0], "「");
+        assert_eq!(state.candidates[1], "『");
+        let _ = state.cycle_candidate(false);
+        assert_eq!(state.conversion_result, "『");
+        assert_eq!(state.hiragana_buffer, "『");
+
+        // 続けて打鍵しても『のまま（バッファ自体が『なので再変換で戻らない）
+        type_str(&mut state, "kyou");
+        assert_eq!(state.conversion_result, "『今日");
+
+        // 閉じ括弧は『に対応する』になる
+        type_str(&mut state, "]");
+        assert_eq!(state.conversion_result, "『今日』");
+    }
+
+    /// 確定を挟んでも（開き括弧が確定済みテキスト側にあっても）閉じ括弧は
+    /// 対応する種類になる。入れ子（【…「…」…】）も内側から順に閉じる。
+    #[test]
+    fn closing_bracket_matches_opener_across_commit_and_nesting() {
+        let mut state = state_with_two_segment_dict();
+        type_str(&mut state, "[");
+        let _ = state.cycle_candidate(false);
+        let _ = state.select_candidate(2); // 【
+        assert_eq!(state.conversion_result, "【");
+        let _ = state.commit();
+
+        type_str(&mut state, "kyou[");
+        assert_eq!(state.conversion_result, "今日「");
+        let _ = state.commit();
+        type_str(&mut state, "kyou]");
+        assert_eq!(state.conversion_result, "今日」");
+        let _ = state.commit();
+        type_str(&mut state, "]");
+        assert_eq!(state.conversion_result, "】");
+    }
+
+    /// 助詞を含むテスト用辞書（先頭文節の固定は文節の切れ目＝助詞の直後で行う）
+    fn particle_test_converter() -> ViterbiConverter {
+        let mut dict = Dictionary::new();
+        dict.matrix = common::ConnectionMatrix::new(10, 10);
+        for i in 0..10 {
+            for j in 0..10 {
+                dict.matrix.set(i, j, 200);
+            }
+        }
+        let mk = |s: &str, r: &str, id: common::PosId, cost: i16, pos: &str| common::WordEntry {
+            surface: s.to_string(), reading: r.to_string(),
+            left_id: id, right_id: id, cost, pos: pos.to_string(),
+        };
+        dict.add_word(mk("今日", "きょう", 1, 3000, "名詞-副詞可能-*-*"));
+        dict.add_word(mk("強", "きょう", 1, 4000, "名詞-一般-*-*"));
+        dict.add_word(mk("学校", "がっこう", 1, 3000, "名詞-一般-*-*"));
+        dict.add_word(mk("は", "は", 2, 1000, "助詞-係助詞-*-*"));
+        dict.add_word(mk("に", "に", 2, 1000, "助詞-格助詞-一般-*"));
+        ViterbiConverter::new(dict)
+    }
+
+    /// 画面上のテキストを模擬してアクションを適用する
+    fn apply_to_screen(screen: &mut String, action: Option<ConversionAction>) {
+        if let Some(a) = action {
+            let keep = screen.chars().count().saturating_sub(a.delete_count);
+            *screen = screen.chars().take(keep).collect();
+            screen.push_str(&a.insert_text);
+        }
+    }
+
+    /// 読みが長くなると先頭側の文節が固定され、後から辞書側の事情（学習）が
+    /// 変わっても固定部分は書き換わらない。未固定の末尾は通常どおり変換される。
+    /// 固定は表示の流れを変えない（画面テキスト＝表示結果）。
+    #[test]
+    fn long_input_pins_leading_clauses_and_keeps_them_stable() {
+        let mut state = LiveConversionState::new();
+        state.converter = Some(particle_test_converter());
+        let mut screen = String::new();
+        // きょうはがっこうに ×3 = 27文字（固定のしきい値24文字以上）
+        for _ in 0..3 {
+            for ch in "kyouhagakkouni".chars() {
+                let action = state.add_char(ch);
+                apply_to_screen(&mut screen, action);
+            }
+        }
+        assert_eq!(state.conversion_result, "今日は学校に今日は学校に今日は学校に");
+        assert_eq!(screen, state.conversion_result);
+        // 末尾12文字以上を残せる最後の切れ目（2つ目の「は」の直後）まで固定
+        let pinned: String = state.pinned.iter().map(|e| e.surface.as_str()).collect();
+        assert_eq!(pinned, "今日は学校に今日は");
+
+        // 以後「きょう」は「強」が優先される学習が入っても、固定部分は「今日」のまま。
+        // 未固定の末尾（3つ目の「きょう」）だけが「強」になる。
+        state.converter.as_mut().unwrap().learn_unigram("きょう", "強", 10);
+        for ch in "ni".chars() {
+            let action = state.add_char(ch);
+            apply_to_screen(&mut screen, action);
+        }
+        assert_eq!(state.conversion_result, "今日は学校に今日は学校に強は学校にに");
+        assert_eq!(screen, state.conversion_result);
+
+        // Backspace で固定領域まで削ると、固定は読みと一致する範囲に縮む
+        for _ in 0..8 {
+            let action = state.backspace();
+            apply_to_screen(&mut screen, action);
+        }
+        assert!(state.pinned.len() < 6, "pinned={:?}", state.pinned);
+        assert_eq!(screen, state.conversion_result);
+
+        // 確定で固定は解除され、学習用の文節列は固定部分も含めて揃う
+        let _ = state.commit();
+        assert!(state.pinned.is_empty());
+        assert!(state.hiragana_buffer.is_empty());
+    }
+
+    /// 遅延させた学習は flush でまとめてDBに記録される（確定時は溜めるだけ）
+    #[test]
+    fn deferred_learning_is_recorded_on_flush() {
+        let mut state = LiveConversionState::new();
+        state.converter = Some(particle_test_converter());
+        state.learning = Some(LearningRepository::in_memory().unwrap());
+        // 遅延先（候補ウィンドウ）はテストには無いので、溜めた文節列を直接 flush する
+        state.pending_learning.push(vec![
+            ("きょう".to_string(), "今日".to_string(), "名詞-副詞可能-*-*".to_string()),
+            ("は".to_string(), "は".to_string(), "助詞-係助詞-*-*".to_string()),
+            ("がっこう".to_string(), "学校".to_string(), "名詞-一般-*-*".to_string()),
+        ]);
+        state.flush_pending_learning();
+        assert!(state.pending_learning.is_empty());
+        let learning = state.learning.as_ref().unwrap();
+        assert_eq!(learning.find_frequency("きょう", "今日").unwrap(), 1);
+        assert_eq!(learning.find_frequency("がっこう", "学校").unwrap(), 1);
+        assert_eq!(learning.find_bigram_frequency("は", "学校").unwrap(), 1);
+    }
+
+    /// しきい値未満の短い入力では固定しない
+    #[test]
+    fn short_input_is_not_pinned() {
+        let mut state = LiveConversionState::new();
+        state.converter = Some(particle_test_converter());
+        for ch in "kyouhagakkouni".chars() {
+            let _ = state.add_char(ch);
+        }
+        assert_eq!(state.conversion_result, "今日は学校に");
+        assert!(state.pinned.is_empty());
+    }
+
+    /// 対応する開き括弧が無ければ `]` は既定の 」 のまま
+    #[test]
+    fn closing_bracket_defaults_without_opener() {
+        let mut state = state_with_two_segment_dict();
+        type_str(&mut state, "kyou]");
+        assert_eq!(state.conversion_result, "今日」");
     }
 
     /// ローマ字 "kyou" を1文字ずつ add_char に通した後 commit() すると、
