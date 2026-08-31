@@ -9,6 +9,10 @@ use crate::*;
 pub(crate) static WINDOW_MODES: Mutex<Vec<(isize, bool, String)>> = Mutex::new(Vec::new());
 /// 直近にフォーカスしていたウィンドウ（モードの保存/復元の切替検出用）
 pub(crate) static mut LAST_FG_HWND: isize = 0;
+/// 直近に `close_ms_ime_for_foreground` でMS-IMEを閉じ済みと確認したウィンドウ。
+/// 同じウィンドウへ確定文字を送り続ける間（1回のキー入力ごとに `execute_action`
+/// が呼ばれる）は毎回 `SendMessageTimeoutW` を送らずスキップする。0は未確定。
+pub(crate) static mut LAST_IME_CLOSED_HWND: isize = 0;
 /// 直近に押した横矢印キー(VK_LEFT/VK_RIGHT)と時刻(ms)。素早い2回押しで
 /// 行端(Home/End)へジャンプさせるための連打検出に使う。
 pub(crate) static mut LAST_ARROW_VK: u32 = 0;
@@ -127,11 +131,24 @@ pub(crate) fn is_ime_toggle_vk(vk: u32) -> bool {
 /// 我々が SendInput KEYEVENTF_UNICODE で送る文字を MS-IME が
 /// composition として取り込むのを防ぐ。IMC_SETOPENSTATUS=0 で
 /// IME 全体を閉じる(=半角英数モード相当)。
+///
+/// `execute_action` からキー入力のたびに呼ばれるため、`SendMessageTimeoutW`
+/// はフォアグラウンドスレッドへの同期メッセージ送信で相手が忙しいと
+/// 最大タイムアウト分ブロックしうる（ChatGPTのようなJS処理が重いWeb
+/// ページで顕著）。既に同じウィンドウで閉じ済みと分かっていれば
+/// 再送をスキップし、キー入力のたびに発生していたブロッキングを避ける。
 pub(crate) fn close_ms_ime_for_foreground() {
     unsafe {
         use windows::Win32::UI::WindowsAndMessaging::{SendMessageTimeoutW, SMTO_ABORTIFHUNG};
         let hwnd = GetForegroundWindow();
         if hwnd.0.is_null() {
+            return;
+        }
+        let hwnd_val = hwnd.0 as isize;
+        if LAST_IME_CLOSED_HWND == hwnd_val {
+            // 同じウィンドウに対して直前に閉じ済み。我々が SendInput で
+            // 直接注入する限りIMEの開閉状態は自然には変化しないため、
+            // ウィンドウが変わるまではキャッシュを信用してよい。
             return;
         }
         let ime_wnd = ImmGetDefaultIMEWnd(hwnd);
@@ -148,6 +165,7 @@ pub(crate) fn close_ms_ime_for_foreground() {
             30,
             None,
         );
+        LAST_IME_CLOSED_HWND = hwnd_val;
     }
 }
 
@@ -186,6 +204,11 @@ pub(crate) fn open_ms_ime_hiragana_for_foreground() {
             30,
             None,
         );
+        // 明示的に開いたので、次回 close_ms_ime_for_foreground が
+        // キャッシュに騙されず確実に閉じ直せるよう無効化する。
+        if hwnd.0 as isize == LAST_IME_CLOSED_HWND {
+            LAST_IME_CLOSED_HWND = 0;
+        }
     }
 }
 
