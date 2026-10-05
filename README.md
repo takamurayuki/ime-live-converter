@@ -115,6 +115,39 @@ cargo run --release -p dict-builder --bin dict-builder -- \
 `dictionaries/system.dic` があれば CLI 起動時に自動でロードされます
 （なければ `dictionaries/sample.dic` にフォールバック）。
 
+### 3. 判断層（judge-lm、任意）
+
+文脈を見て自動変換の結果を選び直す統計言語モデルです。日本語 Wikipedia で
+学習した単語トライグラム＋文法クラスモデル（IPADic の品詞・活用形）で、
+ラティス全体から「LM の確率＋辞書コスト＋個人学習」が最大の経路を選びます。
+計算は決定論的でローカル完結です（外部通信なし）。
+
+`dictionaries/judge_lm.bin` があれば起動時に自動で読み込まれ（フック常駐時は
+バックグラウンドで読み込み、終わるまでは従来の変換で動きます）、無ければ
+従来の変換とまったく同じ動作です。
+
+```bash
+# 1. 素材: Wikipedia ダンプ（約4.7GB）と vibrato 用 IPADic モデル
+curl -L -o jawiki.xml.bz2 https://dumps.wikimedia.org/jawiki/latest/jawiki-latest-pages-articles.xml.bz2
+curl -L https://github.com/daac-tools/vibrato/releases/download/v0.5.0/ipadic-mecab-2_7_0.tar.xz | tar xJ
+
+# 2. 本文の文を抽出（展開律速、全量で約45分）
+cargo run --release -p dict-builder -- wiki-extract jawiki.xml.bz2 jawiki.txt
+
+# 3. 学習（IPA辞書ディレクトリは「辞書の準備」で展開したもの）
+cargo run --release -p dict-builder -- judge-train \
+  ipadic-mecab-2_7_0/system.dic.zst ./mecab-ipadic-2.7.0-20070801 \
+  jawiki.txt ./dictionaries/judge_lm.bin judge_dev.tsv
+
+# 4. 評価とパラメータの書き込み（従来エンジンとの正解率比較）
+JUDGE_SCALE=2000 JUDGE_UNK=-2 cargo run --release -p common --example judge_eval -- \
+  ./dictionaries/judge_lm.bin judge_dev.tsv 3000 --write
+```
+
+**無効化（元に戻す）**: 環境変数 `IME_JUDGE=0` で起動するか、
+`dictionaries/judge_lm.bin` を削除/リネームしてください。調査用に
+`examples/judge_show`（候補ごとの内訳）・`judge_bench`（打鍵ごとの時間）があります。
+
 ## 使い方
 
 ### CLI の起動
