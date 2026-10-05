@@ -8,3 +8,5 @@ ime-learning.db-shm
 hook_debug.log
 # IPA辞書から生成されるバイナリ辞書（README の手順で再生成可能）
 dictionaries/system.dic
+# 判断層（judge-lm）のモデル。Wikipedia から dict-builder judge-train で再生成できる大きなバイナリ
+dictionaries/judge_lm.bin

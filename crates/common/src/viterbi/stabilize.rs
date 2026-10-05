@@ -116,6 +116,25 @@ impl ViterbiConverter {
         if pinned.is_empty() {
             return self.convert(reading);
         }
+        let mut lattice = self.build_pinned_lattice(reading, pinned);
+        self.find_best_path(&mut lattice);
+        if lattice.nodes[lattice.eos_index].total_cost == i32::MAX {
+            return self.convert(reading);
+        }
+        let path = self.extract_result(&lattice);
+        let n = pinned.len();
+        if path.len() < n {
+            return path;
+        }
+        let mut out = path[..n].to_vec();
+        out.extend(self.repair_single_kanji_fragments(path[n..].to_vec()));
+        out
+    }
+
+    /// 固定領域を固定文節だけに制限したラティスを作る（Viterbi 前の状態）。
+    /// `pinned` は `matching_pinned_prefix` 済みであること。
+    /// `convert_with_pinned_prefix` と判断層の N-best（`judge_select.rs`）で共有する。
+    pub(crate) fn build_pinned_lattice(&self, reading: &str, pinned: &[WordEntry]) -> Lattice {
         let mut lattice = self.build_lattice(reading);
 
         let mut spans: Vec<(usize, usize)> = Vec::with_capacity(pinned.len());
@@ -169,19 +188,7 @@ impl ViterbiConverter {
         for list in lattice.nodes_ending_at.iter_mut() {
             list.retain(|&idx| allowed(idx));
         }
-
-        self.find_best_path(&mut lattice);
-        if lattice.nodes[lattice.eos_index].total_cost == i32::MAX {
-            return self.convert(reading);
-        }
-        let path = self.extract_result(&lattice);
-        let n = pinned.len();
-        if path.len() < n {
-            return path;
-        }
-        let mut out = path[..n].to_vec();
-        out.extend(self.repair_single_kanji_fragments(path[n..].to_vec()));
-        out
+        lattice
     }
 
     /// `convert_context_aware` の固定文節対応版。連想リランクも固定部分には
@@ -193,7 +200,8 @@ impl ViterbiConverter {
         }
         let base = self.convert_with_pinned_prefix(reading, pinned);
         let base = self.rerank_by_seeded_collocation_from(base, n);
-        self.rerank_by_assoc_from(base, n)
+        let base = self.rerank_by_assoc_from(base, n);
+        self.judge_or_keep(reading, pinned, base)
     }
 }
 

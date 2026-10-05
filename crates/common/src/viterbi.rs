@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 mod fragment_repair;
+mod judge_select;
 mod incremental;
 mod lattice;
 mod nbest;
@@ -18,6 +19,7 @@ pub use lattice::*;
 pub(crate) use nbest::*;
 pub use scoring::*;
 pub use stabilize::*;
+pub use judge_select::*;
 
 /// Viterbi変換エンジン
 #[derive(Debug)]
@@ -140,6 +142,10 @@ pub struct ViterbiConverter {
     /// 少数のコロケーションだけを隣接語にも適用できる
     /// （[[homophone-selection-is-not-fixable-without-lm]]参照）。
     pub seeded_assoc: HashMap<(String, String), i32>,
+    /// 判断層（judge-lm、`crate::judge`）。`Some`のときだけ自動変換の最終候補を
+    /// N-best＋統計言語モデルの確率で選び直す。`None`なら従来の挙動と完全に同じ
+    /// （[[jev-style-judge-direction]]、`set_judge`で切り替える）。
+    pub judge: Option<Arc<crate::judge::JudgeLm>>,
 }
 
 impl ViterbiConverter {
@@ -202,6 +208,7 @@ impl ViterbiConverter {
             corpus_unigram: HashMap::new(),
             corpus_bigram: HashMap::new(),
             seeded_assoc: HashMap::new(),
+            judge: None,
         };
         conv.seed_common_words();
         conv
@@ -796,7 +803,8 @@ impl ViterbiConverter {
         // 使い方が一般的な傾向より優先されるべきという方針、
         // [[homophone-selection-is-not-fixable-without-lm]]）。
         let base = self.rerank_by_seeded_collocation_from(base, 0);
-        self.rerank_by_assoc_from(base, 0)
+        let base = self.rerank_by_assoc_from(base, 0);
+        self.judge_or_keep(reading, &[], base)
     }
 
     /// `rerank_by_assoc` の、先頭 `first_mutable` 文節を差し替え対象にしない版

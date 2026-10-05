@@ -7,11 +7,13 @@ pub mod typo;
 pub mod learning;
 pub mod rerank;
 pub mod corpus_lm;
+pub mod judge;
 pub mod brackets;
 pub mod conversion;
 
 pub use dictionary::{Dictionary, WordEntry, TrieNode, ConnectionMatrix, CharCategory, PosId};
 pub use corpus_lm::CorpusLm;
+pub use judge::{JudgeLm, JudgeParams};
 pub use viterbi::{ViterbiConverter, LiveConversionContext, Lattice, LatticeNode, IncrementalViterbi};
 pub use candidate::{Candidate, CandidateKind, hiragana_to_katakana, katakana_to_hiragana};
 pub use composition::{CompositionState, InputContext, should_auto_convert};

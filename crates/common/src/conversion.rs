@@ -51,6 +51,12 @@ pub const AUTO_COMPOUND_MIN_FREQ: u32 = 3;
 /// 自動登録する複合語の読みの最大文字数（暴走的に長い結合を防ぐ）。
 pub const AUTO_COMPOUND_MAX_READING_LEN: usize = 8;
 
+/// 判断層（judge-lm）を使うか。環境変数 `IME_JUDGE=0` で無効化できる
+/// （既定は有効。`judge_lm.bin` が無ければいずれにせよ使われない）。
+pub fn judge_enabled() -> bool {
+    std::env::var("IME_JUDGE").map(|v| v != "0").unwrap_or(true)
+}
+
 /// `commit_prediction` で予測（誤字修正・履歴補完）を確定した1回分の学習データ。
 /// フックの外へ遅延させて処理できるよう、DB/コンバータへの参照を持たない
 /// 素のデータとして保持する。
@@ -1434,6 +1440,24 @@ impl LiveConversionState {
                         }
                         Err(e) => {
                             debug_log!("コロケーションシードの読み込みをスキップ: {}", e);
+                        }
+                    }
+                }
+                // 判断層（judge-lm、[[jev-style-judge-direction]]）。辞書と同じ
+                // ディレクトリの judge_lm.bin があれば読み込む。無効化は
+                // 環境変数 IME_JUDGE=0、またはファイルを消す/リネームするだけ
+                // （無ければ従来の変換と完全に同じ動作）。
+                if let Some(conv) = self.converter.as_mut() {
+                    let judge_path = path.with_file_name("judge_lm.bin");
+                    if judge_enabled() && judge_path.exists() {
+                        match crate::judge::JudgeLm::load(&judge_path) {
+                            Ok(judge) => {
+                                debug_log!("判断層を読み込みました: {:?}", judge);
+                                conv.set_judge(Some(std::sync::Arc::new(judge)));
+                            }
+                            Err(e) => {
+                                debug_log!("判断層の読み込みに失敗（従来の変換で続行）: {}", e);
+                            }
                         }
                     }
                 }

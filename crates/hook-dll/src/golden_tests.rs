@@ -113,9 +113,28 @@ fn build_state(dict: &std::sync::Arc<Dictionary>) -> LiveConversionState {
     // とは別に必ず読み込む。読み込まないと同音異義語コロケーションの
     // 効果がゴールデンテストで一切測れない。
     let _ = converter.load_word_assoc_file(&word_assoc_path());
+    // 判断層（judge-lm）は既定では付けない（このテストの期待値は従来エンジンの
+    // スナップショット）。`IME_JUDGE_LM=<judge_lm.bin>` を指定したときだけ付け、
+    // 判断層ありで期待値との差分を見る（[[jev-style-judge-direction]]）。
+    if let Some(judge) = shared_judge() {
+        converter.set_judge(Some(judge));
+    }
     let mut state = LiveConversionState::new();
     state.converter = Some(converter);
     state
+}
+
+/// `IME_JUDGE_LM` で指定された判断層（全ケースで1回だけ読み込んで共有する）
+fn shared_judge() -> Option<std::sync::Arc<common::JudgeLm>> {
+    static JUDGE: std::sync::OnceLock<Option<std::sync::Arc<common::JudgeLm>>> = std::sync::OnceLock::new();
+    JUDGE
+        .get_or_init(|| {
+            let path = std::env::var("IME_JUDGE_LM").ok()?;
+            Some(std::sync::Arc::new(
+                common::JudgeLm::load(std::path::Path::new(&path)).expect("IME_JUDGE_LM の読み込みに失敗"),
+            ))
+        })
+        .clone()
 }
 
 /// `ConversionAction{delete_count, insert_text}`を、`hook.rs::execute_action`

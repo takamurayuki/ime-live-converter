@@ -9,6 +9,9 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter};
 use std::path::Path;
 
+mod judge_train;
+mod wiki;
+
 /// シリアライズ可能な辞書形式
 #[derive(Serialize, Deserialize)]
 struct SerializableDictionary {
@@ -744,6 +747,11 @@ fn main() -> Result<()> {
         println!("  {} extend <辞書ファイル> <補助CSV>  (常用語を追加)", args[0]);
         println!("  {} test <辞書ファイル>", args[0]);
         println!("  {} corpus <vibrato辞書.dic.zst> <コーパステキストディレクトリ> <出力corpus_lm.dic> [最小頻度]", args[0]);
+        println!("  {} wiki-extract <jawiki-pages-articles.xml.bz2> <出力sentences.txt> [最大記事数]", args[0]);
+        println!("  {} judge-train <vibrato辞書.dic.zst> <sentences.txt> <出力judge_lm.bin> <出力dev.tsv> [最大文数]", args[0]);
+        println!();
+        println!("wiki-extract / judge-train は判断層（judge-lm）の学習用。Wikipedia本文を文に分け、");
+        println!("(表記,読み)単位のKneser-Neyバイグラムと評価用データ(読み→正解表記)を作る。");
         println!();
         println!("補助辞書ディレクトリ（NEologd等）は、基本辞書に無い語だけを取り込み、");
         println!("固有名詞には出典不明の異常な低コストを補正するペナルティを掛ける。");
@@ -879,6 +887,35 @@ fn main() -> Result<()> {
             ));
 
             save_corpus_lm(&unigrams, &bigrams, min_freq, output_path)?;
+        }
+        "wiki-extract" => {
+            if args.len() < 4 {
+                anyhow::bail!("使い方: wiki-extract <jawiki-pages-articles.xml.bz2> <出力sentences.txt> [最大記事数]");
+            }
+            let max_pages = args.get(4).and_then(|s| s.parse().ok());
+            let (pages, sentences) = wiki::extract(Path::new(&args[2]), Path::new(&args[3]), max_pages)?;
+            println!("{} 記事から {} 文を抽出しました: {}", pages, sentences, args[3]);
+        }
+        "judge-train" => {
+            if args.len() < 6 {
+                anyhow::bail!("使い方: judge-train <vibrato辞書.dic.zst> <sentences.txt> <出力judge_lm.bin> <出力dev.tsv> [最大文数]");
+            }
+            let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).max(2) - 1;
+            let opts = judge_train::TrainOptions {
+                min_unigram: std::env::var("JUDGE_MIN_UNIGRAM").ok().and_then(|s| s.parse().ok()).unwrap_or(5),
+                min_bigram: std::env::var("JUDGE_MIN_BIGRAM").ok().and_then(|s| s.parse().ok()).unwrap_or(3),
+                dev_every: 100,
+                max_dev: 20000,
+                max_sentences: args.get(6).and_then(|s| s.parse().ok()),
+                threads,
+            };
+            judge_train::train(
+                Path::new(&args[2]),
+                Path::new(&args[3]),
+                Path::new(&args[4]),
+                Path::new(&args[5]),
+                &opts,
+            )?;
         }
         _ => {
             anyhow::bail!("不明なコマンド: {}", args[1]);
