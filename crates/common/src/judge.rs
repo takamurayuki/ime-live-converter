@@ -10,6 +10,9 @@
 //! - 単語バイグラム（Kneser-Ney 割引）: 語の単位は (表記, 読み, 文脈ID)。
 //!   文脈IDは IME の辞書（system.dic）と同じ MeCab IPADic の左右文脈ID で、
 //!   品詞だけでなく活用型・活用形まで区別する。
+//! - 単語トライグラム（任意）: 直前2語を見る（「を 見 に」と「を 身 に」の
+//!   ように直前1語では区別できない並びを、後ろの「行っ」まで含めて評価する）。
+//!   無ければバイグラムへ、バイグラムが無ければクラスモデルへ落ちる。
 //! - 文法クラスモデル（単語バイグラムのバックオフ先）:
 //!   P(今の語のクラス | 直前の語のクラス) × P(語 | クラス)。
 //!   「動詞連用形→助動詞『ます』連用形」のような文法的なつながりは、個々の
@@ -56,11 +59,24 @@ pub struct JudgeParams {
     /// 相当として LM 側の尺度で効かせる（辞書コスト換算のボーナスは
     /// 語コスト差ぎりぎりに作られていて、LM の差に比べて小さすぎるため）。
     pub seed_bonus: f32,
+    /// ユーザーの個人学習（学習ユニグラム・バイグラム・連想のボーナス。単位は
+    /// 辞書コストと同じ）をこの値で割って対数尺度に揃える。辞書コスト
+    /// （`dict_scale`）とは別にするのは、ユーザーが実際に確定した変換は
+    /// Wikipedia の統計より優先されるべきだから（同じ尺度だと1回の確定が
+    /// 0.75 しか効かず、何度直しても LM に押し戻される）。
+    pub learn_scale: f32,
 }
 
 impl Default for JudgeParams {
     fn default() -> Self {
-        Self { lm_weight: 1.0, dict_scale: 2000.0, temperature: 1.0, unk_char_logp: -2.0, seed_bonus: 4.0 }
+        Self {
+            lm_weight: 1.0,
+            dict_scale: 2000.0,
+            temperature: 1.0,
+            unk_char_logp: -2.0,
+            seed_bonus: 4.0,
+            learn_scale: 750.0,
+        }
     }
 }
 
@@ -80,6 +96,15 @@ pub struct JudgeLmData {
     pub bi_next: Vec<u32>,
     /// log P(w | v)（クラスモデルとの補間込み）
     pub bi_logp: Vec<f32>,
+    /// トライグラム。文脈 (u, v) はバイグラム表の添字 b（u→v の行）で表し、
+    /// `tri_offsets[b]..tri_offsets[b+1]` が続く語 w の範囲（`tri_next` は昇順）。
+    /// 空ならトライグラムなし（バイグラム＋クラスモデルだけで動く）。
+    pub tri_offsets: Vec<u32>,
+    pub tri_next: Vec<u32>,
+    /// log P(w | u, v)（バイグラムとの補間込み）
+    pub tri_logp: Vec<f32>,
+    /// 文脈 (u, v) のバックオフ重みの対数（バイグラム表の添字ごと）
+    pub tri_backoff: Vec<f32>,
     /// クラス数（文脈IDの最大値+1）
     pub n_class: u32,
     /// log P(今のクラス L | 直前のクラス R)、添字は `R * n_class + L`
@@ -142,8 +167,10 @@ pub struct JudgeScore {
     pub lm_base: f32,
     /// 語彙外の語の読みの文字数
     pub unk_chars: u32,
-    /// 辞書コスト（`ViterbiConverter::path_dict_cost`）
+    /// 辞書コスト（`ViterbiConverter::path_costs`、個人学習を除く）
     pub dict_cost: i32,
+    /// 個人学習のボーナスの合計（`ViterbiConverter::path_costs`）
+    pub learned: i32,
     /// 隣接コロケーション（word_assoc.tsv）に当たった組の数
     pub seed_hits: u32,
     /// 総合スコア（大きいほど良い）
@@ -203,7 +230,14 @@ impl JudgeLm {
                 && data.bi_next.iter().all(|&w| (w as usize) < n)
                 && data.class_logp.len() == (data.n_class as usize) * (data.n_class as usize)
                 && data.unk_emit_logp.len() == data.n_class as usize
-                && data.word_class.iter().all(|&c| (c as u32) < data.n_class),
+                && data.word_class.iter().all(|&c| (c as u32) < data.n_class)
+                && (data.tri_offsets.is_empty()
+                    || (data.tri_offsets.len() == data.bi_next.len() + 1
+                        && data.tri_backoff.len() == data.bi_next.len()
+                        && data.tri_next.len() == data.tri_logp.len()
+                        && data.tri_offsets.last().map_or(false, |&e| e as usize == data.tri_next.len())
+                        && data.tri_offsets.windows(2).all(|w| w[0] <= w[1])
+                        && data.tri_next.iter().all(|&w| (w as usize) < n))),
             "judge_lm の形式が不正です"
         );
         Ok(Self::from_data(data))
@@ -228,12 +262,61 @@ impl JudgeLm {
         &self.data
     }
 
+    pub fn into_data(self) -> JudgeLmData {
+        self.data
+    }
+
     pub fn vocab_len(&self) -> usize {
         self.data.vocab.len()
     }
 
     pub fn bigram_len(&self) -> usize {
         self.data.bi_next.len()
+    }
+
+    pub fn trigram_len(&self) -> usize {
+        self.data.tri_next.len()
+    }
+
+    /// バイグラム u→v の表の添字（無ければ None）
+    pub fn bigram_index(&self, u: u32, v: u32) -> Option<usize> {
+        let d = &self.data;
+        let (s, e) = (d.bi_offsets[u as usize] as usize, d.bi_offsets[u as usize + 1] as usize);
+        d.bi_next[s..e].binary_search(&v).ok().map(|i| s + i)
+    }
+
+    /// log P(今の語 | 2つ前, 直前)。トライグラムがあればそれ、無ければ
+    /// 文脈 (u, v) のバックオフ重み × バイグラム（`logp`）。
+    pub fn logp3(&self, prev2: Option<u32>, prev: LmCtx, cur: Option<u32>, cur_class: u16) -> f32 {
+        let ctx = self.trigram_ctx(prev2, prev.word);
+        self.logp_tri(ctx, cur, self.logp(prev, cur, cur_class))
+    }
+
+    /// トライグラムの文脈 (2つ前, 直前) を表すバイグラム表の添字。その文脈に
+    /// 保存されたトライグラムが無ければ None（バイグラムそのものを使う）。
+    /// ラティス上の Viterbi では状態ごとに1回だけ求めて使い回す。
+    pub fn trigram_ctx(&self, prev2: Option<u32>, prev: Option<u32>) -> Option<u32> {
+        let d = &self.data;
+        if d.tri_offsets.is_empty() {
+            return None;
+        }
+        let b = self.bigram_index(prev2?, prev?)?;
+        (d.tri_offsets[b + 1] > d.tri_offsets[b]).then_some(b as u32)
+    }
+
+    /// トライグラム文脈 `ctx`（`trigram_ctx`）と、同じ語のバイグラム対数確率
+    /// `bigram_logp`（`logp`）から log P(今の語 | 2つ前, 直前) を出す
+    pub fn logp_tri(&self, ctx: Option<u32>, cur: Option<u32>, bigram_logp: f32) -> f32 {
+        let Some(b) = ctx else { return bigram_logp };
+        let d = &self.data;
+        let b = b as usize;
+        if let Some(w) = cur {
+            let (s, e) = (d.tri_offsets[b] as usize, d.tri_offsets[b + 1] as usize);
+            if let Ok(i) = d.tri_next[s..e].binary_search(&w) {
+                return d.tri_logp[s + i];
+            }
+        }
+        d.tri_backoff[b] + bigram_logp
     }
 
     /// (表記, 読み, 文脈ID) の語ID。語彙外なら None
@@ -388,10 +471,10 @@ impl JudgeLm {
         }
     }
 
-    /// 直前の文脈から `u` へ進むときの対数確率
+    /// 直前の文脈（2つ前の語 `prev2` と直前 `prev`）から `u` へ進むときの対数確率
     /// （語彙外の文字数罰は含まない。罰は `LmUnit::unk_chars` で別に数える）
-    pub fn edge_logp(&self, prev: LmCtx, u: &LmUnit) -> f32 {
-        self.logp(prev, u.first, u.first_class) + u.internal
+    pub fn edge_logp(&self, prev2: Option<u32>, prev: LmCtx, u: &LmUnit) -> f32 {
+        self.logp3(prev2, prev, u.first, u.first_class) + u.internal
     }
 
     /// 語列の対数確率。`left` は直前の文脈語（無ければ文頭 BOS）。
@@ -408,21 +491,25 @@ impl JudgeLm {
             Some(e) => self.unit(e).last,
             None => LmCtx::BOS,
         };
+        let mut prev2: Option<u32> = None;
         let mut total = 0.0f32;
         let mut unk_chars = 0u32;
         for e in words {
             let u = self.unit(e);
-            total += self.edge_logp(prev, &u);
+            total += self.edge_logp(prev2, prev, &u);
             unk_chars += u.unk_chars;
+            prev2 = prev.word;
             prev = u.last;
         }
         (total, unk_chars)
     }
 
-    /// LM 対数確率・辞書コスト・コロケーション一致数から総合スコアを出す
-    pub fn combine(&self, lm_logp: f32, dict_cost: i32, seed_hits: u32) -> f32 {
+    /// LM 対数確率・辞書コスト・個人学習・コロケーション一致数から総合スコアを出す
+    pub fn combine(&self, lm_logp: f32, dict_cost: i32, learned: i32, seed_hits: u32) -> f32 {
         let p = self.params;
-        p.lm_weight * lm_logp - dict_cost as f32 / p.dict_scale + p.seed_bonus * seed_hits as f32
+        p.lm_weight * lm_logp - dict_cost as f32 / p.dict_scale
+            + learned as f32 / p.learn_scale
+            + p.seed_bonus * seed_hits as f32
     }
 
     /// スコア列を確率分布にする（softmax、温度つき）
@@ -448,6 +535,7 @@ impl std::fmt::Debug for JudgeLm {
         f.debug_struct("JudgeLm")
             .field("vocab", &self.data.vocab.len())
             .field("bigrams", &self.data.bi_next.len())
+            .field("trigrams", &self.data.tri_next.len())
             .field("classes", &self.data.n_class)
             .field("params", &self.params)
             .finish()
@@ -507,6 +595,10 @@ mod tests {
             bi_offsets: vec![0, 1, 1, 2, 2, 2, 2, 2, 2],
             bi_next: vec![2, 3],
             bi_logp: vec![-1.5, -0.3],
+            tri_offsets: Vec::new(),
+            tri_next: Vec::new(),
+            tri_logp: Vec::new(),
+            tri_backoff: Vec::new(),
             n_class: 5,
             class_logp,
             unk_emit_logp: vec![-12.0; 5],
@@ -538,6 +630,22 @@ mod tests {
     }
 
     #[test]
+    fn trigram_overrides_bigram_and_backs_off() {
+        let mut lm = tiny();
+        // BOS→今日 の行（バイグラム添字0）にだけ「→は」のトライグラムを置く
+        lm.data.tri_offsets = vec![0, 1, 1];
+        lm.data.tri_next = vec![3];
+        lm.data.tri_logp = vec![-0.01];
+        lm.data.tri_backoff = vec![-0.2, 0.0];
+        let today = lm.ctx_of(2);
+        assert_eq!(lm.logp3(Some(BOS_ID), today, Some(3), P), -0.01);
+        // 同じ文脈で別の語: 文脈のバックオフ重み + バイグラム
+        assert_eq!(lm.logp3(Some(BOS_ID), today, Some(5), N), -0.2 + lm.logp(today, Some(5), N));
+        // 2つ前が無い（文頭直後など）ならバイグラムそのもの
+        assert_eq!(lm.logp3(None, today, Some(3), P), lm.logp(today, Some(3), P));
+    }
+
+    #[test]
     fn context_prefers_attested_sequence() {
         let lm = tiny();
         let good = lm.sequence_logp(None, &[w("今日", "きょう", N), w("は", "は", P)]);
@@ -553,7 +661,7 @@ mod tests {
         let u = lm.unit(&w("今日晴れ", "きょうはれ", N));
         assert_eq!((u.first, u.last.word, u.unk_chars), (Some(2), Some(5), 0));
         assert_eq!(
-            lm.edge_logp(LmCtx::BOS, &u),
+            lm.edge_logp(None, LmCtx::BOS, &u),
             lm.logp(LmCtx::BOS, Some(2), N) + lm.logp(lm.ctx_of(2), Some(5), N)
         );
         // 分解できたものは語彙外の罰を受けない

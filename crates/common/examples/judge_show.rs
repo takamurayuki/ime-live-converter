@@ -1,7 +1,7 @@
 //! 判断層（judge-lm）の候補と内訳を表示する調査用ツール。
 //!
 //! 使い方: printf 'ぐんぐんすすむ\n' | cargo run --release -p common --example judge_show -- <judge_lm.bin>
-//! 学習DBは読まない。各候補の 確率 / 総合スコア / LM対数確率 / 語彙外文字数 / 辞書コスト と、
+//! 学習DBは読まない（IME_LEARN で個人学習を模擬できる）。各候補の 確率 / 総合スコア / LM対数確率 / 語彙外文字数 / 辞書コスト と、
 //! 語ごとの (表記/読み, 語彙内か) を出す。
 use common::judge::JudgeLm;
 use common::{Dictionary, ViterbiConverter};
@@ -15,6 +15,12 @@ fn main() {
     let mut conv = ViterbiConverter::new(Dictionary::load(dict_path).expect("辞書ロード失敗"));
     let _ = conv.load_word_priority_file(&dict_path.with_file_name("word_priority.tsv"));
     let _ = conv.load_word_assoc_file(&dict_path.with_file_name("word_assoc.tsv"));
+    // IME_LEARN="よみ=表記,よみ=表記" で、その変換を1回確定した個人学習を模擬する
+    for pair in std::env::var("IME_LEARN").unwrap_or_default().split(',').filter(|p| !p.is_empty()) {
+        if let Some((r, s)) = pair.split_once('=') {
+            conv.learn_unigram(r, s, 1);
+        }
+    }
     let judge = Arc::new(JudgeLm::load(Path::new(&lm_path)).expect("judge_lm ロード失敗"));
     println!("params: {:?}", judge.params());
     for line in std::io::stdin().lock().lines().map_while(Result::ok) {
@@ -36,12 +42,13 @@ fn main() {
                 })
                 .collect();
             println!(
-                "  {:.3} score={:.2} lm={:.2} unk={} dict={} seed={} {}{}",
+                "  {:.3} score={:.2} lm={:.2} unk={} dict={} learned={} seed={} {}{}",
                 c.prob,
                 c.score.score,
                 c.score.lm_logp,
                 c.score.unk_chars,
                 c.score.dict_cost,
+                c.score.learned,
                 c.score.seed_hits,
                 words.join(" "),
                 if c.is_baseline { "  ←従来" } else { "" }

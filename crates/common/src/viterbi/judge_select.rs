@@ -31,34 +31,59 @@ impl JudgedCandidate {
     }
 }
 
+/// 2次 Viterbi（`lm_viterbi`）で各ノードに残す状態数
+pub const JUDGE_BEAM: usize = 4;
+
 impl ViterbiConverter {
     /// 判断層を付け替える（`None` で従来の挙動に戻る）
     pub fn set_judge(&mut self, judge: Option<Arc<JudgeLm>>) {
         self.judge = judge;
     }
 
-    /// 語列の辞書コスト（単語の実効コスト＋接続コスト、文頭・文末を含む）。
-    /// どの候補にも同じ式を当てるための共通の物差しで、`find_best_path` の
-    /// 手調整ガード群は含まない。
-    pub fn path_dict_cost(&self, path: &[WordEntry]) -> i32 {
-        let mut total = 0i32;
+    /// 1語の (辞書側の実効コスト, 個人学習のボーナス)。`effective_word_cost` から
+    /// 学習ユニグラムのボーナスだけを切り出したもの（判断層では個人学習を
+    /// 辞書コストと別の尺度で効かせるため）。
+    pub(crate) fn judge_word_cost(&self, e: &WordEntry) -> (i32, i32) {
+        let learned = self
+            .learned_unigram
+            .get(&(e.reading.clone(), e.surface.clone()))
+            .copied()
+            .unwrap_or(0);
+        (self.effective_word_cost(e).saturating_add(learned), learned)
+    }
+
+    /// 2語間の (辞書側の接続コスト, 個人学習のバイグラムボーナス)
+    pub(crate) fn judge_conn_cost(
+        &self,
+        prev_right_id: PosId,
+        prev_surface: Option<&str>,
+        cur_left_id: PosId,
+        cur_surface: &str,
+    ) -> (i32, i32) {
+        let (conn, learned) = self.base_connection_cost(prev_right_id, prev_surface, cur_left_id, cur_surface);
+        (conn.saturating_add(learned), learned)
+    }
+
+    /// 語列の (辞書コスト, 個人学習のボーナス)。辞書コストは単語の実効コスト＋
+    /// 接続コスト（文頭・文末を含む）で、どの候補にも同じ式を当てるための
+    /// 共通の物差し（`find_best_path` の手調整ガード群は含まない）。個人学習は
+    /// 学習ユニグラム・学習バイグラム・離れた内容語どうしの学習連想の合計。
+    pub fn path_costs(&self, path: &[WordEntry]) -> (i32, i32) {
+        let mut dict = 0i32;
+        let mut learned = self.path_learned_assoc_bonus(path);
         let mut prev: Option<&WordEntry> = None;
         for e in path {
             let prev_right = prev.map(|p| p.right_id).unwrap_or(self.dictionary.bos_id);
-            let (conn, _) = self.base_connection_cost(
-                prev_right,
-                prev.map(|p| p.surface.as_str()),
-                e.left_id,
-                &e.surface,
-            );
-            total = total
-                .saturating_add(conn)
-                .saturating_add(self.effective_word_cost(e));
+            let (conn, conn_learned) =
+                self.judge_conn_cost(prev_right, prev.map(|p| p.surface.as_str()), e.left_id, &e.surface);
+            let (wc, wc_learned) = self.judge_word_cost(e);
+            dict = dict.saturating_add(conn).saturating_add(wc);
+            learned = learned.saturating_add(conn_learned).saturating_add(wc_learned);
             prev = Some(e);
         }
         let last_right = prev.map(|p| p.right_id).unwrap_or(self.dictionary.bos_id);
-        total = total.saturating_add(self.dictionary.matrix.get(last_right, self.dictionary.eos_id) as i32);
-        total.saturating_sub(self.path_learned_assoc_bonus(path))
+        dict = dict.saturating_add(self.dictionary.matrix.get(last_right, self.dictionary.eos_id) as i32);
+        (dict, learned)
     }
 
     /// 文中の内容語（漢字等に変換された自立語）の (位置, 表記)
@@ -132,37 +157,80 @@ impl ViterbiConverter {
     /// ラティス上で総合スコア（`JudgeLm::combine` と同じ式。ただし離れた語どうしの
     /// 学習連想は辺に分解できないので含めない）が最大の経路を求める。
     /// 到達できなければ None。
+    ///
+    /// LM がトライグラム（直前2語）を見るため、状態は「ノード × 直前のノード」の
+    /// 2次の Viterbi になる。各ノードでは直前ノードごとに最良の1状態だけを残し、
+    /// さらにスコア上位 `JUDGE_BEAM` 個に絞る（ビーム）。トライグラムの無い
+    /// モデルでは状態が直前ノードに依らないので、厳密な1次の Viterbi と一致する。
     pub fn lm_viterbi(&self, judge: &JudgeLm, lattice: &Lattice) -> Option<Vec<WordEntry>> {
+        #[derive(Clone, Copy)]
+        struct State {
+            score: f32,
+            /// 直前のノード（BOS の状態では usize::MAX）
+            prev_node: usize,
+            /// 直前のノードの状態リスト内の位置
+            prev_state: usize,
+            /// 次の語から見たトライグラム文脈（`JudgeLm::trigram_ctx`）
+            tri_ctx: Option<u32>,
+        }
+
         let params = judge.params();
         let nodes = &lattice.nodes;
-        // ノードごとの LM 単位と実効語コスト（辺ごとに作り直さない）
+        let (bos, eos) = (lattice.bos_index, lattice.eos_index);
+        // ノードごとに1回だけ求めるもの（辺・状態ごとに作り直さない）:
+        // LM 単位、実効語コスト、学習バイグラムの前語になりうるか、
+        // コロケーションの前語になりうるか
         let units: Vec<Option<crate::judge::LmUnit>> = nodes
             .iter()
             .map(|n| n.entry.as_ref().map(|e| judge.unit(e)))
             .collect();
-        let word_costs: Vec<i32> = nodes
+        let word_costs: Vec<(i32, i32)> = nodes
             .iter()
-            .map(|n| n.entry.as_ref().map_or(0, |e| self.effective_word_cost(e)))
+            .map(|n| n.entry.as_ref().map_or((0, 0), |e| self.judge_word_cost(e)))
             .collect();
-        let mut best = vec![f32::NEG_INFINITY; nodes.len()];
-        let mut back = vec![usize::MAX; nodes.len()];
-        best[lattice.bos_index] = 0.0;
+        let bigram_prev: Vec<bool> = nodes
+            .iter()
+            .map(|n| {
+                n.entry.as_ref().map_or(false, |e| {
+                    (!self.learned_bigram.is_empty() && self.bigram_prev_surfaces.contains(&e.surface))
+                        || (!self.corpus_bigram.is_empty() && self.corpus_bigram_prev_surfaces.contains(&e.surface))
+                })
+            })
+            .collect();
+        let seed_firsts: std::collections::HashSet<&str> =
+            self.seeded_assoc.keys().map(|(a, _)| a.as_str()).collect();
+        let seed_prev: Vec<bool> = nodes
+            .iter()
+            .map(|n| n.entry.as_ref().map_or(false, |e| seed_firsts.contains(e.surface.as_str())))
+            .collect();
+        // 文脈としての LM 語（BOS は文頭の語、語彙外は None）
+        let last_word = |idx: usize| -> Option<u32> {
+            if idx == bos {
+                Some(crate::judge::BOS_ID)
+            } else {
+                units[idx].as_ref().and_then(|u| u.last.word)
+            }
+        };
+        let mut states: Vec<Vec<State>> = vec![Vec::new(); nodes.len()];
+        states[bos].push(State { score: 0.0, prev_node: usize::MAX, prev_state: usize::MAX, tri_ctx: None });
 
         for pos in 0..lattice.nodes_starting_at.len() {
             for &cur in &lattice.nodes_starting_at[pos] {
                 let node = &nodes[cur];
+                let mut cands: Vec<State> = Vec::new();
                 for &prev in &lattice.nodes_ending_at[pos] {
-                    if best[prev] == f32::NEG_INFINITY {
+                    if states[prev].is_empty() {
                         continue;
                     }
                     let prev_entry = nodes[prev].entry.as_ref();
-                    let score = if cur == lattice.eos_index {
-                        // `path_dict_cost` と同じく文末は連接行列だけ（LM の文末は見ない）
+                    // 2つ前の語に依らない部分（辞書コスト・コロケーション・バイグラム）
+                    let (base, unit_first, bigram_logp) = if cur == eos {
+                        // `path_costs` と同じく文末は連接行列だけ（LM の文末は見ない）
                         let conn = self.dictionary.matrix.get(nodes[prev].right_id, self.dictionary.eos_id) as i32;
-                        best[prev] - conn as f32 / params.dict_scale
+                        (-(conn as f32) / params.dict_scale, None, 0.0)
                     } else {
                         let (Some(e), Some(u)) = (node.entry.as_ref(), units[cur].as_ref()) else { continue };
-                        let prev_last = if prev == lattice.bos_index {
+                        let prev_ctx = if prev == bos {
                             crate::judge::LmCtx::BOS
                         } else {
                             match units[prev].as_ref() {
@@ -170,39 +238,53 @@ impl ViterbiConverter {
                                 None => continue,
                             }
                         };
-                        let (conn, _) = self.base_connection_cost(
-                            nodes[prev].right_id,
-                            prev_entry.map(|p| p.surface.as_str()),
-                            node.left_id,
-                            &e.surface,
-                        );
-                        let lm = judge.edge_logp(prev_last, u) + params.unk_char_logp * u.unk_chars as f32;
+                        let prev_surface = prev_entry.filter(|_| bigram_prev[prev]).map(|p| p.surface.as_str());
+                        let (conn, conn_learned) =
+                            self.judge_conn_cost(nodes[prev].right_id, prev_surface, node.left_id, &e.surface);
                         let seed = match prev_entry {
-                            Some(p) if self.is_seed_pair(p, e) => params.seed_bonus,
+                            Some(p) if seed_prev[prev] && self.is_seed_pair(p, e) => params.seed_bonus,
                             _ => 0.0,
                         };
-                        best[prev] + params.lm_weight * lm
-                            - (conn.saturating_add(word_costs[cur])) as f32 / params.dict_scale
+                        let (wc, wc_learned) = word_costs[cur];
+                        let base = -(conn.saturating_add(wc) as f32) / params.dict_scale
+                            + conn_learned.saturating_add(wc_learned) as f32 / params.learn_scale
                             + seed
+                            + params.lm_weight * (params.unk_char_logp * u.unk_chars as f32 + u.internal);
+                        (base, Some(u.first), judge.logp(prev_ctx, u.first, u.first_class))
                     };
-                    if score > best[cur] {
-                        best[cur] = score;
-                        back[cur] = prev;
+                    let mut best_here: Option<State> = None;
+                    for (si, st) in states[prev].iter().enumerate() {
+                        let lm = match unit_first {
+                            Some(first) => params.lm_weight * judge.logp_tri(st.tri_ctx, first, bigram_logp),
+                            None => 0.0,
+                        };
+                        let score = st.score + lm + base;
+                        if best_here.map_or(true, |b| score > b.score) {
+                            best_here = Some(State { score, prev_node: prev, prev_state: si, tri_ctx: None });
+                        }
+                    }
+                    cands.extend(best_here);
+                }
+                cands.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+                cands.truncate(JUDGE_BEAM);
+                if cur != eos {
+                    let cur_last = units[cur].as_ref().and_then(|u| u.last.word);
+                    for st in &mut cands {
+                        st.tri_ctx = judge.trigram_ctx(last_word(st.prev_node), cur_last);
                     }
                 }
+                states[cur] = cands;
             }
         }
 
-        if best[lattice.eos_index] == f32::NEG_INFINITY {
-            return None;
-        }
+        let mut st = *states[eos].first()?;
         let mut path = Vec::new();
-        let mut idx = back[lattice.eos_index];
-        while idx != lattice.bos_index && idx != usize::MAX {
+        while st.prev_node != usize::MAX && st.prev_node != bos {
+            let idx = st.prev_node;
             if let Some(e) = &nodes[idx].entry {
                 path.push(e.clone());
             }
-            idx = back[idx];
+            st = states[idx][st.prev_state];
         }
         path.reverse();
         Some(path)
@@ -235,10 +317,10 @@ impl ViterbiConverter {
             .map(|(entries, is_baseline)| {
                 let (lm_base, unk_chars) = judge.sequence_logp_parts(None, &entries);
                 let lm_logp = lm_base + judge.params().unk_char_logp * unk_chars as f32;
-                let dict_cost = self.path_dict_cost(&entries);
+                let (dict_cost, learned) = self.path_costs(&entries);
                 let seed_hits = self.path_seed_hits(&entries);
-                let score = judge.combine(lm_logp, dict_cost, seed_hits);
-                (entries, JudgeScore { lm_logp, lm_base, unk_chars, dict_cost, seed_hits, score }, is_baseline)
+                let score = judge.combine(lm_logp, dict_cost, learned, seed_hits);
+                (entries, JudgeScore { lm_logp, lm_base, unk_chars, dict_cost, learned, seed_hits, score }, is_baseline)
             })
             .collect();
         let probs = judge.distribution(&scored.iter().map(|(_, s, _)| s.score).collect::<Vec<_>>());

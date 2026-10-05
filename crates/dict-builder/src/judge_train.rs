@@ -12,7 +12,7 @@
 //!   （`judge_eval` で従来エンジンとの正解率比較・パラメータ調整に使う）。
 
 use anyhow::{Context, Result};
-use common::judge::{vocab_key, JudgeLm, JudgeLmData, JudgeParams, BOS_ID, EOS_ID};
+use common::judge::{vocab_key, JudgeLm, JudgeLmData, JudgeParams, LmCtx, BOS_ID, EOS_ID};
 use encoding_rs::EUC_JP;
 use std::collections::HashMap;
 use std::fs::File;
@@ -25,6 +25,8 @@ pub struct TrainOptions {
     pub min_unigram: u64,
     /// この回数未満のバイグラムは保存しない（バックオフで近似する）
     pub min_bigram: u32,
+    /// この回数未満のトライグラムは保存しない（0 ならトライグラムを作らない）
+    pub min_trigram: u32,
     /// N 文に1文を評価用に回す
     pub dev_every: usize,
     /// 評価用データの最大件数
@@ -156,6 +158,8 @@ struct Counts {
     word_class: Vec<u16>,
     uni: Vec<u64>,
     bigrams: HashMap<u64, u32>,
+    /// トライグラムの回数（語IDを21ビットずつ詰めたキー）
+    trigrams: HashMap<u64, u32>,
     /// クラス遷移の回数（`R * n_class + L`）
     class_bi: Vec<u64>,
     n_class: usize,
@@ -181,6 +185,7 @@ pub fn train(
         word_class: vec![0, 0],
         uni: vec![0, 0],
         bigrams: HashMap::new(),
+        trigrams: HashMap::new(),
         class_bi: vec![0; n_class * n_class],
         n_class,
     };
@@ -257,6 +262,7 @@ pub fn train(
         let mut chunks = 0usize;
         for result in res_rx {
             for clause in result.clauses {
+                let mut prev2: Option<u32> = None;
                 let mut prev = BOS_ID;
                 let mut prev_class = 0usize;
                 counts.uni[BOS_ID as usize] += 1;
@@ -275,9 +281,20 @@ pub fn train(
                     counts.uni[id as usize] += 1;
                     total_tokens += 1;
                     *counts.bigrams.entry(((prev as u64) << 32) | id as u64).or_insert(0) += 1;
+                    if let (Some(u), true) = (prev2, opts.min_trigram > 0) {
+                        if let Some(key) = tri_key(u, prev, id) {
+                            *counts.trigrams.entry(key).or_insert(0) += 1;
+                        }
+                    }
                     counts.class_bi[prev_class * n_class + class as usize] += 1;
+                    prev2 = Some(prev);
                     prev = id;
                     prev_class = class as usize;
+                }
+                if let (Some(u), true) = (prev2, opts.min_trigram > 0) {
+                    if let Some(key) = tri_key(u, prev, EOS_ID) {
+                        *counts.trigrams.entry(key).or_insert(0) += 1;
+                    }
                 }
                 *counts.bigrams.entry(((prev as u64) << 32) | EOS_ID as u64).or_insert(0) += 1;
                 counts.class_bi[prev_class * n_class] += 1;
@@ -287,11 +304,12 @@ pub fn train(
             chunks += 1;
             if chunks % 200 == 0 {
                 eprintln!(
-                    "  {} 文 / {} 語 / 語彙 {} / バイグラム {}",
+                    "  {} 文 / {} 語 / 語彙 {} / バイグラム {} / トライグラム {}",
                     chunks * CHUNK,
                     total_tokens,
                     counts.words.len(),
-                    counts.bigrams.len()
+                    counts.bigrams.len(),
+                    counts.trigrams.len()
                 );
             }
         }
@@ -306,11 +324,17 @@ pub fn train(
         n_class
     );
 
-    let data = build_model(&counts, opts);
+    let (mut data, new_id) = build_model(&counts, opts);
+    let mut counts = counts;
+    counts.bigrams = HashMap::new(); // 以降は不要。トライグラム構築前にメモリを空ける
+    if opts.min_trigram > 0 {
+        add_trigrams(&mut data, &counts.trigrams, &new_id, opts.min_trigram);
+    }
     eprintln!(
-        "モデル: 語彙 {} / バイグラム {}（割引・バックオフ重みは全件から算出）",
+        "モデル: 語彙 {} / バイグラム {} / トライグラム {}（割引・バックオフ重みは全件から算出）",
         data.vocab.len(),
-        data.bi_next.len()
+        data.bi_next.len(),
+        data.tri_next.len()
     );
     JudgeLm::save_data(&data, output)?;
     eprintln!("保存しました: {}", output.display());
@@ -330,7 +354,7 @@ pub fn train(
 ///
 /// P(w | v) = max(c(v,w) − D, 0) / c(v) + γ(v) · P(L(w) | R(v)) · P(w | L(w))
 /// γ(v) = D · N1+(v・) / c(v)
-fn build_model(c: &Counts, opts: &TrainOptions) -> JudgeLmData {
+fn build_model(c: &Counts, opts: &TrainOptions) -> (JudgeLmData, Vec<u32>) {
     let n = c.words.len();
     let nc = c.n_class;
 
@@ -434,7 +458,7 @@ fn build_model(c: &Counts, opts: &TrainOptions) -> JudgeLmData {
         bi_offsets[i + 1] += bi_offsets[i];
     }
 
-    JudgeLmData {
+    let data = JudgeLmData {
         vocab: keep.iter().map(|&i| c.words[i].clone()).collect(),
         word_class: keep.iter().map(|&i| c.word_class[i]).collect(),
         emit_logp: keep.iter().map(|&i| emit(i).ln() as f32).collect(),
@@ -442,9 +466,108 @@ fn build_model(c: &Counts, opts: &TrainOptions) -> JudgeLmData {
         bi_offsets,
         bi_next: entries.iter().map(|e| e.1).collect(),
         bi_logp: entries.iter().map(|e| e.2).collect(),
+        tri_offsets: Vec::new(),
+        tri_next: Vec::new(),
+        tri_logp: Vec::new(),
+        tri_backoff: Vec::new(),
         n_class: nc as u32,
         class_logp,
         unk_emit_logp,
         params_json: serde_json::to_string(&JudgeParams::default()).unwrap_or_default(),
+    };
+    (data, new_id)
+}
+
+/// トライグラムのキー（語IDを21ビットずつ詰める。収まらない語IDなら None）
+const TRI_BITS: u32 = 21;
+fn tri_key(u: u32, v: u32, w: u32) -> Option<u64> {
+    let max = 1u32 << TRI_BITS;
+    (u < max && v < max && w < max).then(|| ((u as u64) << (2 * TRI_BITS)) | ((v as u64) << TRI_BITS) | w as u64)
+}
+fn tri_unkey(key: u64) -> (u32, u32, u32) {
+    let mask = (1u64 << TRI_BITS) - 1;
+    ((key >> (2 * TRI_BITS)) as u32, ((key >> TRI_BITS) & mask) as u32, (key & mask) as u32)
+}
+
+/// できあがったバイグラム＋クラスモデルの上にトライグラムを足す
+///
+/// P(w | u, v) = max(c(u,v,w) − D3, 0) / c(u,v) + γ(u,v) · P(w | v)
+/// γ(u,v) = D3 · N1+(u,v,・) / c(u,v)
+/// 文脈 (u, v) はバイグラム表の添字で表すので、保存されていないバイグラムを
+/// 文脈とするトライグラムは持たない（そこではバイグラムに落ちる）。
+fn add_trigrams(data: &mut JudgeLmData, trigrams: &HashMap<u64, u32>, new_id: &[u32], min_trigram: u32) {
+    // 文脈 (u, v) ごとの回数と異なり数、割引 D3
+    let mut ctx: HashMap<u64, (u64, u32)> = HashMap::new();
+    let (mut n1, mut n2) = (0u64, 0u64);
+    for (&key, &cnt) in trigrams {
+        let (u, v, _) = tri_unkey(key);
+        let e = ctx.entry(((u as u64) << 32) | v as u64).or_insert((0, 0));
+        e.0 += cnt as u64;
+        e.1 += 1;
+        match cnt {
+            1 => n1 += 1,
+            2 => n2 += 1,
+            _ => {}
+        }
     }
+    let discount = if n1 + n2 > 0 { n1 as f64 / (n1 as f64 + 2.0 * n2 as f64) } else { 0.75 };
+    eprintln!("トライグラム: {} 種 / 文脈 {} / 割引 D3 = {:.3}", trigrams.len(), ctx.len(), discount);
+
+    let lm = JudgeLm::from_data(std::mem::take(data));
+    let class = |id: u32| lm.data().word_class[id as usize];
+    let mut entries: Vec<(u32, u32, f32)> = Vec::new(); // (バイグラム添字, w, logp)
+    for (&key, &cnt) in trigrams {
+        if cnt < min_trigram {
+            continue;
+        }
+        let (u, v, w) = tri_unkey(key);
+        let (nu, nv, nw) = (new_id[u as usize], new_id[v as usize], new_id[w as usize]);
+        if nu == u32::MAX || nv == u32::MAX || nw == u32::MAX {
+            continue;
+        }
+        let Some(b) = lm.bigram_index(nu, nv) else { continue };
+        let (c_uv, types) = ctx[&(((u as u64) << 32) | v as u64)];
+        let gamma = discount * types as f64 / c_uv as f64;
+        let p2 = lm.logp(LmCtx { word: Some(nv), class: class(nv) }, Some(nw), class(nw)) as f64;
+        let p = (cnt as f64 - discount).max(0.0) / c_uv as f64 + gamma * p2.exp();
+        entries.push((b as u32, nw, p.ln() as f32));
+    }
+    entries.sort_unstable_by_key(|e| (e.0, e.1));
+
+    // 保存したトライグラムがある文脈だけバックオフ重みを持たせる（無い文脈は
+    // バイグラムそのものを使う＝重み1）
+    let mut gamma_of: HashMap<u32, f32> = HashMap::new();
+    for (&key, &(c_uv, types)) in &ctx {
+        let (u, v) = ((key >> 32) as u32, (key & 0xFFFF_FFFF) as u32);
+        let (nu, nv) = (new_id[u as usize], new_id[v as usize]);
+        if nu == u32::MAX || nv == u32::MAX {
+            continue;
+        }
+        if let Some(b) = lm.bigram_index(nu, nv) {
+            gamma_of.insert(b as u32, (discount * types as f64 / c_uv as f64).ln() as f32);
+        }
+    }
+
+    let mut data_out = lm.into_data();
+    let n_bi = data_out.bi_next.len();
+    let mut tri_offsets = vec![0u32; n_bi + 1];
+    for e in &entries {
+        tri_offsets[e.0 as usize + 1] += 1;
+    }
+    for i in 0..n_bi {
+        tri_offsets[i + 1] += tri_offsets[i];
+    }
+    let mut tri_backoff = vec![0f32; n_bi];
+    for b in 0..n_bi {
+        if tri_offsets[b + 1] > tri_offsets[b] {
+            if let Some(&g) = gamma_of.get(&(b as u32)) {
+                tri_backoff[b] = g;
+            }
+        }
+    }
+    data_out.tri_offsets = tri_offsets;
+    data_out.tri_next = entries.iter().map(|e| e.1).collect();
+    data_out.tri_logp = entries.iter().map(|e| e.2).collect();
+    data_out.tri_backoff = tri_backoff;
+    *data = data_out;
 }

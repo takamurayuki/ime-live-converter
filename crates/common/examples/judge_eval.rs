@@ -24,7 +24,7 @@ struct Case {
     reading: String,
     gold: String,
     baseline: String,
-    /// (表記, 語彙外罰を除くLM対数確率＋コロケーション加点, 語彙外の文字数, 辞書コスト)
+    /// (表記, 語彙外罰を除くLM対数確率＋コロケーション・個人学習の加点, 語彙外の文字数, 辞書コスト)
     cands: Vec<(String, f32, u32, i32)>,
 }
 
@@ -99,7 +99,8 @@ fn main() {
         // 従来の結果を先頭に置く（同点時の優先）
         let mut cands: Vec<(String, f32, u32, i32)> = Vec::new();
         for j in judged.iter().filter(|j| j.is_baseline).chain(judged.iter().filter(|j| !j.is_baseline)) {
-            let seed = arc.params().seed_bonus * j.score.seed_hits as f32;
+            let seed = arc.params().seed_bonus * j.score.seed_hits as f32
+                + j.score.learned as f32 / arc.params().learn_scale;
             cands.push((j.surface(), j.score.lm_base + seed, j.score.unk_chars, j.score.dict_cost));
         }
         cases.push(Case {
@@ -183,7 +184,15 @@ fn main() {
     if write {
         let dict_scale = if alpha > 0.0 { 1.0 / alpha } else { 1e9 };
         let seed_bonus = std::env::var("JUDGE_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(judge.params().seed_bonus);
-        judge.set_params(JudgeParams { lm_weight: 1.0, dict_scale, temperature: best_t.0, unk_char_logp: unk_char, seed_bonus });
+        let learn_scale = std::env::var("JUDGE_LEARN").ok().and_then(|s| s.parse().ok()).unwrap_or(judge.params().learn_scale);
+        judge.set_params(JudgeParams {
+            lm_weight: 1.0,
+            dict_scale,
+            temperature: best_t.0,
+            unk_char_logp: unk_char,
+            seed_bonus,
+            learn_scale,
+        });
         JudgeLm::save_data(judge.data(), lm_path).expect("保存失敗");
         println!("パラメータを書き戻しました: {}", lm_path.display());
     }

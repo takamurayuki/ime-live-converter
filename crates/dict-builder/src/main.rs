@@ -919,6 +919,7 @@ fn main() -> Result<()> {
             let opts = judge_train::TrainOptions {
                 min_unigram: std::env::var("JUDGE_MIN_UNIGRAM").ok().and_then(|s| s.parse().ok()).unwrap_or(5),
                 min_bigram: std::env::var("JUDGE_MIN_BIGRAM").ok().and_then(|s| s.parse().ok()).unwrap_or(3),
+                min_trigram: std::env::var("JUDGE_MIN_TRIGRAM").ok().and_then(|s| s.parse().ok()).unwrap_or(3),
                 dev_every: 100,
                 max_dev: 20000,
                 max_sentences: args.get(7).and_then(|s| s.parse().ok()),
