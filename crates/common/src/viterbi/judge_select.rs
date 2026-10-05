@@ -1,15 +1,18 @@
 //! 判断層（judge-lm）による自動変換結果の選び直し
 //!
 //! 従来の変換結果（Viterbi 1-best＋連想リランク）を「候補の1つ」として残した
-//! まま、同じラティスの N-best を加えた候補集合を `crate::judge::JudgeLm` で
-//! 採点し、最も確率の高いものを採用する。判断層が無い（`judge == None`）とき
-//! は何もしない（従来の挙動と完全に同じ）。
+//! まま、同じラティス上で「LM 対数確率＋辞書コスト」の総合スコアが最大になる
+//! 経路（`lm_viterbi`）を加えた候補集合を `crate::judge::JudgeLm` で採点し、
+//! 最も確率の高いものを採用する。判断層が無い（`judge == None`）ときは何も
+//! しない（従来の挙動と完全に同じ）。
+//!
+//! LM はバイグラムなので、総合スコアは「直前の語→今の語」の辺ごとの和に
+//! 分解できる。よってラティスのノードをそのまま状態にした Viterbi で、全経路の
+//! 中の厳密な最適を従来の Viterbi と同程度の計算量で求められる（N-best から
+//! 選ぶ方式は長文で正解が上位N件に入らず、探索も重かったため置き換えた）。
 
 use super::*;
 use crate::judge::{JudgeLm, JudgeScore};
-
-/// 判断層に渡す N-best の候補数（従来の変換結果は別枠で必ず含める）
-pub const JUDGE_N_BEST: usize = 10;
 
 /// 判断層が採点した1候補
 #[derive(Clone, Debug)]
@@ -98,38 +101,111 @@ impl ViterbiConverter {
         if self.seeded_assoc.is_empty() {
             return 0;
         }
-        path.windows(2)
-            .filter(|w| {
-                (is_content_pos(&w[0].pos) || is_content_pos(&w[1].pos))
-                    && self.seeded_assoc.contains_key(&(w[0].surface.clone(), w[1].surface.clone()))
-            })
-            .count() as u32
+        path.windows(2).filter(|w| self.is_seed_pair(&w[0], &w[1])).count() as u32
     }
 
-    /// 判断層の候補集合（N-best＋従来の結果）を作る。固定文節 `pinned` は
-    /// 全候補で保たれる。
-    fn judge_candidate_paths(&self, reading: &str, pinned: &[WordEntry]) -> Vec<Vec<WordEntry>> {
+    /// 隣接する2語が事前精査済みコロケーション（`seeded_assoc`）の組か
+    fn is_seed_pair(&self, a: &WordEntry, b: &WordEntry) -> bool {
+        !self.seeded_assoc.is_empty()
+            && (is_content_pos(&a.pos) || is_content_pos(&b.pos))
+            && self.seeded_assoc.contains_key(&(a.surface.clone(), b.surface.clone()))
+    }
+
+    /// 判断層の候補（従来の結果以外）を作る: 総合スコア最大の経路と、その
+    /// 断片修復版。固定文節 `pinned` は全候補で保たれる。
+    fn judge_candidate_paths(&self, judge: &JudgeLm, reading: &str, pinned: &[WordEntry]) -> Vec<Vec<WordEntry>> {
         let pinned = matching_pinned_prefix(reading, pinned);
-        if pinned.is_empty() {
-            return self.n_best(reading, JUDGE_N_BEST);
-        }
-        let mut lattice = self.build_pinned_lattice(reading, pinned);
-        self.find_best_path(&mut lattice);
-        if lattice.nodes[lattice.eos_index].total_cost == i32::MAX {
+        let lattice = if pinned.is_empty() {
+            self.build_lattice(reading)
+        } else {
+            self.build_pinned_lattice(reading, pinned)
+        };
+        let Some(path) = self.lm_viterbi(judge, &lattice) else {
             return Vec::new();
-        }
-        let n = pinned.len();
-        n_best_from_lattice(&lattice, &self.dictionary, JUDGE_N_BEST)
-            .into_iter()
-            .map(|path| {
-                if path.len() < n {
-                    return path;
+        };
+        let n = pinned.len().min(path.len());
+        let mut repaired = path[..n].to_vec();
+        repaired.extend(self.repair_single_kanji_fragments(path[n..].to_vec()));
+        vec![path, repaired]
+    }
+
+    /// ラティス上で総合スコア（`JudgeLm::combine` と同じ式。ただし離れた語どうしの
+    /// 学習連想は辺に分解できないので含めない）が最大の経路を求める。
+    /// 到達できなければ None。
+    pub fn lm_viterbi(&self, judge: &JudgeLm, lattice: &Lattice) -> Option<Vec<WordEntry>> {
+        let params = judge.params();
+        let nodes = &lattice.nodes;
+        // ノードごとの LM 単位と実効語コスト（辺ごとに作り直さない）
+        let units: Vec<Option<crate::judge::LmUnit>> = nodes
+            .iter()
+            .map(|n| n.entry.as_ref().map(|e| judge.unit(e)))
+            .collect();
+        let word_costs: Vec<i32> = nodes
+            .iter()
+            .map(|n| n.entry.as_ref().map_or(0, |e| self.effective_word_cost(e)))
+            .collect();
+        let mut best = vec![f32::NEG_INFINITY; nodes.len()];
+        let mut back = vec![usize::MAX; nodes.len()];
+        best[lattice.bos_index] = 0.0;
+
+        for pos in 0..lattice.nodes_starting_at.len() {
+            for &cur in &lattice.nodes_starting_at[pos] {
+                let node = &nodes[cur];
+                for &prev in &lattice.nodes_ending_at[pos] {
+                    if best[prev] == f32::NEG_INFINITY {
+                        continue;
+                    }
+                    let prev_entry = nodes[prev].entry.as_ref();
+                    let score = if cur == lattice.eos_index {
+                        // `path_dict_cost` と同じく文末は連接行列だけ（LM の文末は見ない）
+                        let conn = self.dictionary.matrix.get(nodes[prev].right_id, self.dictionary.eos_id) as i32;
+                        best[prev] - conn as f32 / params.dict_scale
+                    } else {
+                        let (Some(e), Some(u)) = (node.entry.as_ref(), units[cur].as_ref()) else { continue };
+                        let prev_last = if prev == lattice.bos_index {
+                            crate::judge::LmCtx::BOS
+                        } else {
+                            match units[prev].as_ref() {
+                                Some(u) => u.last,
+                                None => continue,
+                            }
+                        };
+                        let (conn, _) = self.base_connection_cost(
+                            nodes[prev].right_id,
+                            prev_entry.map(|p| p.surface.as_str()),
+                            node.left_id,
+                            &e.surface,
+                        );
+                        let lm = judge.edge_logp(prev_last, u) + params.unk_char_logp * u.unk_chars as f32;
+                        let seed = match prev_entry {
+                            Some(p) if self.is_seed_pair(p, e) => params.seed_bonus,
+                            _ => 0.0,
+                        };
+                        best[prev] + params.lm_weight * lm
+                            - (conn.saturating_add(word_costs[cur])) as f32 / params.dict_scale
+                            + seed
+                    };
+                    if score > best[cur] {
+                        best[cur] = score;
+                        back[cur] = prev;
+                    }
                 }
-                let mut out = path[..n].to_vec();
-                out.extend(self.repair_single_kanji_fragments(path[n..].to_vec()));
-                out
-            })
-            .collect()
+            }
+        }
+
+        if best[lattice.eos_index] == f32::NEG_INFINITY {
+            return None;
+        }
+        let mut path = Vec::new();
+        let mut idx = back[lattice.eos_index];
+        while idx != lattice.bos_index && idx != usize::MAX {
+            if let Some(e) = &nodes[idx].entry {
+                path.push(e.clone());
+            }
+            idx = back[idx];
+        }
+        path.reverse();
+        Some(path)
     }
 
     /// 候補を採点し、確率の高い順に並べて返す。`baseline` は従来エンジンの
@@ -147,7 +223,7 @@ impl ViterbiConverter {
         let mut seen = std::collections::HashSet::new();
         seen.insert(base_surface);
         let mut paths = vec![(baseline.to_vec(), true)];
-        for path in self.judge_candidate_paths(reading, pinned) {
+        for path in self.judge_candidate_paths(judge, reading, pinned) {
             let s: String = path.iter().map(|e| e.surface.as_str()).collect();
             if seen.insert(s) {
                 paths.push((path, false));

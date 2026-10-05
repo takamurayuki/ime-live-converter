@@ -748,7 +748,7 @@ fn main() -> Result<()> {
         println!("  {} test <辞書ファイル>", args[0]);
         println!("  {} corpus <vibrato辞書.dic.zst> <コーパステキストディレクトリ> <出力corpus_lm.dic> [最小頻度]", args[0]);
         println!("  {} wiki-extract <jawiki-pages-articles.xml.bz2> <出力sentences.txt> [最大記事数]", args[0]);
-        println!("  {} judge-train <vibrato辞書.dic.zst> <sentences.txt> <出力judge_lm.bin> <出力dev.tsv> [最大文数]", args[0]);
+        println!("  {} judge-train <vibrato辞書.dic.zst> <IPA辞書ディレクトリ> <sentences.txt> <出力judge_lm.bin> <出力dev.tsv> [最大文数]", args[0]);
         println!();
         println!("wiki-extract / judge-train は判断層（judge-lm）の学習用。Wikipedia本文を文に分け、");
         println!("(表記,読み)単位のKneser-Neyバイグラムと評価用データ(読み→正解表記)を作る。");
@@ -888,6 +888,21 @@ fn main() -> Result<()> {
 
             save_corpus_lm(&unigrams, &bigrams, min_freq, output_path)?;
         }
+        "tokenize" => {
+            // 調査用: vibrato の分かち書き結果を (表記, 左ID, 右ID, 素性) で表示する
+            if args.len() < 4 {
+                anyhow::bail!("使い方: tokenize <vibrato辞書.dic.zst> <文>");
+            }
+            let reader = zstd::Decoder::new(File::open(&args[2])?)?;
+            let tokenizer = vibrato::Tokenizer::new(vibrato::Dictionary::read(reader)?);
+            let mut worker = tokenizer.new_worker();
+            worker.reset_sentence(&args[3]);
+            worker.tokenize();
+            for i in 0..worker.num_tokens() {
+                let t = worker.token(i);
+                println!("{}	{}	{}	{}", t.surface(), t.left_id(), t.right_id(), t.feature());
+            }
+        }
         "wiki-extract" => {
             if args.len() < 4 {
                 anyhow::bail!("使い方: wiki-extract <jawiki-pages-articles.xml.bz2> <出力sentences.txt> [最大記事数]");
@@ -897,8 +912,8 @@ fn main() -> Result<()> {
             println!("{} 記事から {} 文を抽出しました: {}", pages, sentences, args[3]);
         }
         "judge-train" => {
-            if args.len() < 6 {
-                anyhow::bail!("使い方: judge-train <vibrato辞書.dic.zst> <sentences.txt> <出力judge_lm.bin> <出力dev.tsv> [最大文数]");
+            if args.len() < 7 {
+                anyhow::bail!("使い方: judge-train <vibrato辞書.dic.zst> <IPA辞書ディレクトリ> <sentences.txt> <出力judge_lm.bin> <出力dev.tsv> [最大文数]");
             }
             let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).max(2) - 1;
             let opts = judge_train::TrainOptions {
@@ -906,7 +921,7 @@ fn main() -> Result<()> {
                 min_bigram: std::env::var("JUDGE_MIN_BIGRAM").ok().and_then(|s| s.parse().ok()).unwrap_or(3),
                 dev_every: 100,
                 max_dev: 20000,
-                max_sentences: args.get(6).and_then(|s| s.parse().ok()),
+                max_sentences: args.get(7).and_then(|s| s.parse().ok()),
                 threads,
             };
             judge_train::train(
@@ -914,6 +929,7 @@ fn main() -> Result<()> {
                 Path::new(&args[3]),
                 Path::new(&args[4]),
                 Path::new(&args[5]),
+                Path::new(&args[6]),
                 &opts,
             )?;
         }

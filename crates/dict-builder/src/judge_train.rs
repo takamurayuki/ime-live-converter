@@ -1,14 +1,19 @@
 //! 判断層（judge-lm）の学習: 1行1文のコーパスを vibrato(IPADic) で分かち書きし、
-//! (表記, 読み) 単位の Kneser-Ney 平滑化つき単語バイグラムを作る。
+//! (表記, 読み, 文脈ID) 単位の Kneser-Ney 単語バイグラムと、そのバックオフ先の
+//! 文法クラスモデル（文脈ID どうしの遷移確率 × クラス内の語の出現確率）を作る。
 //!
+//! - 文脈IDは IME の辞書（system.dic）と同じ MeCab IPADic の番号にそろえる。
+//!   vibrato の配布モデルは文脈IDを独自に振り直しているため、トークンの
+//!   (表記, 素性) を IPADic の CSV で引き直して IPADic の番号を得る。
 //! - 句読点・括弧などの記号と、読みの無い語（英数字・未知語）は「文節の
 //!   区切り」として扱い、そこで文頭(BOS)からやり直す。ライブ変換も句読点で
 //!   自動確定して次の入力が文頭から始まるので、それに合わせている。
 //! - 一定間隔の文は学習に使わず、評価用データ（読み→正解表記）に回す
 //!   （`judge_eval` で従来エンジンとの正解率比較・パラメータ調整に使う）。
 
-use anyhow::Result;
-use common::judge::{JudgeLm, JudgeLmData, JudgeParams, BOS_ID, EOS_ID};
+use anyhow::{Context, Result};
+use common::judge::{vocab_key, JudgeLm, JudgeLmData, JudgeParams, BOS_ID, EOS_ID};
+use encoding_rs::EUC_JP;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -29,13 +34,42 @@ pub struct TrainOptions {
     pub threads: usize,
 }
 
-/// 分かち書き済みの1文節（語キー列）
-type Clause = Vec<String>;
+/// 分かち書き済みの1文節（(語キー, 文脈ID) の列）
+type Clause = Vec<(String, u16)>;
 
 struct ChunkResult {
     clauses: Vec<Clause>,
     /// (文番号, 読み, 正解表記, 分かち書き)
     dev: Vec<(usize, String, String, String)>,
+}
+
+/// IPADic の CSV を読み、"表記\t素性" → 文脈ID の表を作る（素性は CSV の
+/// 5列目以降。vibrato のトークン素性と同じ並び）。IPADic は左右の文脈IDが
+/// 常に同じなので左IDだけ持つ。
+fn load_ipadic_ids(dir: &Path) -> Result<(HashMap<String, u16>, u16)> {
+    let mut map = HashMap::new();
+    let mut max_id = 0u16;
+    for entry in std::fs::read_dir(dir).with_context(|| format!("IPADic ディレクトリを開けません: {}", dir.display()))? {
+        let path = entry?.path();
+        if path.extension().map_or(true, |e| e != "csv") {
+            continue;
+        }
+        let bytes = std::fs::read(&path)?;
+        let (text, _, _) = EUC_JP.decode(&bytes);
+        for line in text.lines() {
+            let mut it = line.splitn(5, ',');
+            let (Some(surface), Some(left), Some(_right), Some(_cost), Some(feature)) =
+                (it.next(), it.next(), it.next(), it.next(), it.next())
+            else {
+                continue;
+            };
+            let Ok(left) = left.parse::<u16>() else { continue };
+            max_id = max_id.max(left);
+            map.insert(format!("{}\t{}", surface, feature), left);
+        }
+    }
+    anyhow::ensure!(!map.is_empty(), "IPADic の CSV が見つかりません: {}", dir.display());
+    Ok((map, max_id))
 }
 
 fn katakana_to_hiragana(s: &str) -> String {
@@ -51,70 +85,106 @@ fn is_reading_char(c: char) -> bool {
     ('\u{3041}'..='\u{3096}').contains(&c) || c == 'ー'
 }
 
-/// 1文を分かち書きし、文節（記号・未知語で区切った語キー列）に分ける。
-/// 各文節は (語キー列, 読み, 表記, 分かち書き表示) を返す。
+/// 1文を分かち書きし、文節（記号・未知語で区切った語列）に分ける。
+/// 各文節は (語列, 読み, 表記, 分かち書き表示) を返す。
 fn tokenize_clauses(
     worker: &mut vibrato::tokenizer::worker::Worker<'_>,
+    ids: &HashMap<String, u16>,
     sentence: &str,
 ) -> Vec<(Clause, String, String, Vec<String>)> {
     worker.reset_sentence(sentence);
     worker.tokenize();
     let mut out = Vec::new();
-    let mut keys: Clause = Vec::new();
+    let mut words: Clause = Vec::new();
     let mut reading = String::new();
     let mut surface = String::new();
     let mut shown: Vec<String> = Vec::new();
-    let flush = |keys: &mut Clause, reading: &mut String, surface: &mut String, shown: &mut Vec<String>, out: &mut Vec<_>| {
-        if !keys.is_empty() {
-            out.push((std::mem::take(keys), std::mem::take(reading), std::mem::take(surface), std::mem::take(shown)));
-        } else {
-            reading.clear();
-            surface.clear();
-            shown.clear();
-        }
-    };
+    let mut lookup = String::new();
     for i in 0..worker.num_tokens() {
         let t = worker.token(i);
         let feature = t.feature();
-        let mut fields = feature.split(',');
-        let pos = fields.next().unwrap_or("");
-        let reading_kana = feature.split(',').nth(7);
-        let r = reading_kana.map(katakana_to_hiragana).unwrap_or_default();
         let s = t.surface();
-        if pos == "記号" || r.is_empty() || !r.chars().all(is_reading_char) || s.trim().is_empty() {
-            flush(&mut keys, &mut reading, &mut surface, &mut shown, &mut out);
-            continue;
+        let pos = feature.split(',').next().unwrap_or("");
+        let r = feature.split(',').nth(7).map(katakana_to_hiragana).unwrap_or_default();
+        lookup.clear();
+        lookup.push_str(s);
+        lookup.push('\t');
+        lookup.push_str(feature);
+        let class = ids.get(&lookup).copied();
+        let usable = pos != "記号" && !r.is_empty() && r.chars().all(is_reading_char) && !s.trim().is_empty();
+        match (usable, class) {
+            (true, Some(class)) => {
+                words.push((vocab_key(s, &r, class), class));
+                reading.push_str(&r);
+                surface.push_str(s);
+                shown.push(format!("{}/{}", s, r));
+            }
+            _ => {
+                if !words.is_empty() {
+                    out.push((
+                        std::mem::take(&mut words),
+                        std::mem::take(&mut reading),
+                        std::mem::take(&mut surface),
+                        std::mem::take(&mut shown),
+                    ));
+                } else {
+                    reading.clear();
+                    surface.clear();
+                    shown.clear();
+                }
+            }
         }
-        keys.push(format!("{}\t{}", s, r));
-        reading.push_str(&r);
-        surface.push_str(s);
-        shown.push(format!("{}/{}", s, r));
     }
-    flush(&mut keys, &mut reading, &mut surface, &mut shown, &mut out);
+    if !words.is_empty() {
+        out.push((words, reading, surface, shown));
+    }
     out
 }
 
 /// 評価用データに使える文節か（漢字を含み、長さが手頃）
-fn is_dev_clause(keys: &Clause, reading: &str, surface: &str) -> bool {
+fn is_dev_clause(words: &Clause, reading: &str, surface: &str) -> bool {
     let n = reading.chars().count();
-    keys.len() >= 2 && (5..=30).contains(&n) && surface != reading && surface.chars().any(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c))
+    words.len() >= 2
+        && (5..=30).contains(&n)
+        && surface != reading
+        && surface.chars().any(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c))
+}
+
+/// 集計結果
+struct Counts {
+    words: Vec<String>,
+    word_class: Vec<u16>,
+    uni: Vec<u64>,
+    bigrams: HashMap<u64, u32>,
+    /// クラス遷移の回数（`R * n_class + L`）
+    class_bi: Vec<u64>,
+    n_class: usize,
 }
 
 pub fn train(
     vibrato_dict: &Path,
+    ipadic_dir: &Path,
     corpus: &Path,
     output: &Path,
     dev_output: &Path,
     opts: &TrainOptions,
 ) -> Result<()> {
+    eprintln!("IPADic の文脈ID表を読み込んでいます: {}", ipadic_dir.display());
+    let (ids, max_id) = load_ipadic_ids(ipadic_dir)?;
     eprintln!("vibrato辞書を読み込んでいます: {}", vibrato_dict.display());
     let reader = zstd::Decoder::new(File::open(vibrato_dict)?)?;
     let tokenizer = vibrato::Tokenizer::new(vibrato::Dictionary::read(reader)?);
 
+    let n_class = max_id as usize + 1;
+    let mut counts = Counts {
+        words: vec!["<s>".into(), "</s>".into()],
+        word_class: vec![0, 0],
+        uni: vec![0, 0],
+        bigrams: HashMap::new(),
+        class_bi: vec![0; n_class * n_class],
+        n_class,
+    };
     let mut vocab: HashMap<String, u32> = HashMap::new();
-    let mut words: Vec<String> = vec!["<s>".into(), "</s>".into()];
-    let mut uni: Vec<u64> = vec![0, 0];
-    let mut bigrams: HashMap<u64, u32> = HashMap::new();
     let mut dev: Vec<(usize, String, String, String)> = Vec::new();
     let mut total_tokens: u64 = 0;
 
@@ -129,6 +199,7 @@ pub fn train(
             let res_tx = res_tx.clone();
             let job_rx = &job_rx;
             let tokenizer = &tokenizer;
+            let ids = &ids;
             let dev_every = opts.dev_every;
             scope.spawn(move || {
                 let mut worker = tokenizer.new_worker();
@@ -139,13 +210,13 @@ pub fn train(
                     for (k, line) in lines.iter().enumerate() {
                         let idx = base + k;
                         let is_dev = dev_every > 0 && idx % dev_every == 0;
-                        for (keys, reading, surface, shown) in tokenize_clauses(&mut worker, line) {
+                        for (words, reading, surface, shown) in tokenize_clauses(&mut worker, ids, line) {
                             if is_dev {
-                                if is_dev_clause(&keys, &reading, &surface) {
+                                if is_dev_clause(&words, &reading, &surface) {
                                     result.dev.push((idx, reading, surface, shown.join(" ")));
                                 }
                             } else {
-                                result.clauses.push(keys);
+                                result.clauses.push(words);
                             }
                         }
                     }
@@ -187,43 +258,57 @@ pub fn train(
         for result in res_rx {
             for clause in result.clauses {
                 let mut prev = BOS_ID;
-                uni[BOS_ID as usize] += 1;
-                for key in clause {
+                let mut prev_class = 0usize;
+                counts.uni[BOS_ID as usize] += 1;
+                for (key, class) in clause {
                     let id = match vocab.get(&key) {
                         Some(&id) => id,
                         None => {
-                            let id = words.len() as u32;
+                            let id = counts.words.len() as u32;
                             vocab.insert(key.clone(), id);
-                            words.push(key);
-                            uni.push(0);
+                            counts.words.push(key);
+                            counts.word_class.push(class);
+                            counts.uni.push(0);
                             id
                         }
                     };
-                    uni[id as usize] += 1;
+                    counts.uni[id as usize] += 1;
                     total_tokens += 1;
-                    *bigrams.entry(((prev as u64) << 32) | id as u64).or_insert(0) += 1;
+                    *counts.bigrams.entry(((prev as u64) << 32) | id as u64).or_insert(0) += 1;
+                    counts.class_bi[prev_class * n_class + class as usize] += 1;
                     prev = id;
+                    prev_class = class as usize;
                 }
-                *bigrams.entry(((prev as u64) << 32) | EOS_ID as u64).or_insert(0) += 1;
-                uni[EOS_ID as usize] += 1;
+                *counts.bigrams.entry(((prev as u64) << 32) | EOS_ID as u64).or_insert(0) += 1;
+                counts.class_bi[prev_class * n_class] += 1;
+                counts.uni[EOS_ID as usize] += 1;
             }
             dev.extend(result.dev);
             chunks += 1;
             if chunks % 200 == 0 {
                 eprintln!(
                     "  {} 文 / {} 語 / 語彙 {} / バイグラム {}",
-                    chunks * CHUNK, total_tokens, words.len(), bigrams.len()
+                    chunks * CHUNK,
+                    total_tokens,
+                    counts.words.len(),
+                    counts.bigrams.len()
                 );
             }
         }
         Ok(())
     })?;
 
-    eprintln!("集計完了: {} 語 / 語彙 {} / バイグラム {}", total_tokens, words.len(), bigrams.len());
-
-    let data = build_model(&words, &uni, &bigrams, total_tokens, opts);
     eprintln!(
-        "モデル: 語彙 {} / バイグラム {}（D・バックオフは全件から算出）",
+        "集計完了: {} 語 / 語彙 {} / バイグラム {} / クラス {}",
+        total_tokens,
+        counts.words.len(),
+        counts.bigrams.len(),
+        n_class
+    );
+
+    let data = build_model(&counts, opts);
+    eprintln!(
+        "モデル: 語彙 {} / バイグラム {}（割引・バックオフ重みは全件から算出）",
         data.vocab.len(),
         data.bi_next.len()
     );
@@ -241,25 +326,23 @@ pub fn train(
     Ok(())
 }
 
-/// 集計結果から補間 Kneser-Ney バイグラムを作る
-fn build_model(
-    words: &[String],
-    uni: &[u64],
-    bigrams: &HashMap<u64, u32>,
-    total_tokens: u64,
-    opts: &TrainOptions,
-) -> JudgeLmData {
-    let n = words.len();
-    let mut ctx_count = vec![0u64; n]; // c(v)
-    let mut ctx_types = vec![0u32; n]; // N1+(v・)
-    let mut cont_types = vec![0u32; n]; // N1+(・w)
+/// 集計結果から「Kneser-Ney 割引の単語バイグラム ＋ 文法クラスモデルへのバックオフ」を作る
+///
+/// P(w | v) = max(c(v,w) − D, 0) / c(v) + γ(v) · P(L(w) | R(v)) · P(w | L(w))
+/// γ(v) = D · N1+(v・) / c(v)
+fn build_model(c: &Counts, opts: &TrainOptions) -> JudgeLmData {
+    let n = c.words.len();
+    let nc = c.n_class;
+
+    // 文脈としての回数 c(v) と異なり数 N1+(v・)、割引 D
+    let mut ctx_count = vec![0u64; n];
+    let mut ctx_types = vec![0u32; n];
     let (mut n1, mut n2) = (0u64, 0u64);
-    for (&key, &c) in bigrams {
-        let (v, w) = ((key >> 32) as usize, (key & 0xFFFF_FFFF) as usize);
-        ctx_count[v] += c as u64;
+    for (&key, &cnt) in &c.bigrams {
+        let v = (key >> 32) as usize;
+        ctx_count[v] += cnt as u64;
         ctx_types[v] += 1;
-        cont_types[w] += 1;
-        match c {
+        match cnt {
             1 => n1 += 1,
             2 => n2 += 1,
             _ => {}
@@ -268,38 +351,68 @@ fn build_model(
     let discount = if n1 + n2 > 0 { n1 as f64 / (n1 as f64 + 2.0 * n2 as f64) } else { 0.75 };
     eprintln!("Kneser-Ney 割引 D = {:.3}", discount);
 
-    // 語彙の刈り込み（BOS/EOS は必ず残す）
-    let mut new_id = vec![u32::MAX; n];
-    let mut vocab = Vec::new();
-    for (i, w) in words.iter().enumerate() {
-        if i < 2 || uni[i] >= opts.min_unigram {
-            new_id[i] = vocab.len() as u32;
-            vocab.push(w.clone());
-        }
-    }
-    let v_size = vocab.len();
-    let total_types: f64 = bigrams.len() as f64;
-    let eps = 1e-4f64;
-    let mut p_uni = vec![0f64; v_size];
-    for (old, &nid) in new_id.iter().enumerate() {
-        if nid != u32::MAX {
-            p_uni[nid as usize] = (1.0 - eps) * cont_types[old] as f64 / total_types + eps / v_size as f64;
-        }
-    }
-    let mut backoff = vec![0f64; v_size];
-    for (old, &nid) in new_id.iter().enumerate() {
-        if nid != u32::MAX {
-            backoff[nid as usize] = if ctx_count[old] > 0 {
-                discount * ctx_types[old] as f64 / ctx_count[old] as f64
-            } else {
-                1.0
-            };
+    // クラス遷移 P(L | R)（加算平滑化。文法的にありえない遷移ほど小さくなる）
+    let alpha = 0.1f64;
+    let mut class_logp = vec![0f32; nc * nc];
+    for r in 0..nc {
+        let row = &c.class_bi[r * nc..(r + 1) * nc];
+        let total: u64 = row.iter().sum();
+        let denom = total as f64 + alpha * nc as f64;
+        for l in 0..nc {
+            class_logp[r * nc + l] = ((row[l] as f64 + alpha) / denom).ln() as f32;
         }
     }
 
+    // クラスごとの語の総数と、刈り込まれる語の総数・異なり数
+    let mut class_tokens = vec![0u64; nc];
+    let mut pruned_tokens = vec![0u64; nc];
+    let mut pruned_types = vec![0u64; nc];
+    for i in 2..n {
+        let cls = c.word_class[i] as usize;
+        class_tokens[cls] += c.uni[i];
+        if c.uni[i] < opts.min_unigram {
+            pruned_tokens[cls] += c.uni[i];
+            pruned_types[cls] += 1;
+        }
+    }
+    let unk_emit_logp: Vec<f32> = (0..nc)
+        .map(|l| {
+            if class_tokens[l] == 0 {
+                -20.0
+            } else {
+                // 刈り込まれた語1つあたりの平均確率（そのクラスの「未知の語」の確率）
+                (pruned_tokens[l].max(1) as f64 / class_tokens[l] as f64 / pruned_types[l].max(1) as f64).ln() as f32
+            }
+        })
+        .collect();
+
+    // 語彙の刈り込み（BOS/EOS は必ず残す）
+    let mut new_id = vec![u32::MAX; n];
+    let mut keep = Vec::new();
+    for i in 0..n {
+        if i < 2 || c.uni[i] >= opts.min_unigram {
+            new_id[i] = keep.len() as u32;
+            keep.push(i);
+        }
+    }
+    let emit = |i: usize| -> f64 {
+        if i < 2 {
+            1.0
+        } else {
+            c.uni[i] as f64 / class_tokens[c.word_class[i] as usize].max(1) as f64
+        }
+    };
+    let backoff = |v: usize| -> f64 {
+        if ctx_count[v] > 0 {
+            discount * ctx_types[v] as f64 / ctx_count[v] as f64
+        } else {
+            1.0
+        }
+    };
+
     let mut entries: Vec<(u32, u32, f32)> = Vec::new();
-    for (&key, &c) in bigrams {
-        if c < opts.min_bigram {
+    for (&key, &cnt) in &c.bigrams {
+        if cnt < opts.min_bigram {
             continue;
         }
         let (v, w) = ((key >> 32) as usize, (key & 0xFFFF_FFFF) as usize);
@@ -307,11 +420,12 @@ fn build_model(
         if nv == u32::MAX || nw == u32::MAX {
             continue;
         }
-        let p = (c as f64 - discount).max(0.0) / ctx_count[v] as f64
-            + backoff[nv as usize] * p_uni[nw as usize];
+        let class_p = (class_logp[c.word_class[v] as usize * nc + c.word_class[w] as usize] as f64).exp();
+        let p = (cnt as f64 - discount).max(0.0) / ctx_count[v] as f64 + backoff(v) * class_p * emit(w);
         entries.push((nv, nw, p.ln() as f32));
     }
     entries.sort_unstable_by_key(|e| (e.0, e.1));
+    let v_size = keep.len();
     let mut bi_offsets = vec![0u32; v_size + 1];
     for e in &entries {
         bi_offsets[e.0 as usize + 1] += 1;
@@ -321,14 +435,16 @@ fn build_model(
     }
 
     JudgeLmData {
-        uni_logp: p_uni.iter().map(|p| p.ln() as f32).collect(),
-        backoff: backoff.iter().map(|b| b.ln() as f32).collect(),
+        vocab: keep.iter().map(|&i| c.words[i].clone()).collect(),
+        word_class: keep.iter().map(|&i| c.word_class[i]).collect(),
+        emit_logp: keep.iter().map(|&i| emit(i).ln() as f32).collect(),
+        backoff: keep.iter().map(|&i| backoff(i).ln() as f32).collect(),
         bi_offsets,
         bi_next: entries.iter().map(|e| e.1).collect(),
         bi_logp: entries.iter().map(|e| e.2).collect(),
-        // 語彙に入らなかった語（刈り込み閾値未満の頻度）相当の確率
-        unk_logp: (opts.min_unigram as f64 / total_tokens.max(1) as f64).ln() as f32,
-        vocab,
+        n_class: nc as u32,
+        class_logp,
+        unk_emit_logp,
         params_json: serde_json::to_string(&JudgeParams::default()).unwrap_or_default(),
     }
 }

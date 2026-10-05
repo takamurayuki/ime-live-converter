@@ -31,7 +31,7 @@ fn main() {
                 .entries
                 .iter()
                 .map(|e| {
-                    let known = judge.word_id(&e.surface, &e.reading).is_some();
+                    let known = judge.word_id(&e.surface, &e.reading, e.left_id as u16).is_some();
                     format!("{}/{}{}", e.surface, e.reading, if known { "" } else { "(?)" })
                 })
                 .collect();

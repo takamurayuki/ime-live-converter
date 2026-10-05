@@ -75,6 +75,13 @@ pub struct LiveConversionState {
     pub romaji: RomajiConverter,
     /// ひらがな→漢字変換
     pub converter: Option<ViterbiConverter>,
+    /// 判断層（judge-lm）をバックグラウンドで読み込むか。フック常駐プロセスでは
+    /// true にする（大きなモデルの読み込みで `LIVE_CONTEXT` のロックを長く握り、
+    /// その間のキー入力がフックの制限時間を超えるのを避ける）。読み込みが
+    /// 終わるまでは従来の変換のまま動く。
+    pub load_judge_async: bool,
+    /// バックグラウンド読み込み中の判断層（`attach_pending_judge` で取り付ける）
+    pending_judge: Option<std::sync::mpsc::Receiver<Option<std::sync::Arc<crate::judge::JudgeLm>>>>,
     /// 現在のローマ字入力バッファ
     pub romaji_buffer: String,
     /// 現在のひらがなバッファ
@@ -365,6 +372,8 @@ impl LiveConversionState {
         Self {
             romaji: RomajiConverter::new(),
             converter: None,
+            load_judge_async: false,
+            pending_judge: None,
             romaji_buffer: String::new(),
             hiragana_buffer: String::new(),
             conversion_result: String::new(),
@@ -396,6 +405,22 @@ impl LiveConversionState {
             enabled: true,
             commit_ring: std::collections::VecDeque::new(),
             restore_selection: None,
+        }
+    }
+
+    /// バックグラウンドで読み込み終わった判断層があれば変換エンジンに取り付ける
+    /// （待たない。まだなら次の変換で再確認する）
+    fn attach_pending_judge(&mut self) {
+        let Some(rx) = self.pending_judge.as_ref() else { return };
+        match rx.try_recv() {
+            Ok(judge) => {
+                if let (Some(judge), Some(conv)) = (judge, self.converter.as_mut()) {
+                    conv.set_judge(Some(judge));
+                }
+                self.pending_judge = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.pending_judge = None,
         }
     }
 
@@ -1447,18 +1472,27 @@ impl LiveConversionState {
                 // ディレクトリの judge_lm.bin があれば読み込む。無効化は
                 // 環境変数 IME_JUDGE=0、またはファイルを消す/リネームするだけ
                 // （無ければ従来の変換と完全に同じ動作）。
-                if let Some(conv) = self.converter.as_mut() {
-                    let judge_path = path.with_file_name("judge_lm.bin");
-                    if judge_enabled() && judge_path.exists() {
-                        match crate::judge::JudgeLm::load(&judge_path) {
-                            Ok(judge) => {
-                                debug_log!("判断層を読み込みました: {:?}", judge);
-                                conv.set_judge(Some(std::sync::Arc::new(judge)));
-                            }
-                            Err(e) => {
-                                debug_log!("判断層の読み込みに失敗（従来の変換で続行）: {}", e);
-                            }
+                self.pending_judge = None;
+                let judge_path = path.with_file_name("judge_lm.bin");
+                if judge_enabled() && judge_path.exists() {
+                    let load = move || match crate::judge::JudgeLm::load(&judge_path) {
+                        Ok(judge) => {
+                            debug_log!("判断層を読み込みました: {:?}", judge);
+                            Some(std::sync::Arc::new(judge))
                         }
+                        Err(e) => {
+                            debug_log!("判断層の読み込みに失敗（従来の変換で続行）: {}", e);
+                            None
+                        }
+                    };
+                    if self.load_judge_async {
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        std::thread::spawn(move || {
+                            let _ = tx.send(load());
+                        });
+                        self.pending_judge = Some(rx);
+                    } else if let (Some(judge), Some(conv)) = (load(), self.converter.as_mut()) {
+                        conv.set_judge(Some(judge));
                     }
                 }
                 // ユーザー登録の単語を辞書へ注入（辞書に無い複合語を変換可能に）
@@ -1701,6 +1735,7 @@ impl LiveConversionState {
     /// 末尾だけ更新できる。旧実装(毎回全削除→再挿入)は cursor が頻繁に左に飛び、
     /// 視覚的に「後の入力が前を上書きする」ように見える原因だった。
     pub fn update_conversion(&mut self) -> Option<ConversionAction> {
+        self.attach_pending_judge();
         // ひらがなバッファのみを漢字変換
         // ローマ字バッファはそのまま末尾に追加
         let converted_hiragana = if self.converter.is_none() {

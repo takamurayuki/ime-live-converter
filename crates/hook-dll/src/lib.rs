@@ -93,6 +93,9 @@ pub extern "C" fn install_hook() -> bool {
         let mut state = LiveConversionState::new();
         // 確定時の学習（DB書き込み）はフックの外（メッセージループ）で処理する
         state.defer_learning = true;
+        // 判断層（judge-lm）の大きなモデルはバックグラウンドで読み込む
+        // （辞書ロード中のロック保持時間を延ばさない）
+        state.load_judge_async = true;
         // `common`crateはWin32非依存のため、遅延通知の実手段（PostMessageW）を
         // 持たない。実運用（フック配送）ではここで注入する。
         state.request_deferred_learning = Some(popup::request_deferred_learning);
