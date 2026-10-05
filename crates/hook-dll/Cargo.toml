@@ -19,6 +19,8 @@ windows = { version = "0.58", features = [
     "Win32_UI_Controls",
     "Win32_UI_Controls_Dialogs",
     "Win32_UI_Shell_Common",
+    "Win32_System_SystemInformation",
+    "Win32_Security",
 ] }
 
 common = { path = "../common" }
@@ -30,3 +32,9 @@ serial_test = "3"
 
 [lib]
 crate-type = ["cdylib"]
+
+[features]
+# フックスレッド分離の効果を証明するA/B実験専用。有効時のみWM_PAINTに
+# 人工的な遅延を注入する（crates/hook-dll/src/popup.rs）。通常ビルドには
+# 物理的に含まれないため、revert忘れが事故にならない。
+ab_proof = []

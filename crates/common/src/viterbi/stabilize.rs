@@ -135,6 +135,19 @@ impl ViterbiConverter {
                 .any(|&idx| node_matches(&lattice.nodes[idx], s, t, e));
             if !exists {
                 lattice.add_word(s, t, e.clone());
+                // `build_lattice`は学習ユニグラムボーナスをノード生成後に
+                // 一括で埋めるが、ここで追加するノードはそのタイミングより
+                // 後に生えるため素通りしてしまう。`find_best_path`の断片化
+                // 防止ガード群は`learned_bonus`だけを見て学習の関与を判定
+                // するため、ここで埋め忘れるとガードが素通りしてしまう。
+                if !self.learned_unigram.is_empty() {
+                    let idx = lattice.nodes.len() - 1;
+                    lattice.nodes[idx].learned_bonus = self
+                        .learned_unigram
+                        .get(&(e.reading.clone(), e.surface.clone()))
+                        .copied()
+                        .unwrap_or(0);
+                }
             }
         }
 
@@ -179,6 +192,7 @@ impl ViterbiConverter {
             return self.convert_context_aware(reading);
         }
         let base = self.convert_with_pinned_prefix(reading, pinned);
+        let base = self.rerank_by_seeded_collocation_from(base, n);
         self.rerank_by_assoc_from(base, n)
     }
 }

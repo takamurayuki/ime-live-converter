@@ -356,6 +356,15 @@ fn contains_kanji(surface: &str) -> bool {
         .any(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c) || ('\u{3400}'..='\u{4DBF}').contains(&c))
 }
 
+/// 表記がちょうど1文字の漢字か（`common::viterbi::is_single_kanji_surface`と同じ判定）。
+fn is_single_kanji_surface(surface: &str) -> bool {
+    let mut chars = surface.chars();
+    let (Some(c), None) = (chars.next(), chars.next()) else {
+        return false;
+    };
+    ('\u{4E00}'..='\u{9FFF}').contains(&c) || ('\u{3400}'..='\u{4DBF}').contains(&c)
+}
+
 /// カタカナ表記が同一読みの漢字表記より辞書コストで勝ってしまう構造的な
 /// 誤変換（カテゴリC）を辞書構築時に機械的に補正する。
 ///
@@ -608,6 +617,18 @@ fn feature_pos(feature: &str) -> &str {
 /// バイグラムは文（。！？で区切る）をまたがない。記号・空白トークンは
 /// 集計対象にせず、直後のバイグラムの「前」もリセットする（不自然な
 /// 語同士の結びつきを学習しないため）。
+///
+/// 表記が1文字の漢字（居・挙・雨 等）も同様に対象外にする。これらは単独の
+/// 語として使われることは稀で、実際には「住居」「選挙」「豪雨」のような
+/// 2文字以上の複合語の一部として（分かち書き結果としては別トークンに
+/// 割れて）現れる頻度がコーパス中で積み上がる。この頻度をそのまま
+/// unigram/bigramボーナスにすると、「きょう」→「挙」(きょ)+「雨」(う)の
+/// ような無関係な1文字漢字どうしの組み合わせが、その合算頻度のおかげで
+/// 「今日」より安く見えてしまう（実測: Wikipediaコーパスで発生・修正済み。
+/// 旧仮名遣い「て居る」で同型の問題が起きた青空文庫コーパスの件と同根）。
+/// 1文字漢字語のコスト調整は既存の専用の仕組み
+/// （`COMMON_WORD_SEED`・`fragment_repair.rs`・`single_kanji_penalty`）に
+/// 任せ、コーパスLMでは対象にしない。
 fn tokenize_and_aggregate(
     tokenizer: &vibrato::Tokenizer,
     text: &str,
@@ -645,6 +666,30 @@ fn tokenize_and_aggregate(
                 continue;
             }
             let surface = t.surface().to_string();
+            // 表記が読みと同じ（＝助詞・助動詞・活用語尾等のひらがなそのまま）
+            // トークンは対象外にする。「に」「は」「を」等の助詞は文中に
+            // 極端な頻度で出現するため、頻度上限（CORPUS_UNIGRAM_BONUS_CAP）
+            // に張り付いた巨大なユニグラムボーナスを持ってしまう。IPA辞書には
+            // 稀に「ほん」（表記もひらがな、cost=8423）のように読みと表記が
+            // 同じ内容語エントリが実在しており、これが本来の「本」より安く
+            // なって変換全体が崩壊した（実測）。ライブ変換の個人学習
+            // （`learn_from_segments`の`if reading == surface { continue; }`）
+            // と同じ理由・同じ対処。
+            //
+            // 加えて `common::is_learnable_pair` も適用する。助詞の読みが
+            // 別表記に化けたもの（に→二）、1文字読みの別表記への変化
+            // （み→ミ、ず→図）、短い読みのカタカナ化（ほん→ホン）は、
+            // 個人学習で誤変換の強化を防ぐために既に除外している対象と
+            // 全く同じ理由でコーパス集計からも除外する必要がある
+            // （実測: これらを素通りさせると「日本」が「二ホン」に、
+            // 「水を飲んだ」が「ミ図を飲んだ」に化けた）。
+            if surface == reading
+                || is_single_kanji_surface(&surface)
+                || !common::is_learnable_pair(&reading, &surface)
+            {
+                prev_surface = None;
+                continue;
+            }
             *unigrams.entry((reading, surface.clone())).or_insert(0) += 1;
             if let Some(prev) = prev_surface.take() {
                 *bigrams.entry((prev, surface.clone())).or_insert(0) += 1;
@@ -817,7 +862,14 @@ fn main() -> Result<()> {
             for path in &files {
                 pb.set_message(format!("{}", path.file_name().unwrap_or_default().to_string_lossy()));
                 let bytes = fs::read(path)?;
-                let text = clean_aozora_html(&bytes);
+                // .html は青空文庫形式（Shift-JIS＋ルビ付きXHTML）を想定して専用の
+                // クリーニングを通す。.txt は現代語コーパス（Wikipedia文抽出等）を
+                // 想定し、既にUTF-8のプレーンテキスト（1行1文）としてそのまま使う。
+                let text = if path.extension().map_or(false, |e| e == "html") {
+                    clean_aozora_html(&bytes)
+                } else {
+                    String::from_utf8_lossy(&bytes).into_owned()
+                };
                 tokenize_and_aggregate(&tokenizer, &text, &mut unigrams, &mut bigrams);
                 pb.inc(1);
             }

@@ -1,0 +1,107 @@
+# ゴールデンテスト: 一般精度コーパス（日常文）。
+# 1行 = 1ケース、タブ区切りで「ローマ字入力<TAB>期待される確定後の表記」。
+# `#`始まりの行はコメント、空行は無視。
+#
+# 初回実装時に実際の出力をそのまま記録した「スナップショット」であり、
+# golden_tests.rs の GENERAL_ACCURACY_FLOOR を下回ったら退行とみなす
+# （100%固定ではない。今後継続的にケースを追加していく）。
+
+kyouhaiitenkidesune	今日はいい天気ですね
+ashitakaigidesu	明日会議です
+# 現状「は→羽」「わ→輪」に誤変換される（未修正の既知の精度課題として
+# そのまま記録。スナップショット方式のため、直ったら期待値を更新すること）。
+sorewaomoshiroiwadesune	それ羽面白い輪ですね
+kanojohaeigogatokuidesu	彼女は英語が得意です
+# 現状「ご飯→５版」に誤変換される（未修正の既知の精度課題）。
+kyounoyorugohangotabemashitaka	今日の夜５版後食べましたか
+densyagaokuretekiteimasu	電車が遅れてきています
+konokikakuhajissainiokonawaremasu	この企劃は実際に行なわれます
+# 以前は「来週→来襲」に誤変換されていたが、load_dictionaryの
+# word_priority.tsv読み込み順序バグ修正（reload_learning_into_converterより
+# 前に読んでいたため直後にclear_learningで消えていた）により、学習を
+# 無効化した状態で正しく「来週」になることを確認済み。
+raishuunokayoubinihanashiaimasyou	来週の火曜日に話し合いましょう
+shigotogaowattaradenwashimasu	仕事が終わったら電話します
+atarashiipasokonwokaimashita	新しいパソコンを買いました
+kanojotohanashiaimashita	彼女と話し合いました
+
+# --- 同音異義語: せいさく（制作/製作/政策） ---
+eigawoseisakusuru	映画を制作する
+# 「製作」と出ても不自然ではないが、現状は「制作」になる（どちらも
+# 実在語で文脈依存の曖昧さ。誤りと断定できないためそのまま記録）。
+jidoushawoseisakusuru	自動車を制作する
+# 2026-09-13にword_assoc.tsv（隣接コロケーションシード、
+# [[homophone-selection-is-not-fixable-without-lm]]）で修正。「経済」が
+# 隣接すると「政策」を優先する。「映画を制作する」等の非隣接文脈は無影響
+# （eigawoseisakusuru/jidoushawoseisakusuruが変わっていないことで確認済み）。
+keizaiseisakunitsuitehanasu	経済政策について話す
+
+# --- 同音異義語: かたい（硬い/固い/堅い） ---
+# 現状「石」ではなく「医師」になる（既知の精度課題）。
+kataiishiwohirou	硬い医師を拾う
+# 「硬い決意」「固い決意」はどちらも実在するが現状は「硬い」（そのまま記録）。
+kataiketsuiwosuru	硬い決意をする
+# 2026-09-13にword_assoc.tsvで修正。「仕事」が隣接すると「堅い」を優先する。
+# 「つく→就く」（正しくは仕事に就く）は別の同音異義語グループで未対応。
+kataishigotonitsuku	堅い仕事に付く
+
+# --- 同音異義語: はやい（早い/速い） ---
+# 現状「朝」が単独では漢字にならずカタカナ「アサ」になる（既知の精度課題）。
+asahayakuokiru	アサ早く起きる
+# 「くるま→車」は2026-09-13にCOMMON_WORD_SEED+個別ボーナスで修正済み
+# （クルマ→車、コスト差3288を強めのユニグラムボーナスで解消）。
+# 「早い→速い」も同日、word_assoc.tsvで修正（「車」が隣接すると「速い」を
+# 優先する）。
+hayaikurumagahashiru	速い車が走る
+
+# --- 同音異義語: その他 ---
+# 現状「満点/取れる」ではなく「万点/採れる」になる（既知の精度課題）。
+shikendemantenwotoreru	試験で万点を採れる
+# 「つづく」の正しいローマ字は"tsu"ではなく"du"（つ→tsu、づ→du）。
+atatakaihigatsuduku	温かい日が続く
+# 現状「暑い」ではなく「篤い」になる（既知の精度課題）。
+atsuihigatsuduku	篤い日が続く
+
+# --- 送り仮名 ---
+# 「行う」「行なう」はどちらも実在する送り仮名バリエーション。
+kaigiwookonau	会議を行なう
+# 現状「表す」ではなく「著す」になる（既知の精度課題。文脈上は明確に誤り）。
+kimochiwoarawasu	気持ちを著す
+kikennwotomonau	危険を伴う
+nimotsuwouketoru	荷物を受け取る
+keikakuwominaosu	計画を見直す
+shiryouwomitsukeru	資料を見つける
+mondaiwokangaeru	問題を考える
+
+# --- 数字＋助数詞（ひらがな綴りの数詞。同音異義語の精度課題を記録） ---
+# 現状「3人」ではなく国会の「参院」になる（既知の精度課題）。
+sanninnohitogairu	参院おヒトが居る
+# 現状「猫」ではなくカタカナ「ネコ」になる（既知の精度課題）。
+nihikinoneko	二匹のネコ
+
+# --- カタカナ語（長音は"-"で入力） ---
+konpyu-ta-wokau	コンピューターを買う
+suma-tofonwotsukau	スマートフォンを使う
+inta-nettonisetsuzokusuru	インターネットに接続する
+dezainwokangaeru	デザインを考える
+puroguramuwosakuseisuru	プログラムを作成する
+repo-towomatomeru	レポートを纏める
+mi-thinngu	ミーティング
+
+# --- 隣接コロケーションシード（word_assoc.tsv）関連のテストケースは
+# golden/collocations.tsv に分離した（量産で件数が増え続けるため、
+# 安定した日常文コーパスであるこのファイルとは分けて管理する）。
+# [[seeded-adjacent-collocation]]参照。
+
+# --- 記号混じり（数字はローマ字と別に直接入力する） ---
+kaigiha10jikaradesu	会議は10時からです
+# 現状「円」ではなく「炎」になる（既知の精度課題）。
+kakakuha500endesu	価格は500炎です
+
+# --- 長文（文節分割が壊れやすい） ---
+# 長文になるほど文節分割が崩れやすい既知の課題（[[long-input-drift-pinned-prefix]]）。
+# 「整理し」以降が想定と大きく異なる分解になる（既知の精度課題として記録）。
+kyounokaigidehanashiaunaiyouwoarakajimeseirishiikennwokoukanshiteokitai	今日の会議で話し合う内容を予め整理思惟圏を交歓しておきたい
+# 現状「参加する」ではなく「酸化する」になり、「どうか」も[[adverb-particle-bigram-pollution]]
+# で既知の「同化」誤変換になる（既知の精度課題2件がここに集中している）。
+raigetsukaisaisareruibentonisankasurukadoukahamadakimatteimasenga	来月開催されるイベントに酸化するか同化はまだ決まっていませんが

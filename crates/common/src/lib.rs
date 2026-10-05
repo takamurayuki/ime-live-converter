@@ -4,10 +4,11 @@ pub mod serialization;
 pub mod candidate;
 pub mod composition;
 pub mod typo;
-pub mod converter;
 pub mod learning;
 pub mod rerank;
 pub mod corpus_lm;
+pub mod brackets;
+pub mod conversion;
 
 pub use dictionary::{Dictionary, WordEntry, TrieNode, ConnectionMatrix, CharCategory, PosId};
 pub use corpus_lm::CorpusLm;
@@ -15,11 +16,92 @@ pub use viterbi::{ViterbiConverter, LiveConversionContext, Lattice, LatticeNode,
 pub use candidate::{Candidate, CandidateKind, hiragana_to_katakana, katakana_to_hiragana};
 pub use composition::{CompositionState, InputContext, should_auto_convert};
 pub use typo::{TypoCorrector, TypoCandidate};
-pub use converter::{LiveConverter, ConversionResult};
 pub use learning::{LearningRepository, UserDictEntry, ConversionHistoryEntry};
 pub use rerank::{CandidateReranker, NoopReranker};
+pub use conversion::{LiveConversionState, ConversionAction, PredictionLearning};
 
 use std::collections::HashMap;
+
+/// デバッグログ有効判定（`IME_DEBUG_LOG=1` のときのみ）。
+///
+/// このログはキー入力由来の内容を平文でファイルに残しうるため
+/// （パスワード入力も含まれ得る）、既定では完全に無効。調査時のみ
+/// `IME_DEBUG_LOG=1` で起動して有効化すること。
+///
+/// 元は`hook-dll`側にあったが、`LiveConversionState`（`conversion`モジュール）
+/// を`common`へ移設した際、そこからの`debug_log!`呼び出しを成立させるために
+/// こちらへ移した（`hook-dll`側は`pub(crate) use common::debug_log;`で
+/// 再公開し、既存の呼び出し箇所は無変更のまま動く）。
+pub fn debug_log_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("IME_DEBUG_LOG").map(|v| v == "1").unwrap_or(false)
+    })
+}
+
+// デバッグログ（UTF-8 BOM付きで出力、IME_DEBUG_LOG=1 のときのみ）。
+// `$crate::debug_log_enabled()`にしているのは、このマクロが他クレート
+// （`hook-dll`）で展開されたときも常に「このクレート（common）自身の」
+// `debug_log_enabled`を指すようにするため（マクロ衛生規則。単に
+// `crate::debug_log_enabled()`と書くと、展開先クレートのcrateルートを
+// 指してしまい解決に失敗する）。
+#[macro_export]
+macro_rules! debug_log {
+    ($($arg:tt)*) => {
+        if $crate::debug_log_enabled() {
+            use std::io::Write;
+            let path = "C:\\Projects\\ime-live-converter\\hook_debug.log";
+            let needs_bom = !std::path::Path::new(path).exists();
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                if needs_bom {
+                    let _ = file.write_all(&[0xEF, 0xBB, 0xBF]);
+                }
+                let _ = writeln!(file, "[IME] {}", format!($($arg)*));
+            }
+        }
+    };
+}
+
+/// この (読み, 表記) ペアを学習・コーパス集計してよいか
+///
+/// 誤学習・コーパス汚染で変換が悪化するのを防ぐガード（`hook-dll`の個人学習
+/// `crates/dict-builder`のコーパスLM集計の両方から共通で使う）:
+/// - 助詞の読み（に・は・を 等）が漢字/数字に化けたもの（例 に→二）は対象外。
+///   助詞は常に既定表記であるべき。
+/// - 英数字を含む表記（旧ローマ字バグ由来のゴミ等）は対象外。
+/// - 1文字の読み→別表記は曖昧すぎる断片（例: じ→時、み→ミ）なので対象外。
+/// - 短い読みの「その読みのカタカナ化」（例: かん→カン）はカタカナ・
+///   フォールバックの断片なので対象外。
+pub fn is_learnable_pair(reading: &str, surface: &str) -> bool {
+    // 助詞・助動詞になりうる短い仮名の読み（これらが漢字化したら誤り）
+    const PARTICLE_READINGS: &[&str] = &[
+        "に", "は", "を", "へ", "が", "の", "と", "も", "や", "か",
+        "で", "ね", "よ", "わ", "し", "ば", "な", "ぞ", "さ",
+    ];
+    if PARTICLE_READINGS.contains(&reading) && surface != reading {
+        return false;
+    }
+    // 英数字混じりの表記は対象外（ゴミ・未変換ローマ字）
+    if surface.chars().any(|c| c.is_ascii_alphanumeric()) {
+        return false;
+    }
+    let reading_len = reading.chars().count();
+    // 1文字の読み→別表記は曖昧すぎる断片（例: じ→時）。誤変換の
+    // 学習ループを招くので対象外。
+    if reading_len == 1 && surface != reading {
+        return false;
+    }
+    // 短い読みを「その読みのカタカナ化」として対象外にする（例: かん→カン）。
+    // これはカタカナ・フォールバックの断片で、誤変換を強化してしまう。
+    if reading_len <= 3 && surface == hiragana_to_katakana(reading) {
+        return false;
+    }
+    true
+}
 
 /// ローマ字→ひらがな変換マッピング
 pub struct RomajiConverter {

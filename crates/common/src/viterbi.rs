@@ -1,6 +1,8 @@
 use crate::candidate::hiragana_to_katakana;
 use crate::dictionary::{Dictionary, WordEntry, PosId};
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 mod fragment_repair;
 mod incremental;
@@ -20,8 +22,19 @@ pub use stabilize::*;
 /// Viterbi変換エンジン
 #[derive(Debug)]
 pub struct ViterbiConverter {
-    /// 辞書
-    pub dictionary: Dictionary,
+    /// 基底辞書（IPA辞書等、巨大で不変）。`Arc`で共有し、インスタンスごとに
+    /// 深いコピーをしない（[[dictionary-arc-sharing]]参照。以前は
+    /// `ViterbiConverter::new`のたびに数百MB規模のTrieを丸ごとクローンして
+    /// おり、ゴールデンテストのようにケースごとに新規インスタンスを作る
+    /// 用途で1回あたり300〜400msかかっていた）。
+    pub dictionary: Arc<Dictionary>,
+    /// 上乗せ辞書（ユーザー辞書・自動登録複合語・`seed_common_words`由来の
+    /// 追加語）。基底辞書と違って小さく、インスタンスごとに独立して持つ
+    /// 必要があるため`Arc`化しない。`add_word`/`remove_word`は必ずこちらに
+    /// 対して行う（基底は不変のため書き込めない）。検索時は
+    /// `merged_lookup`/`merged_prefix_search`/`merged_fuzzy_readings`が
+    /// 両方を引いて合成する。
+    pub overlay: Dictionary,
     /// 未知語のデフォルト品詞ID
     pub unknown_id: PosId,
     /// 未知語のコスト
@@ -63,6 +76,10 @@ pub struct ViterbiConverter {
     /// アロケーションになる。まず &str でこの集合を引き、無ければ
     /// キーを作らずに済ませる。
     bigram_prev_surfaces: std::collections::HashSet<String>,
+    /// `corpus_bigram` 版の `bigram_prev_surfaces`（`load_corpus_lm`が
+    /// 丸ごと差し替える専用フィールドなので、`learned_bigram`側のように
+    /// 個別の学習操作で再構築する必要が無く別枠にしている）。
+    corpus_bigram_prev_surfaces: std::collections::HashSet<String>,
     /// 学習した内容語の連想: (前の内容語, 次の内容語) → スコア
     ///
     /// 助詞・助動詞を飛ばした「内容語どうしの結びつき」。
@@ -108,10 +125,38 @@ pub struct ViterbiConverter {
     pub corpus_unigram: HashMap<(String, String), i32>,
     /// コーパス由来のバイグラム: (前の表記, 次の表記) → 接続コスト減額
     pub corpus_bigram: HashMap<(String, String), i32>,
+    /// 隣接コロケーションのシード: (語, 隣接語) → ボーナス（両方向で登録）
+    ///
+    /// `learned_assoc`は「駅の汽車／新聞の記者」のように助詞を挟んで離れた
+    /// 内容語どうしの結びつきを見る設計で、直前・直後（助詞すら挟まない
+    /// 隣接語）は明示的に除外している（[[rerank_by_assoc_from]]のコメント
+    /// 参照。ユーザーの実学習ノイズが隣接語まで波及すると「際」×「起動」の
+    /// ような誤った複合語読みを誘発するため）。
+    ///
+    /// しかし「経済＋政策」「かたい＋仕事」「はやい＋くるま」のような
+    /// 複合名詞・形容詞＋名詞の同音異義語選択は、まさにその除外された
+    /// 隣接構造でしか起きない。`learned_assoc`とは別枠にすることで、
+    /// 学習側の安全設計（隣接語除外）に一切手を触れずに、事前に精査した
+    /// 少数のコロケーションだけを隣接語にも適用できる
+    /// （[[homophone-selection-is-not-fixable-without-lm]]参照）。
+    pub seeded_assoc: HashMap<(String, String), i32>,
 }
 
 impl ViterbiConverter {
+    /// 辞書を所有権ごと受け取り、内部で`Arc`に包む。呼び出し側で`Arc`を
+    /// 共有したい場合（同じ基底辞書でインスタンスを何度も作る、
+    /// [[golden-test-harness]]のようなケース）は`from_shared`を使うこと。
     pub fn new(dictionary: Dictionary) -> Self {
+        Self::from_shared(Arc::new(dictionary))
+    }
+
+    /// 既に`Arc`化された基底辞書を共有してインスタンスを作る。基底辞書は
+    /// 一切クローンしないため、同じ`Arc<Dictionary>`から何個作っても
+    /// `Dictionary::clone()`のコスト（実測300〜400ms/回、Trie全体の
+    /// 深いコピー）は1回も発生しない。上乗せ辞書（`overlay`）は各
+    /// インスタンスが独立して持つ（ユーザー辞書等はインスタンスごとに
+    /// 違いうるため）。
+    pub fn from_shared(dictionary: Arc<Dictionary>) -> Self {
         // カタカナ候補・未知語ノードに使う文脈IDは、辞書に実在する
         // 一般名詞のIDを流用する。文脈ID体系は辞書ごとに異なる
         // （sample=1, IPA辞書の名詞一般=1285 など）ため、固定値では
@@ -131,6 +176,7 @@ impl ViterbiConverter {
 
         let mut conv = Self {
             dictionary,
+            overlay: Dictionary::new(),
             unknown_id: noun_id,
             unknown_cost: 10000, // 未知語は高コスト
             katakana_pos_id: noun_id,
@@ -148,19 +194,128 @@ impl ViterbiConverter {
             learned_unigram: HashMap::new(),
             learned_bigram: HashMap::new(),
             bigram_prev_surfaces: std::collections::HashSet::new(),
+            corpus_bigram_prev_surfaces: std::collections::HashSet::new(),
             learned_assoc: HashMap::new(),
             learned_hiragana: HashMap::new(),
             trusted_phrase_bonus: HashMap::new(),
             typo_corrections: HashMap::new(),
             corpus_unigram: HashMap::new(),
             corpus_bigram: HashMap::new(),
+            seeded_assoc: HashMap::new(),
         };
         conv.seed_common_words();
         conv
     }
 
     /// 頻出語プリセットを learned_unigram に薄く入れる（初回変換の品質向上）
+    /// 読みで単語を検索する（基底辞書＋上乗せ辞書の合成）。
+    ///
+    /// 上乗せ辞書にこの読みのエントリが無ければ、基底辞書の借用をそのまま
+    /// 返す（`Cow::Borrowed`、クローン無し＝これまでの`self.dictionary.lookup`
+    /// と全く同じコスト）。上乗せ辞書にエントリがある場合（ユーザー辞書・
+    /// 自動登録複合語・`seed_common_words`由来の追加語）だけ、両方を
+    /// 連結した新しい`Vec`を作る（`Cow::Owned`）。この分岐により、
+    /// 上乗せ辞書が空（大多数のケース）ではホットパスの性能が変わらない。
+    pub fn merged_lookup(&self, reading: &str) -> Option<Cow<'_, [WordEntry]>> {
+        let overlay_hit = self.overlay.lookup(reading);
+        match overlay_hit {
+            None => self
+                .dictionary
+                .lookup(reading)
+                .map(|v| Cow::Borrowed(v.as_slice())),
+            Some(overlay_entries) => {
+                let mut merged: Vec<WordEntry> = self
+                    .dictionary
+                    .lookup(reading)
+                    .map(|v| v.clone())
+                    .unwrap_or_default();
+                merged.extend(overlay_entries.iter().cloned());
+                Some(Cow::Owned(merged))
+            }
+        }
+    }
+
+    /// プレフィックス検索（基底辞書＋上乗せ辞書の合成）。
+    ///
+    /// `merged_lookup`と同じ考え方: 上乗せ辞書がそもそも空（`is_empty`、
+    /// ユーザー辞書登録も`seed_common_words`の追加も無い状態）なら基底の
+    /// 結果をそのまま借用で返す（`build_lattice`のホットパスで1文字ごとに
+    /// 呼ばれるため、ここの分岐が最も重要）。上乗せ辞書に何かあっても
+    /// この読み出しに一致が無ければ同様に借用のまま返す。両方に一致が
+    /// あるプレフィックス長だけ、その長さの分だけ結合した`Vec`を作る。
+    pub fn merged_prefix_search(&self, text: &str) -> Vec<(usize, Cow<'_, [WordEntry]>)> {
+        let base_hits = self.dictionary.common_prefix_search(text);
+        if self.overlay.is_empty() {
+            return base_hits
+                .into_iter()
+                .map(|(len, v)| (len, Cow::Borrowed(v.as_slice())))
+                .collect();
+        }
+        let overlay_hits = self.overlay.common_prefix_search(text);
+        if overlay_hits.is_empty() {
+            return base_hits
+                .into_iter()
+                .map(|(len, v)| (len, Cow::Borrowed(v.as_slice())))
+                .collect();
+        }
+        let mut by_len: std::collections::BTreeMap<usize, Vec<WordEntry>> =
+            std::collections::BTreeMap::new();
+        for (len, v) in &base_hits {
+            by_len.entry(*len).or_default().extend(v.iter().cloned());
+        }
+        for (len, v) in &overlay_hits {
+            by_len.entry(*len).or_default().extend(v.iter().cloned());
+        }
+        by_len
+            .into_iter()
+            .map(|(len, v)| (len, Cow::Owned(v)))
+            .collect()
+    }
+
+    /// 編集距離によるあいまい読み検索（基底辞書＋上乗せ辞書の合成）。
+    pub fn merged_fuzzy_readings(&self, target: &str, max_dist: usize) -> Vec<(String, usize)> {
+        let mut results = self.dictionary.fuzzy_readings(target, max_dist);
+        if !self.overlay.is_empty() {
+            results.extend(self.overlay.fuzzy_readings(target, max_dist));
+        }
+        results
+    }
+
     fn seed_common_words(&mut self) {
+        // IPA/追加辞書に欠ける定型語。地名「コ・コン」のコストを全体で
+        // 変えるのではなく「古今東西」の読み全体に一致する候補を補う。
+        // 既存判定は基底＋上乗せ両方を見る（`merged_lookup`）。上乗せだけ
+        // 見ると`clear_learning`経由でこの関数が再度呼ばれたときに
+        // 二重登録してしまう（基底＝Arc共有・不変は変化しないため、
+        // 上乗せに前回追加済みでも基底だけ見ると「無い」と誤判定する）。
+        if !self.merged_lookup("ここんとうざい")
+            .is_some_and(|entries| entries.iter().any(|e| e.surface == "古今東西"))
+        {
+            self.overlay.add_word(WordEntry {
+                reading: "ここんとうざい".into(), surface: "古今東西".into(),
+                left_id: 1285, right_id: 1285, cost: 3000,
+                pos: "名詞-一般-*-*".into(),
+            });
+        }
+        // 「メモ帳」も辞書に複合語として無く、「帳」が接尾辞（付属語向けの
+        // 高いコスト）でしか登録されていないため、単独名詞の「チョウ」に
+        // 負けて「めも帳/眼も寵」のように割れる。読み全体に一致する複合語
+        // を直接補う。
+        if !self.merged_lookup("めもちょう")
+            .is_some_and(|entries| entries.iter().any(|e| e.surface == "メモ帳"))
+        {
+            self.overlay.add_word(WordEntry {
+                reading: "めもちょう".into(), surface: "メモ帳".into(),
+                left_id: 1285, right_id: 1285, cost: 3000,
+                pos: "名詞-一般-*-*".into(),
+            });
+        }
+        // 謝罪の定型表現を「ゴメン＋な＋際」に分割しない。
+        // 分割語の個人学習で接続込みコストが負になるため通常の0下限では不足する。
+        self.trusted_phrase_bonus
+            .insert(("ごめんなさい".to_string(), "ごめんなさい".to_string()), 12000);
+        self.trusted_phrase_bonus
+            .insert(("だれ".to_string(), "誰".to_string()), 5000);
         for &(reading, surface) in COMMON_WORD_SEED {
             self.learned_unigram
                 .entry((reading.to_string(), surface.to_string()))
@@ -180,6 +335,13 @@ impl ViterbiConverter {
         // 負ける（うしろ→ウシ炉）ため強めに優先する。
         self.learned_unigram
             .insert(("うしろ".to_string(), "後ろ".to_string()), 4000);
+        // 「車」はIPA辞書で単独名詞としてのコストが高く(6918)、同じ読みの
+        // カタカナ表記「クルマ」(3630、コスト差3288)に負ける。COMMON_WORD_SEED
+        // の一律1500では足りないため個別に強めのボーナスを設定する
+        // （はやいくるまがはしる→速い車が走る、で発覚。[[correction-cascade-unification]]
+        // の精度課題調査の一環）。
+        self.learned_unigram
+            .insert(("くるま".to_string(), "車".to_string()), 4000);
         // 「文章」は「文書(ぶんしょ,超低コスト1432)＋う」の分割に負けやすい
         // （ぶんしょう→文書雨/文書う）ため強めに優先する。
         self.learned_unigram
@@ -206,6 +368,28 @@ impl ViterbiConverter {
         // 「お腹/電車が空いている」のように圧倒的に高頻度な語なので優先する。
         self.learned_unigram
             .insert(("すい".to_string(), "空い".to_string()), 2500);
+        // 「本」「線」は通常のプリセットボーナス(1500)では、辞書のカタカナ
+        // 表記「ホン」「セン」（固有名詞-人名-姓としても実在）や1文字漢字
+        // への断片化に負ける（実測: 本を読んだ→ホンを読んだ、線を弾いた→
+        // センを弾いた）。カタカナ表記全般へのペナルティは「めも→眼も」の
+        // ような別の実在語まで壊す（コスト差だけでは正当な外来語と区別
+        // できない）ため見送り、代わりにこの2語だけ強めに優先する。
+        self.learned_unigram.insert(("ほん".to_string(), "本".to_string()), 3000);
+        // 「線」は「本」と同様の断片化(せ+ん)を狙ってボーナスを試したが、
+        // 「新幹線」のような複合語の内部分解を壊す新たな副作用が出た上、
+        // 断片化自体も解消しきれなかった（残る接続コスト差がさらに大きい）
+        // ため、このボーナスは見送る（[[atomic-word-particle-connection-quirk]]
+        // 参照。せんをひいた→線を弾いた、は既知の未解決課題として残す）。
+        // 「いっ」（行くの音便形）は「いってらっしゃい/いってきます/
+        // いってしまった」のように後続の補助動詞（らっしゃる・くる・しまう
+        // 等）ごとに「て」以降の接続コストが変わり、通常のユニグラム
+        // ボーナス（0未満不可）では稀な同音動詞「逝っ」に勝ちきれない
+        // 組み合わせが複数ある（実測: 補助動詞が続く文頭の「いって」で
+        // 顕著）。行くは日常会話で圧倒的に高頻度、逝くは文語的・訃報等の
+        // 限定的な場面でしか使わないため、`trusted_phrase_bonus`で
+        // 0未満まで割り引いて確実に優先する。
+        self.trusted_phrase_bonus
+            .insert(("いっ".to_string(), "行っ".to_string()), 15000);
         // 「いちがい」も、「位置」（無関係な文脈で単語コストが学習ボーナスで
         // ほぼ0まで下がりやすい）+「が」+「胃」の分割（合計コストが正だが
         // 「一概」の生コストより低くなり得る）に負けやすい。「位置」は
@@ -273,6 +457,28 @@ impl ViterbiConverter {
         self.learned_hiragana
             .entry("したい".to_string())
             .or_insert(COMMON_WORD_SEED_BONUS);
+        // 「どうか」は辞書に副詞としての実在エントリがある（cost=6752）ので
+        // 合成ひらがなノードではなく通常のユニグラムボーナス経路で優先する。
+        // 漢字表記「同化」（同化政策・文化の同化 等）は限定的な場面でしか
+        // 使わないのに対し、「どうか」（お願い・様子伺い・〜かどうか の
+        // 一部）は圧倒的に高頻度。学習が無い状態でも「同化」が既定で
+        // 選ばれてしまう（実測: どうかしましたか→同化しましたか、
+        // どうかしている→同化している）。「同化」がサ変接続名詞として
+        // 「し」に直接続く接続コストが本来かなり有利なため、通常の
+        // ユニグラムボーナス（0未満不可floor）では勝ちきれず、「問題ない」
+        // 「水曜」と同様に0未満まで割り引ける trusted_phrase_bonus を使う
+        // （[[adverb-particle-bigram-pollution]]の未修正事例）。
+        self.trusted_phrase_bonus
+            .insert(("どうか".to_string(), "どうか".to_string()), 8000);
+        // 「いくらか」（幾らか、「いくらかもらった」等）が単独/文末では
+        // 「イクラ」（cost=3261、いくら/幾ら と同じ品詞クラス）+「か」に
+        // 分割されてしまう（実測: いくらか→イクラか）。「いくらか」が
+        // 後続語を伴う場合（いくらかもらった 等）は既に辞書本来のコストで
+        // 正しく選ばれるため、この場合だけ通常のユニグラムボーナスで
+        // 十分（0未満不可floorで足りる、trusted_phrase_bonusは不要）。
+        self.learned_unigram
+            .entry(("いくらか".to_string(), "幾らか".to_string()))
+            .or_insert(COMMON_WORD_SEED_BONUS);
     }
 
     /// 優先語彙ファイル（`word_priority.tsv`）を読み込み、learned_unigram に
@@ -313,6 +519,123 @@ impl ViterbiConverter {
         Ok(count)
     }
 
+    /// 隣接コロケーションのシード（`seeded_assoc`）を外部ファイルから読み込む。
+    /// フォーマットは `読み\t出力表記\tトリガー語\tボーナス(省略可)`。
+    /// `#`始まりの行・空行は無視。
+    ///
+    /// ボーナスは省略時、`読み`の辞書エントリから`出力表記`と競合表記の
+    /// 生コスト差を自動算出する（`compute_word_assoc_bonus`、
+    /// [[seeded-adjacent-collocation]]）。算出結果が上限
+    /// （`SEEDED_ASSOC_MAX_BONUS`）を超える、または`読み`が辞書に無い場合は
+    /// そのグループを採用しない（辞書上の生コスト差が元々大きい＝一般的には
+    /// 競合表記の方が正しい可能性が高く、無理に押し退けるとリスクが大きい
+    /// と判断するため）。4列目に数値を明示すればその値で上書きできる
+    /// （手動ピン留め用）。
+    ///
+    /// 両方向（出力表記→トリガー語、トリガー語→出力表記）に同じボーナスで
+    /// 登録する（`rerank_by_seeded_collocation_from`はどちらの並び順の
+    /// 隣接語からも引けるようにするため）。`.entry().or_insert()`で書き込む
+    /// が、`seeded_assoc`はユーザー学習では書き換わらない専用のマップなので
+    /// 実質的には常に新規挿入になる。
+    pub fn load_word_assoc_file(&mut self, path: &std::path::Path) -> std::io::Result<usize> {
+        let content = std::fs::read_to_string(path)?;
+        Ok(self.load_word_assoc_str(&content))
+    }
+
+    /// `load_word_assoc_file`のファイルI/Oを伴わない版。候補バッチの検証
+    /// ツール（`examples/verify_word_assoc_candidates.rs`）のように、まだ
+    /// ディスク上のファイルになっていない候補データを直接読み込みたい
+    /// 場合に使う。
+    pub fn load_word_assoc_str(&mut self, content: &str) -> usize {
+        for collision in find_word_assoc_collisions(content) {
+            crate::debug_log!("word_assoc.tsv の衝突を検出（読み込みは継続）: {collision}");
+        }
+        let mut count = 0;
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut parts = line.split('\t');
+            let (Some(reading), Some(target), Some(trigger)) =
+                (parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            let (reading, target, trigger) = (reading.trim(), target.trim(), trigger.trim());
+            if reading.is_empty() || target.is_empty() || trigger.is_empty() {
+                continue;
+            }
+            let explicit_bonus = parts.next().and_then(|s| s.trim().parse::<i32>().ok());
+            let bonus = match explicit_bonus {
+                Some(b) => b,
+                None => match self.compute_word_assoc_bonus(reading, target) {
+                    Some(b) => b,
+                    None => {
+                        crate::debug_log!(
+                            "word_assoc.tsv: 「{reading}」→「{target}」は必要ボーナスが上限を超えるか辞書に無いため不採用（トリガー={trigger}）"
+                        );
+                        continue;
+                    }
+                },
+            };
+            self.seeded_assoc
+                .entry((target.to_string(), trigger.to_string()))
+                .or_insert(bonus);
+            self.seeded_assoc
+                .entry((trigger.to_string(), target.to_string()))
+                .or_insert(bonus);
+            count += 1;
+        }
+        count
+    }
+
+    /// `word_assoc.tsv`のローダーと候補生成ツール（`examples/dump_homophones.rs`
+    /// の`=target`指定、`examples/verify_word_assoc_candidates.rs`）の両方が
+    /// 使う共通ロジック。生成時に「このボーナスは上限を超えて不採用になる」
+    /// ことを事前に知りたい場合はこの関数を直接呼べる（`pub`化済み）。
+    ///
+    /// `target`（`reading`の変換候補の1つ）が、同じ読みの他候補に競り勝つのに
+    /// 必要なボーナスを、辞書の生コストの差から自動算出する。
+    ///
+    /// `rerank_by_seeded_collocation_from`の純利得計算が
+    /// `effective_word_cost`（接続コストを含まない語コストのみ）で比較して
+    /// いるのに合わせ、ここでも接続コストは無視し語コストの差だけを見る
+    /// （近似の精度をそちらと揃えることが目的で、他の要因を見落としている
+    /// わけではない）。
+    ///
+    /// `target`より安い競合が無ければ`Some(SEEDED_ASSOC_MARGIN)`（既に有利
+    /// なので最小限のマージンのみ）。競合が`target`より安ければ
+    /// `差 + SEEDED_ASSOC_MARGIN`。この必要量が`SEEDED_ASSOC_MAX_BONUS`を
+    /// 超える場合は`None`（採用しない）。超える＝辞書上の生コスト差が
+    /// 元々大きい＝一般にはその競合表記の方が正しい可能性が高く、シードで
+    /// 押し退けるリスクが大きいと判断する（ユーザー指定の方針）。
+    pub fn compute_word_assoc_bonus(&self, reading: &str, target: &str) -> Option<i32> {
+        let entries = self.merged_lookup(reading)?;
+        // 同じ表記が品詞違いで複数エントリを持つことがある（例: 「工事」が
+        // 名詞-サ変接続(cost=1056)と名詞-固有名詞-人名-名(cost=6502)の両方に
+        // 存在する）。`.find()`で最初に見つかった方（辞書内の格納順、コスト
+        // 順ではない）を使うと、たまたま高コスト側を掴んで「最安の競合にも
+        // 負けている」と誤判定し、実際には最安のはずの語を不採用にしてしまう
+        // （実際にこのバグで「こうじ」の「工事」が誤って不採用と判定された）。
+        // 同じ表記の中では常に最安のコストを使う。
+        let target_cost = entries
+            .iter()
+            .filter(|e| e.surface == target)
+            .map(|e| e.cost as i32)
+            .min()?;
+        let cheapest_competitor = entries
+            .iter()
+            .filter(|e| e.surface != target)
+            .map(|e| e.cost as i32)
+            .min();
+        let required = match cheapest_competitor {
+            Some(c) if c < target_cost => (target_cost - c) + SEEDED_ASSOC_MARGIN,
+            _ => SEEDED_ASSOC_MARGIN,
+        };
+        (required <= SEEDED_ASSOC_MAX_BONUS).then_some(required)
+    }
+
     /// 学習データをすべてクリア（頻出語プリセットは残す）
     pub fn clear_learning(&mut self) {
         self.learned_unigram.clear();
@@ -325,10 +648,21 @@ impl ViterbiConverter {
     }
 
     /// ひらがな優先（Escで戻した読み）を頻度から設定する
+    ///
+    /// `learn_unigram`（漢字変換側の学習）と同じ頻度→ボーナス換算・上限を
+    /// 使う。以前はここだけ上限を1500〜3000に抑えていたが、それだと
+    /// 「Escで戻した回数」がどれだけ多くても、漢字側の学習
+    /// （最大6000まで伸びる）に対して常に不利になり、ユーザーが繰り返し
+    /// ひらがなを選び直しているのに漢字変換が優先され続けてしまう
+    /// （確定のたびに`forget_reading`で漢字側の学習は消しているので、
+    /// 残るのは辞書本来のコストとの勝負になる）。断片化については
+    /// ボーナスの大小ではなく`breaks_longer_word`（同じ開始位置により
+    /// 長い実在語があれば、そもそもひらがなノードを足さない）という
+    /// 構造的なガードで別途守られているため、上限をそろえても
+    /// 「さいきどう→さい+起動」のような回帰は起きない
+    /// （回帰防止テストで確認済み）。
     pub fn learn_hiragana(&mut self, reading: &str, freq: u32) {
-        // ひらがなノードを既存語より優先させるが、強すぎると周囲の分割を
-        // 乱すため中程度に抑える（Escで漢字学習は忘れるので過剰に強くしない）。
-        let bonus = frequency_to_bonus(freq).clamp(COMMON_WORD_SEED_BONUS, 3000);
+        let bonus = frequency_to_bonus(freq).min(UNIGRAM_BONUS_CAP);
         self.learned_hiragana.insert(reading.to_string(), bonus);
     }
 
@@ -410,11 +744,20 @@ impl ViterbiConverter {
             }
         }
         self.corpus_bigram.clear();
+        self.corpus_bigram_prev_surfaces.clear();
         for (prev_surface, surface, freq) in &lm.bigrams {
             let bonus = corpus_bigram_bonus(*freq);
             if bonus != 0 {
                 self.corpus_bigram
                     .insert((prev_surface.clone(), surface.clone()), bonus);
+                // `base_connection_cost`が辺ごとに(String,String)を確保して
+                // HashMapを引く前に、この安価な集合でほぼ確実に外れる
+                // prev_surfaceを弾けるようにする（`learned_bigram`と
+                // `bigram_prev_surfaces`の関係と同じ）。`load_corpus_lm`が
+                // 唯一の書き込み口（丸ごと差し替え）なので、`bigram_prev_surfaces`
+                // のように他の変更（`forget_unigram`等）で再構築される心配が無い
+                // 専用のフィールドにしている。
+                self.corpus_bigram_prev_surfaces.insert(prev_surface.clone());
             }
         }
     }
@@ -447,11 +790,12 @@ impl ViterbiConverter {
             }];
         }
         let base = self.convert(reading);
-        self.rerank_by_assoc(base)
-    }
-
-    /// 学習した内容語連想で 1-best を微調整する（差し替え）
-    fn rerank_by_assoc(&self, base: Vec<WordEntry>) -> Vec<WordEntry> {
+        // シード（隣接コロケーション）→学習（非隣接連想）の順で適用する。
+        // 学習が後に来ることで、両方が同じ語について異なる差し替えを
+        // 示唆した場合に必ず学習側が最終的に勝つ（ユーザー本人の実際の
+        // 使い方が一般的な傾向より優先されるべきという方針、
+        // [[homophone-selection-is-not-fixable-without-lm]]）。
+        let base = self.rerank_by_seeded_collocation_from(base, 0);
         self.rerank_by_assoc_from(base, 0)
     }
 
@@ -477,14 +821,14 @@ impl ViterbiConverter {
                 continue;
             }
             let cur = base[i].clone();
-            let Some(alts) = self.dictionary.lookup(&cur.reading) else {
+            let Some(alts) = self.merged_lookup(&cur.reading) else {
                 continue;
             };
             let cur_cost = self.effective_word_cost(&cur);
 
             let mut best: Option<WordEntry> = None;
             let mut best_gain = 0i32;
-            for alt in alts {
+            for alt in alts.iter() {
                 if alt.surface == cur.surface {
                     continue;
                 }
@@ -523,6 +867,100 @@ impl ViterbiConverter {
                 }
             }
             if let Some(alt) = best {
+                crate::debug_log!(
+                    "rerank_by_assoc: {}→{}（連想利得={}）",
+                    base[i].surface, alt.surface, best_gain
+                );
+                base[i] = alt;
+            }
+        }
+        base
+    }
+
+    /// シード済み隣接コロケーション（`seeded_assoc`）で1-bestを微調整する。
+    ///
+    /// `rerank_by_assoc_from`とは逆に、直前・直後（間に助詞すら挟まない
+    /// 隣接語）だけを見る。「経済＋政策」「かたい＋仕事」「はやい＋くるま」
+    /// のような複合名詞・形容詞＋名詞の同音異義語選択は、まさにこの
+    /// 隣接構造でしか起きないため（[[homophone-selection-is-not-fixable-without-lm]]）。
+    /// `learned_assoc`の隣接語除外は「駅の汽車」型の連想向けの安全設計
+    /// なのでそのまま残し、こちらは事前精査済みの`seeded_assoc`だけを
+    /// 対象にする別関数にすることで、その安全設計に触れずに済ませている。
+    ///
+    /// `first_mutable`より前の文節は書き換えない（`convert_context_aware_pinned`
+    /// から使う。`rerank_by_assoc_from`と同じ規約）。
+    pub(crate) fn rerank_by_seeded_collocation_from(
+        &self,
+        mut base: Vec<WordEntry>,
+        first_mutable: usize,
+    ) -> Vec<WordEntry> {
+        if self.seeded_assoc.is_empty() || base.len() < 2 {
+            return base;
+        }
+
+        // 隣接語の表記は、この関数に入った時点の元の1-bestで固定する
+        // （スナップショット）。`base[i]`をその場で書き換えながらループすると、
+        // 後続の判定が「元の1-best」ではなく「直前の判定で書き換わった後の
+        // 表記」を隣接語として参照してしまい、1回のパスの中で書き換えが
+        // 連鎖する（実測: 「はやい→速い」への書き換えが先に起きると、
+        // その「速い」を隣接語として直後の「くるま/車」判定が再評価され、
+        // 別途修正済みだった「くるま→車」が巻き戻る。
+        // [[seeded-adjacent-collocation]]で発見）。読み（インデックス）だけを
+        // 見る1パス構造にすることで、シードを何千件に増やしても各語の
+        // 判定が他の語の書き換え結果に依存しないことを保証する。
+        let original_surfaces: Vec<String> = base.iter().map(|e| e.surface.clone()).collect();
+
+        for i in first_mutable..base.len() {
+            if !is_content_pos(&base[i].pos) || base[i].surface == base[i].reading {
+                continue;
+            }
+            let cur = base[i].clone();
+            let Some(alts) = self.merged_lookup(&cur.reading) else {
+                continue;
+            };
+            let cur_cost = self.effective_word_cost(&cur);
+
+            // 直前・直後の表記だけを見る（`rerank_by_assoc_from`と正反対）。
+            // 必ずスナップショット（`original_surfaces`）から読む。
+            let mut neighbors: Vec<&str> = Vec::with_capacity(2);
+            if i > 0 {
+                neighbors.push(original_surfaces[i - 1].as_str());
+            }
+            if i + 1 < base.len() {
+                neighbors.push(original_surfaces[i + 1].as_str());
+            }
+            if neighbors.is_empty() {
+                continue;
+            }
+
+            let mut best: Option<WordEntry> = None;
+            let mut best_gain = 0i32;
+            for alt in alts.iter() {
+                if alt.surface == cur.surface {
+                    continue;
+                }
+                let mut assoc = 0i32;
+                for &nb in &neighbors {
+                    assoc += self
+                        .seeded_assoc
+                        .get(&(nb.to_string(), alt.surface.clone()))
+                        .copied()
+                        .unwrap_or(0);
+                }
+                if assoc == 0 {
+                    continue;
+                }
+                let net = assoc.saturating_sub(self.effective_word_cost(alt) - cur_cost);
+                if net > best_gain {
+                    best_gain = net;
+                    best = Some(alt.clone());
+                }
+            }
+            if let Some(alt) = best {
+                crate::debug_log!(
+                    "rerank_by_seeded_collocation: {}→{}（隣接語利得={}）",
+                    base[i].surface, alt.surface, best_gain
+                );
                 base[i] = alt;
             }
         }
@@ -671,7 +1109,7 @@ impl ViterbiConverter {
                 cands.push((v, 1));
             }
         }
-        for (v, dist) in self.dictionary.fuzzy_readings(word, 1) {
+        for (v, dist) in self.merged_fuzzy_readings(word, 1) {
             if v != word && dist > 0 {
                 cands.push((v, dist));
             }
@@ -783,11 +1221,65 @@ impl ViterbiConverter {
         Some((surface, cost))
     }
 
+    /// 学習バイグラムのボーナスが、祖先ノードとprevを結合すれば実在する
+    /// 1語になる場合にだけ効いている（＝そのボーナスを受け取るためだけに
+    /// 正当な1語を分割している）かを判定する。読み2文字以下の短い語同士の
+    /// 組み合わせに限定する（既存の`bonused_short_prev_conn_floor_at_utterance_start`
+    /// と同じ「もぐら叩きを避けるための語彙非依存の条件」の考え方）。
+    fn bigram_bonus_splits_atomic_word(
+        &self,
+        grandparent: Option<&WordEntry>,
+        prev: Option<&WordEntry>,
+    ) -> bool {
+        let Some(gp) = grandparent else { return false };
+        let Some(p) = prev else { return false };
+        if gp.reading.chars().count() > 2 || p.reading.chars().count() > 2 {
+            return false;
+        }
+        let combined_reading = format!("{}{}", gp.reading, p.reading);
+        let Some(entries) = self.merged_lookup(&combined_reading) else {
+            return false;
+        };
+        entries.iter().any(|e| is_content_pos(&e.pos))
+    }
+
+    /// `prev`と同じ読み・同じ接続クラス（left_id/right_id一致）だが学習
+    /// ボーナスの乗っていない別表記（ひらがな等）が辞書に存在するか。
+    /// `bonused_short_prev_conn_floor_at_utterance_start`が、学習で優先
+    /// したい表記自身の接続コストだけを狙い撃ちで不利にし、無学習の
+    /// 同義語に道を譲ってしまう副作用を避けるために使う
+    /// （実測:「他」を学習していても「他の/他が/他に」で無学習の
+    /// 「ほか」に負ける）。
+    fn prev_has_untrusted_pos_homograph(&self, prev: &WordEntry) -> bool {
+        let Some(entries) = self.merged_lookup(&prev.reading) else {
+            return false;
+        };
+        entries.iter().any(|e| {
+            e.surface != prev.surface
+                && e.left_id == prev.left_id
+                && e.right_id == prev.right_id
+                && !self.is_bonused_entry(e)
+        })
+    }
+
+    fn is_bonused_entry(&self, e: &WordEntry) -> bool {
+        let key = (e.reading.clone(), e.surface.clone());
+        self.learned_unigram.get(&key).copied().unwrap_or(0) > 0
+            || self.trusted_phrase_bonus.get(&key).copied().unwrap_or(0) > 0
+    }
+
     /// 単語の実効コスト（1文字漢字ペナルティ・学習ユニグラム・コーパス頻度を反映）。
     /// `build_lattice`が各ラティスノードに適用するのと同じ計算式。候補一覧
     /// （`hook-dll`の`build_candidates`）からも参照するため`pub(crate)`にしている。
     pub fn effective_word_cost(&self, e: &WordEntry) -> i32 {
-        let pen = single_kanji_penalty(&e.surface, self.single_kanji_penalty);
+        // `build_lattice`がラティスの各ノードに適用するのと同じ3つのペナルティ
+        // （1文字漢字・カタカナ固有名詞・記号）を揃える。ここが揃っていないと、
+        // これを使う`rerank_by_assoc_from`（連想再ランク）や候補一覧が、
+        // find_best_pathの実際のラティスコストより語を過小評価し、
+        // find_best_pathなら選ばないはずの固有名詞・記号語を選んでしまう。
+        let pen = single_kanji_penalty(&e.surface, self.single_kanji_penalty)
+            + proper_noun_penalty(&e.surface, &e.pos)
+            + symbol_penalty(&e.surface, &e.pos);
         let key = (e.reading.clone(), e.surface.clone());
         let bonus = self.learned_unigram.get(&key).copied().unwrap_or(0);
         let trusted_bonus = self.trusted_phrase_bonus.get(&key).copied().unwrap_or(0);
@@ -849,7 +1341,7 @@ impl ViterbiConverter {
             let remaining = &input[byte_pos..];
 
             // 辞書からプレフィックス検索
-            let matches = self.dictionary.common_prefix_search(remaining);
+            let matches = self.merged_prefix_search(remaining);
             let has_dict_hit = !matches.is_empty();
 
             if !has_dict_hit {
@@ -877,7 +1369,16 @@ impl ViterbiConverter {
                         // 学習したユニグラムはコストを減額（優先度を上げる）
                         let key = (entry.reading.clone(), entry.surface.clone());
                         let bonus = self.learned_unigram.get(&key).copied().unwrap_or(0);
-                        let trusted_bonus = self.trusted_phrase_bonus.get(&key).copied().unwrap_or(0);
+                        // 「いっ」→「行っ」は読み・後続語を問わない無条件適用にすると
+                        // 無関係な語（一貫性→行っ完成）まで巻き込む（2026-09-13発見、
+                        // [[trusted-phrase-bonus-blast-radius]]）。この1組だけ
+                        // node単位の適用から除外し、`iitte_verb_conn_floor`で
+                        // 後続が「て」「た」のときだけedge単位で効かせる。
+                        let trusted_bonus = if key.0 == "いっ" && key.1 == "行っ" {
+                            0
+                        } else {
+                            self.trusted_phrase_bonus.get(&key).copied().unwrap_or(0)
+                        };
                         // コーパス由来のユニグラム頻度も同じ「使うほど優先」の
                         // 発想の減額だが、個人の学習履歴とは別チャネル（詳細は
                         // `corpus_unigram`フィールドのコメント）。
@@ -986,6 +1487,26 @@ impl ViterbiConverter {
                     from = start + reading.chars().next().unwrap().len_utf8();
                     continue;
                 }
+                // 同じ終了位置でより手前から始まる実在の内容語（例:「毎回」が
+                // 「まい」+「かい」の「かい」側だけを見た場合、「毎回」は
+                // このひらがなノードより手前の位置から始まり同じ終了位置で
+                // 終わる）があるなら、このひらがな優先ノードは足さない。
+                // 上のチェックは「同じ開始位置からより長い語」しか見ないため、
+                // このケース（自分より手前から始まる語）は素通りしてしまう
+                // （実測:「まいかい」で「かい」をEscひらがな優先していると、
+                // 学習ユニグラムの乗った「毎回」自体より、断片「舞い」+
+                // ひらがな「かい」の方が安くなり「舞いかい」に化ける。
+                // ひらがな優先ノードはコストが学習ボーナス次第で負になり得る
+                // （`5000 - bonus`）ため、学習ユニグラムの0下限しかない
+                // 「毎回」を通常のコスト勝負では負かせてしまう）。
+                let breaks_longer_word_from_before = lattice.nodes_ending_at[end].iter().any(|&idx| {
+                    let n = &lattice.nodes[idx];
+                    n.start < start && n.entry.as_ref().is_some_and(|e| is_content_pos(&e.pos))
+                });
+                if breaks_longer_word_from_before {
+                    from = start + reading.chars().next().unwrap().len_utf8();
+                    continue;
+                }
                 // ひらがな表記は基準コストから学習ボーナス分を引いて優先
                 let cost = (5000 - bonus).clamp(-30000, i16::MAX as i32) as i16;
                 lattice.add_word(
@@ -1029,32 +1550,45 @@ impl ViterbiConverter {
         // 逆に「ぶらうざ」→ 内部の ら/う/ざ は高コストの稀漢字なので ブラウザ
         // を出してよい（きょうは→内部の は が安いので キョウハ は出さない）。
         const INTERIOR_STOP_MAX_COST: i16 = 4500;
-        // lattice を可変借用する add_word と競合しないよう入力を控えておく
-        let input_owned = lattice.input.clone();
-        let cheapest_at = |char_pos: usize| -> Option<i16> {
-            let bp = byte_positions[char_pos];
-            self.dictionary
-                .common_prefix_search(&input_owned[bp..])
-                .iter()
-                .flat_map(|(_, ws)| ws.iter())
-                .map(|e| e.cost)
-                .min()
-        };
-        for len in self.katakana_min_len..=max_len {
+        // 2パスに分ける: 1パス目は`lattice.input`を不変借用するだけで、
+        // 追加すべき長さの上限（`chosen_max_len`）だけを決める。2パス目で
+        // `lattice.add_word`（可変借用）を呼ぶ。以前は`add_word`と競合しない
+        // よう`lattice.input`（入力全体）をこの関数の呼び出しごと（＝1文字
+        // 位置ごと）に丸ごとcloneしていたが、これは文字数に対してO(n²)の
+        // 無駄なコピーになる（実測: 長い入力ほど`build_lattice`の所要時間が
+        // 文字数に対して超線形に伸びる一因）。`lattice.input`は関数内で
+        // 変更されないので、2パスに分けるだけでcloneせずに済む。
+        let mut chosen_max_len = self.katakana_min_len.saturating_sub(1);
+        {
+            let input = lattice.input.as_str();
+            let cheapest_at = |char_pos: usize| -> Option<i16> {
+                let bp = byte_positions[char_pos];
+                self.dictionary
+                    .common_prefix_search(&input[bp..])
+                    .iter()
+                    .flat_map(|(_, ws)| ws.iter())
+                    .map(|e| e.cost)
+                    .min()
+            };
+            for len in self.katakana_min_len..=max_len {
+                let end_idx = start_idx + len;
+
+                // 範囲が全てひらがな（長音符含む）でなければそれ以上伸ばせない
+                if !is_all_hiragana(&chars[start_idx..end_idx]) {
+                    break;
+                }
+                // 内部（開始位置を除く）に安い辞書語があれば、この長さ以降は打ち切り
+                let has_cheap_interior = (start_idx + 1..end_idx).any(|p| {
+                    cheapest_at(p).map_or(false, |c| c <= INTERIOR_STOP_MAX_COST)
+                });
+                if has_cheap_interior {
+                    break;
+                }
+                chosen_max_len = len;
+            }
+        }
+        for len in self.katakana_min_len..=chosen_max_len {
             let end_idx = start_idx + len;
-
-            // 範囲が全てひらがな（長音符含む）でなければそれ以上伸ばせない
-            if !is_all_hiragana(&chars[start_idx..end_idx]) {
-                break;
-            }
-            // 内部（開始位置を除く）に安い辞書語があれば、この長さ以降は打ち切り
-            let has_cheap_interior = (start_idx + 1..end_idx).any(|p| {
-                cheapest_at(p).map_or(false, |c| c <= INTERIOR_STOP_MAX_COST)
-            });
-            if has_cheap_interior {
-                break;
-            }
-
             let start_byte = byte_positions[start_idx];
             let end_byte = byte_positions[end_idx];
             let reading: String = chars[start_idx..end_idx].iter().collect();
@@ -1100,7 +1634,9 @@ impl ViterbiConverter {
                     conn_cost = conn_cost.saturating_sub(bigram_bonus);
                 }
             }
-            if !self.corpus_bigram.is_empty() {
+            if !self.corpus_bigram.is_empty()
+                && self.corpus_bigram_prev_surfaces.contains(prev_surface)
+            {
                 if let Some(bonus) = self
                     .corpus_bigram
                     .get(&(prev_surface.to_string(), cur_surface.to_string()))
@@ -1133,6 +1669,8 @@ impl ViterbiConverter {
             self.base_connection_cost(cur.right_id, Some(&cur.surface), next_left_id, next_surface);
 
         before.saturating_add(after)
+            .saturating_add(prev.map_or(0, |p| adjective_terminal_then_ni_penalty(p, cur, before) - before))
+            .saturating_add(next.map_or(0, |n| adjective_terminal_then_ni_penalty(cur, n, after) - after))
     }
 
     /// Viterbiアルゴリズムで最適パスを探索（pub for IncrementalViterbi）
@@ -1148,7 +1686,21 @@ impl ViterbiConverter {
             let ending_indices: Vec<usize> = lattice.nodes_ending_at[pos].clone();
 
             for &node_idx in &starting_indices {
-                
+                let current_node = &lattice.nodes[node_idx];
+                let is_eos = node_idx == lattice.eos_index;
+                // `current_node`（ce）だけで決まるペナルティは prev_idx に依存しない
+                // ので、内側ループの外（この node_idx につき1回）で計算しておく。
+                // 以前は内側ループ内で毎回呼んでおり、同じ結果を
+                // `ending_indices.len()`回（＝辺の数だけ）再計算していた。
+                let cur_lone_particle_penalty = current_node
+                    .entry
+                    .as_ref()
+                    .map_or(0, single_kanji_lone_particle_reading_penalty);
+                let cur_is_unallowed_suffix = current_node
+                    .entry
+                    .as_ref()
+                    .is_some_and(is_unallowed_single_kanji_suffix);
+
                 let mut best_cost = i32::MAX;
                 let mut best_prev: Option<usize> = None;
 
@@ -1157,8 +1709,6 @@ impl ViterbiConverter {
                     if prev_node.total_cost == i32::MAX {
                         continue;
                     }
-
-                    let current_node = &lattice.nodes[node_idx];
 
                     // 連接コスト（辞書の連接行列 － 学習/コーパスのバイグラム
                     // ボーナス）。候補一覧の`context_connection_cost`とも
@@ -1178,15 +1728,16 @@ impl ViterbiConverter {
                         // カタカナ語+単独の接尾辞漢字という不自然な組み合わせは
                         // 接続コストを上乗せする（例外は語・人・製 等の外来語に
                         // 実際に付く接尾辞のみ）
-                        conn_cost = conn_cost
-                            .saturating_add(katakana_kanji_suffix_penalty(pe, ce));
+                        if cur_is_unallowed_suffix && prev_is_katakana_word(pe) {
+                            conn_cost = conn_cost.saturating_add(2000);
+                        }
                         // 形容詞の終止形（〜い）に「て」が直接続くのは文法的に
                         // 常に誤り（正しくは連用形〜くて）なので無条件でペナルティ
                         conn_cost = adjective_terminal_then_te_penalty(pe, ce, conn_cost);
+                        conn_cost = adjective_terminal_then_ni_penalty(pe, ce, conn_cost);
                         // 1文字漢字の表記かつ読みが単独助詞と一致する語（野・葉 等）
                         // が文頭以外に出現するのは不自然なので無条件でペナルティ
-                        conn_cost = conn_cost
-                            .saturating_add(single_kanji_lone_particle_reading_penalty(ce));
+                        conn_cost = conn_cost.saturating_add(cur_lone_particle_penalty);
                     }
                     // 1文字漢字が絡む不自然な接続コスト（学習バイグラム込み）には
                     // 下限を設ける。ただし学習ボーナスでどちらかの単語コストが
@@ -1202,8 +1753,18 @@ impl ViterbiConverter {
                     conn_cost = conn_cost.saturating_add(
                         content_word_particle_reading_before_eos_penalty(
                             prev_node.entry.as_ref(),
-                            node_idx == lattice.eos_index,
+                            is_eos,
                         ),
+                    );
+                    // 「いっ」→「行っ」（行くの音便形）は、直後が「て」「た」
+                    // （行って/行った）のときだけ稀な同音動詞「逝っ」に対して
+                    // 確実に勝たせる。学習の有無を問わず常に対象（元は
+                    // `trusted_phrase_bonus`でnode単位・無条件だったものを
+                    // edge単位・条件付きに変更、2026-09-13）。
+                    conn_cost = iitte_verb_conn_floor(
+                        prev_node.entry.as_ref(),
+                        current_node.entry.as_ref(),
+                        conn_cost,
                     );
 
                     // 以下はすべて「学習ボーナスでどちらかの単語コストが不自然に
@@ -1222,6 +1783,32 @@ impl ViterbiConverter {
                     let grandparent_entry = grandparent_node.and_then(|n| n.entry.as_ref());
                     let grandparent_bonus = grandparent_node.map_or(0, |n| n.learned_bonus);
                     let prev_is_utterance_start = prev_node.prev_node == Some(lattice.bos_index);
+                    // 学習バイグラムのボーナスが「祖先ノード＋prevを結合すれば実在する
+                    // 1語になる」場合にだけ効いているなら、そのボーナスを打ち消す。
+                    // バイグラムは表記の完全一致キーのため、正当な1語（例:「この」）を
+                    // 敢えて分割（「こ」+「の」）しないと受け取れないボーナス
+                    // （例: 学習バイグラム「の→空」）が、分割してでも受け取る方を
+                    // 有利にしてしまう抜け道になる（実測:「このそらをみあげて」→
+                    // 「股の空を見上げて」。[[atomic-word-particle-connection-quirk]]と
+                    // 同系統）。既存の「文頭限定」ガードは、prev自身が文頭語のときしか
+                    // 守れない（このケースはprevが2語目の「の」で対象外）ため、
+                    // 「祖先＋prevの結合読みが辞書に実在するか」という語彙非依存の
+                    // 別条件で捕捉する。
+                    if bigram_bonus != 0 && self.bigram_bonus_splits_atomic_word(grandparent_entry, prev_node.entry.as_ref()) {
+                        conn_cost = conn_cost.saturating_add(bigram_bonus);
+                    }
+                    // 束縛モーラ「ん」+助詞の有利な接続コストが、単独の1文字漢字/
+                    // カタカナ直後だと断片化の抜け道になる問題は学習の有無を
+                    // 問わないため、他のガード群（学習ボーナス絡み限定）とは別に
+                    // 無条件で適用する。
+                    if let (Some(pe), Some(ce)) = (&prev_node.entry, &current_node.entry) {
+                        conn_cost = single_char_bound_mora_then_particle_conn_floor(
+                            grandparent_entry,
+                            pe,
+                            ce,
+                            conn_cost,
+                        );
+                    }
                     if prev_bonus != 0 || cur_bonus != 0 || grandparent_bonus != 0 || bigram_bonus != 0 {
                         conn_cost = clamp_single_kanji_pair_conn_cost(
                             prev_node.entry.as_ref(),
@@ -1283,6 +1870,12 @@ impl ViterbiConverter {
                         // 「どう」+「か」で「同化」、「位置」+「が」で
                         // 「一概」が押しのけられるのを防ぐ。個別のPOSに
                         // 限定した複数のガードを一般化して統合したもの）。
+                        let prev_has_untrusted_pos_homograph = prev_bonus != 0
+                            && prev_is_utterance_start
+                            && prev_node
+                                .entry
+                                .as_ref()
+                                .is_some_and(|p| self.prev_has_untrusted_pos_homograph(p));
                         conn_cost = bonused_short_prev_conn_floor_at_utterance_start(
                             prev_node.entry.as_ref(),
                             current_node.entry.as_ref(),
@@ -1290,6 +1883,7 @@ impl ViterbiConverter {
                             prev_bonus,
                             cur_bonus,
                             bigram_bonus,
+                            prev_has_untrusted_pos_homograph,
                             conn_cost,
                         );
                     }
@@ -1358,7 +1952,13 @@ impl ViterbiConverter {
             return Vec::new();
         }
 
+        // `convert_with_cost`と同じ断片修復を各候補パスにも適用する
+        // （`ime-cli`の`convert`はこちらを経由するため、これが無いと
+        // CLIと実際のライブ変換で断片修復の有無が食い違ってしまう）。
         n_best_from_lattice(&lattice, &self.dictionary, n)
+            .into_iter()
+            .map(|path| self.repair_single_kanji_fragments(path))
+            .collect()
     }
 
     /// N-best候補を表層形の文字列として取得
@@ -1368,4 +1968,55 @@ impl ViterbiConverter {
             .map(|entries| entries.iter().map(|e| e.surface.as_str()).collect())
             .collect()
     }
+}
+
+/// `word_assoc.tsv`（`seeded_assoc`のシード元、[[seeded-adjacent-collocation]]）
+/// の1列目（出力表記）が、別グループの2列目（トリガー語）としても
+/// 使われていないかを検出する。
+///
+/// `rerank_by_seeded_collocation_from`は現在スナップショット方式（同一パス
+/// 内での連鎖を防ぐ設計）だが、それとは別に、あるグループの出力語が
+/// 別の無関係なグループのトリガー語としても登録されていること自体は
+/// データ品質上のリスクを示す（実際に踏んだ事例: 「速い」のトリガー語に
+/// 「クルマ」を含めたところ、別途修正済みだった「くるま→車」を巻き戻す
+/// 結果になった）。数千件規模にシードを増やすと目視での確認が現実的で
+/// なくなるため、読み込み時に機械的に検出する。呼び出し元（`ViterbiConverter`
+/// の状態を使わない）から独立してテストできるよう純粋関数にしている。
+///
+/// 戻り値は衝突ごとの説明文（衝突が無ければ空）。
+pub fn find_word_assoc_collisions(content: &str) -> Vec<String> {
+    let mut targets: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut lines: Vec<(String, String)> = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split('\t');
+        // フォーマット: 読み<TAB>出力表記(target)<TAB>トリガー語(trigger)<TAB>ボーナス(省略可)
+        let (Some(_reading), Some(target), Some(trigger)) =
+            (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        let (target, trigger) = (target.trim(), trigger.trim());
+        if target.is_empty() || trigger.is_empty() {
+            continue;
+        }
+        targets.insert(target.to_string());
+        lines.push((target.to_string(), trigger.to_string()));
+    }
+
+    let mut collisions: Vec<String> = lines
+        .iter()
+        .filter(|(target, trigger)| trigger != target && targets.contains(trigger))
+        .map(|(target, trigger)| {
+            format!(
+                "「{trigger}」は「{target}」のトリガー語だが、「{trigger}」自体も別グループの出力表記として登録されている"
+            )
+        })
+        .collect();
+    collisions.sort();
+    collisions.dedup();
+    collisions
 }

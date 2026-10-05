@@ -1,6 +1,7 @@
 //! 低レベルキーボードフック本体、モード切替、IME制御、キー送出
 
 use crate::*;
+use windows::Win32::System::SystemInformation::GetTickCount;
 
 /// ウィンドウ(環境)ごとの入力モード(OUR_ACTIVE)と打鍵中コマンド行を覚える。
 /// ターミナルAを日本語、Bはコマンド、のように**環境ごとに独立**して切替できる。
@@ -9,12 +10,6 @@ use crate::*;
 pub(crate) static WINDOW_MODES: Mutex<Vec<(isize, bool, String)>> = Mutex::new(Vec::new());
 /// 直近にフォーカスしていたウィンドウ（モードの保存/復元の切替検出用）
 pub(crate) static mut LAST_FG_HWND: isize = 0;
-/// 直近に押した横矢印キー(VK_LEFT/VK_RIGHT)と時刻(ms)。素早い2回押しで
-/// 行端(Home/End)へジャンプさせるための連打検出に使う。
-pub(crate) static mut LAST_ARROW_VK: u32 = 0;
-pub(crate) static mut LAST_ARROW_TICK: u32 = 0;
-/// 連打とみなす間隔(ms)
-pub(crate) const ARROW_DOUBLE_TAP_MS: u32 = 250;
 
 /// VKコード→文字変換
 ///
@@ -145,6 +140,28 @@ pub(crate) fn is_alt_pressed() -> bool {
         use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
         GetAsyncKeyState(VK_MENU.0 as i32) < 0
     }
+}
+
+/// 自分（IME本体）がSendInputで送出したキーであることを示す
+/// `KEYBDINPUT::dwExtraInfo`のマーカー値。
+///
+/// 以前は`LLKHF_INJECTED`フラグ（＝SendInputによる合成キー全般）だけで
+/// 「自分由来か」を判定していたため、テスト/負荷計測用ハーネスが
+/// SendInputで打鍵を注入しても、この既存チェックで無条件に無視されて
+/// しまい機能しなかった。このマーカーを持つ注入だけを「自分由来」として
+/// 除外するようにし、他の注入元（ハーネス等）は通常の物理キーと同様に
+/// 処理されるようにする。値そのものに意味は無く、衝突しにくい適当な
+/// 定数（"IME1"のASCIIコードに由来）。
+pub(crate) const SELF_INJECTED_MAGIC: usize = 0x494D_4531;
+
+/// このキーイベントが自分（IME本体）由来のSendInputによるものか。
+///
+/// `LLKHF_INJECTED`（合成キー全般）に加えて`SELF_INJECTED_MAGIC`マーカーの
+/// 一致まで見る。マーカー無しの注入（他プロセス由来。負荷計測用ハーネスや
+/// 他の入力補助ツール等）は自己送信として扱わず、通常の物理キーと同様に
+/// 処理する。
+fn is_self_injected(flags: u32, extra_info: usize) -> bool {
+    (flags & LLKHF_INJECTED.0) != 0 && extra_info == SELF_INJECTED_MAGIC
 }
 
 // WM_IME_CONTROL wparam 定数 (windows crate に未定義のため手動定義)
@@ -438,7 +455,7 @@ pub(crate) fn send_vk(vk: VIRTUAL_KEY) {
                         wScan: 0,
                         dwFlags: KEYBD_EVENT_FLAGS(0),
                         time: 0,
-                        dwExtraInfo: 0,
+                        dwExtraInfo: SELF_INJECTED_MAGIC,
                     },
                 },
             },
@@ -450,7 +467,7 @@ pub(crate) fn send_vk(vk: VIRTUAL_KEY) {
                         wScan: 0,
                         dwFlags: KEYEVENTF_KEYUP,
                         time: 0,
-                        dwExtraInfo: 0,
+                        dwExtraInfo: SELF_INJECTED_MAGIC,
                     },
                 },
             },
@@ -479,7 +496,7 @@ pub(crate) fn send_vk_edge(vk: VIRTUAL_KEY, down: bool) {
                     wScan: 0,
                     dwFlags: if down { KEYBD_EVENT_FLAGS(0) } else { KEYEVENTF_KEYUP },
                     time: 0,
-                    dwExtraInfo: 0,
+                    dwExtraInfo: SELF_INJECTED_MAGIC,
                 },
             },
         }];
@@ -510,7 +527,7 @@ pub(crate) fn execute_action(action: ConversionAction) {
                     wScan: 0,
                     dwFlags: KEYBD_EVENT_FLAGS(0),
                     time: 0,
-                    dwExtraInfo: 0,
+                    dwExtraInfo: SELF_INJECTED_MAGIC,
                 },
             },
         });
@@ -522,7 +539,7 @@ pub(crate) fn execute_action(action: ConversionAction) {
                     wScan: 0,
                     dwFlags: KEYEVENTF_KEYUP,
                     time: 0,
-                    dwExtraInfo: 0,
+                    dwExtraInfo: SELF_INJECTED_MAGIC,
                 },
             },
         });
@@ -543,7 +560,7 @@ pub(crate) fn execute_action(action: ConversionAction) {
                         wScan: unit,
                         dwFlags: KEYEVENTF_UNICODE,
                         time: 0,
-                        dwExtraInfo: 0,
+                        dwExtraInfo: SELF_INJECTED_MAGIC,
                     },
                 },
             });
@@ -555,7 +572,7 @@ pub(crate) fn execute_action(action: ConversionAction) {
                         wScan: unit,
                         dwFlags: KEYEVENTF_UNICODE | KEYEVENTF_KEYUP,
                         time: 0,
-                        dwExtraInfo: 0,
+                        dwExtraInfo: SELF_INJECTED_MAGIC,
                     },
                 },
             });
@@ -602,6 +619,10 @@ pub(crate) fn settle_composition_on_click(state: &mut LiveConversionState) -> bo
 pub(crate) fn on_click_outside_popup() {
     if let Some(cm) = LIVE_CONTEXT.get() {
         if let Ok(mut c) = cm.try_lock() {
+            // マウスクリックは確定後の復元用リングバッファの無効化条件
+            // （[[commit-ring-buffer]]）。composing中かどうかに関わらず、
+            // クリックでキャレットが移った可能性がある以上は無効化する。
+            c.invalidate_commit_ring();
             let settled = settle_composition_on_click(&mut c);
             debug_log!("ポップアップ外クリック: 下書き確定={}", settled);
         }
@@ -611,29 +632,366 @@ pub(crate) fn on_click_outside_popup() {
 
 /// 低レベルマウスフック（WH_MOUSE_LL）。
 ///
-/// 予測変換・候補一覧・コマンド候補のポップアップ表示中に、ポップアップの
-/// 外側でマウスボタンが押されたらポップアップを閉じる。ポップアップ自身の
-/// クリック（コマンドモードの「設定」ボタン等）は矩形内なので対象外。
+/// マウスボタンが押されたら下書き（変換中の文字列）を確定扱いにする。
+/// ポップアップ（予測変換・候補一覧・コマンド候補）が表示中は、その矩形の
+/// 内側のクリック（コマンドモードの「設定」ボタン等）だけは対象外にする。
+/// ポップアップが無ければ、インライン変換中の下書きも含めて常に「外側の
+/// クリック」として扱う（ポップアップの有無に関わらず、下書きがある状態で
+/// キャレットが移動したら確定させる必要があるため）。
 /// マウス移動・ホイールはボタン押下でないため即座に次のフックへ渡す。
 #[allow(non_snake_case)]
 pub extern "system" fn LowLevelMouseProc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
-        if code >= 0 && is_mouse_button_down_message(wparam.0 as u32) && candidate_window_visible() {
-            use windows::Win32::UI::WindowsAndMessaging::MSLLHOOKSTRUCT;
-            let info = lparam.0 as *const MSLLHOOKSTRUCT;
-            if !info.is_null() {
-                let pt = (*info).pt;
-                if !popup_contains_screen_point(pt.x, pt.y) {
-                    on_click_outside_popup();
-                }
+        if code >= 0 && is_mouse_button_down_message(wparam.0 as u32) {
+            let outside_popup = if candidate_window_visible() {
+                use windows::Win32::UI::WindowsAndMessaging::MSLLHOOKSTRUCT;
+                let info = lparam.0 as *const MSLLHOOKSTRUCT;
+                info.is_null() || !popup_contains_screen_point((*info).pt.x, (*info).pt.y)
+            } else {
+                true
+            };
+            if outside_popup {
+                on_click_outside_popup();
             }
         }
         CallNextHookEx(None, code, wparam, lparam)
     }
 }
 
+/// `LowLevelKeyboardProc`の入口〜出口の実測レイテンシ計測。
+///
+/// `HKCU\Control Panel\Desktop\LowLevelHooksTimeout`（既定300ms）を超えて
+/// 戻らないとOSがそのイベントを素通しし、繰り返すとフック自体が外される。
+///
+/// **コールバック内で行ってよいのは`Instant::now()`（QueryPerformanceCounter
+/// 相当）とメモリ上の配列への書き込みだけ**。ディスクI/Oは計測対象そのものを
+/// 汚染する（数msの書き込み待ちが「計測しなければ起きなかった外れ値」を
+/// 生む。危険な瞬間ほどウイルス対策ソフトのリアルタイムスキャンが絡み
+/// さらに歪む）ため、フックの中では一切行わない。
+///
+/// 重要: `PostMessageW` + `WM_APP_*` によるメッセージループへの委譲では
+/// **不十分**なことが判明している。`install_hook`を呼ぶスレッドと、
+/// 候補ウィンドウ（`ensure_candidate_window`はフックからのみ呼ばれる）の
+/// ウィンドウプロシージャが動くスレッドは同一（`conversion-service`の
+/// `main()`が両方を担う）。そのため`WM_APP_*`ハンドラの中で同期I/Oを
+/// 行うと、そのI/Oの間そのスレッドはメッセージポンプに戻れず、次の
+/// `LowLevelKeyboardProc`呼び出しをOSが配送できなくなる（配送待ちは
+/// `Instant::now()`ベースの計測には一切現れないが、
+/// `LowLevelHooksTimeout`には丸ごと計上される）。したがって集計・
+/// ファイル出力は**専用のバックグラウンドスレッド**（`std::thread::spawn`、
+/// フック/メッセージループとは別スレッド）に`mpsc`チャネル経由で渡す。
+///
+/// また、全打鍵を混ぜた集計P99は無意味（短いバッファでの打鍵が大多数を
+/// 占め、長文時の危険な値が埋もれる）なので、バッファ長でバケット分けし、
+/// バケットごとのmax/件数を見る。
+pub(crate) mod hook_latency {
+    use std::sync::mpsc::{self, Sender};
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    /// バケット境界（文字数）。最後は「400+」を表す番兵。
+    const BUCKET_BOUNDS: [usize; 6] = [20, 50, 100, 200, 400, usize::MAX];
+    const RING_CAPACITY: usize = 4000;
+    /// この件数ごとに、メッセージループへ非同期フラッシュを依頼する。
+    pub(super) const FLUSH_EVERY: u64 = 500;
+    /// この間隔（ミリ秒）以上打鍵が無かった直後の呼び出しは「アイドル後の
+    /// 初回変換」（ページフォールト等を含む真のコールドパス）として別集計する。
+    const COLD_PATH_GAP_MS: u128 = 2000;
+
+    #[derive(Clone, Copy)]
+    struct Sample {
+        us: u32,
+        bucket: u8,
+        consumed: bool,
+    }
+
+    struct Stats {
+        ring: Vec<Sample>,
+        next: usize,
+        total_count: u64,
+        bucket_max_ever: [u32; BUCKET_BOUNDS.len()],
+        bucket_count_ever: [u64; BUCKET_BOUNDS.len()],
+        cold_max_ever: u32,
+        cold_count_ever: u64,
+        last_call_at: Option<Instant>,
+        /// 配送遅延（GetTickCountベース、分解能約15.6ms）の最大値。
+        /// コールバック内時間には現れないがLowLevelHooksTimeoutには
+        /// 計上される「フックスレッドがメッセージポンプに戻れなかった
+        /// 時間」を捉えるための指標。
+        dispatch_delay_max_ever: u32,
+        /// GetTickCountの分解能（約15.6ms）を超える、ノイズではなさそうな
+        /// 配送遅延の件数。
+        dispatch_delay_large_count: u64,
+    }
+
+    /// バックグラウンドスレッドへ渡す、ある時点の統計の複製。
+    /// `Stats`自体を渡さずこちらを使うのは、`ring`（最大4000要素）以外は
+    /// すべてCopy型で複製が一瞬（マイクロ秒未満）で終わり、フック/
+    /// メッセージループ側のスレッドをその間だけ保持するmutexロックの
+    /// 保持時間を最小化できるため。整形・ソート・ファイルI/Oは一切
+    /// ここでは行わず、すべてバックグラウンドスレッド側に委ねる。
+    struct Snapshot {
+        ring: Vec<Sample>,
+        total_count: u64,
+        bucket_max_ever: [u32; BUCKET_BOUNDS.len()],
+        bucket_count_ever: [u64; BUCKET_BOUNDS.len()],
+        cold_max_ever: u32,
+        cold_count_ever: u64,
+        dispatch_delay_max_ever: u32,
+        dispatch_delay_large_count: u64,
+    }
+
+    /// メッセージループ側の個別ハンドラ（学習フラッシュ・候補ウィンドウ
+    /// 描画等）1回分の所要時間。フック本体のリングバッファ統計とは別に、
+    /// 「どのハンドラが同一スレッドを塞いでいるか」を直接切り分けるための
+    /// もの。ハンドラ呼び出し自体はキー入力より遥かに低頻度（確定・
+    /// 再描画のたびの1回）なので、バッチ化せず都度チャネルへ送る。
+    struct HandlerSample {
+        name: &'static str,
+        us: u32,
+    }
+
+    enum FlushMsg {
+        Hook(Snapshot),
+        Handler(HandlerSample),
+    }
+
+    static STATS: Mutex<Option<Stats>> = Mutex::new(None);
+    static FLUSH_TX: OnceLock<Sender<FlushMsg>> = OnceLock::new();
+
+    /// 統計の整形・ファイルI/Oを行う専用バックグラウンドスレッドへの
+    /// 送信チャネルを返す（初回呼び出しでスレッドを起動）。このスレッドは
+    /// フック/メッセージループのスレッドとは完全に別なので、ここでの
+    /// ディスクI/O（ウイルス対策ソフトのリアルタイムスキャン等を含めて
+    /// どれだけ遅くても）がフックの応答時間に影響することは無い。
+    fn flush_sender() -> &'static Sender<FlushMsg> {
+        FLUSH_TX.get_or_init(|| {
+            let (tx, rx) = mpsc::channel::<FlushMsg>();
+            std::thread::spawn(move || {
+                while let Ok(msg) = rx.recv() {
+                    match msg {
+                        FlushMsg::Hook(snapshot) => write_snapshot(&snapshot),
+                        FlushMsg::Handler(sample) => write_handler_sample(&sample),
+                    }
+                }
+            });
+            tx
+        })
+    }
+
+    /// メッセージループ側の個別ハンドラの所要時間を記録する。
+    /// `candidate_wndproc`（フックと同一スレッド）から、処理の前後で
+    /// `Instant::now()`を取って呼ぶこと。ここでの処理はチャネルへの
+    /// 送信のみで、ファイルI/Oは行わない。
+    pub(crate) fn record_handler(name: &'static str, elapsed: Duration) {
+        let us = elapsed.as_micros().min(u128::from(u32::MAX)) as u32;
+        let _ = flush_sender().send(FlushMsg::Handler(HandlerSample { name, us }));
+    }
+
+    fn write_handler_sample(sample: &HandlerSample) {
+        use std::io::Write;
+        let path = "C:\\Projects\\ime-live-converter\\hook_latency.log";
+        let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) else {
+            return;
+        };
+        let _ = writeln!(file, "  handler={} us={}", sample.name, sample.us);
+    }
+
+    /// バックグラウンドスレッドを前もって起動しておく。`install_hook`から
+    /// 呼ぶこと。`flush_sender`は`OnceLock::get_or_init`で初回呼び出し時に
+    /// `std::thread::spawn`（OSのスレッド作成、実測で無視できない時間が
+    /// かかり得る）を行うため、それを`record()`任せ（＝500打鍵目の
+    /// フックコールバック内）にすると、その1回だけ計測対象自身がスレッド
+    /// 作成コストで汚染される。ここで先に呼んでおくことで、実際の打鍵が
+    /// 始まる前にスレッドを立てておく。
+    pub(crate) fn ensure_started() {
+        let _ = flush_sender();
+    }
+
+    fn write_snapshot(stats: &Snapshot) {
+        use std::io::Write;
+        let path = "C:\\Projects\\ime-live-converter\\hook_latency.log";
+        let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) else {
+            return;
+        };
+        let _ = writeln!(file, "--- total_count={} ---", stats.total_count);
+        let mut prev_bound = 0usize;
+        for (i, &bound) in BUCKET_BOUNDS.iter().enumerate() {
+            let label = if bound == usize::MAX {
+                format!("{}+", prev_bound + 1)
+            } else {
+                format!("{}-{}", prev_bound + 1, bound)
+            };
+            prev_bound = bound;
+            let mut window: Vec<u32> = stats
+                .ring
+                .iter()
+                .filter(|s| s.bucket as usize == i)
+                .map(|s| s.us)
+                .collect();
+            window.sort_unstable();
+            let window_max = window.last().copied().unwrap_or(0);
+            let consumed_n = stats.ring.iter().filter(|s| s.bucket as usize == i && s.consumed).count();
+            let passthrough_n = stats.ring.iter().filter(|s| s.bucket as usize == i && !s.consumed).count();
+            let _ = writeln!(
+                file,
+                "  bucket={label:<8} count_ever={:<8} window_n={:<5} window_max_us={:<8} max_us_ever={:<8} consumed={consumed_n} passthrough={passthrough_n}",
+                stats.bucket_count_ever[i], window.len(), window_max, stats.bucket_max_ever[i],
+            );
+        }
+        let _ = writeln!(
+            file,
+            "  cold_path(gap>={}ms) count_ever={} max_us_ever={}",
+            COLD_PATH_GAP_MS, stats.cold_count_ever, stats.cold_max_ever
+        );
+        let _ = writeln!(
+            file,
+            "  dispatch_delay(GetTickCount起点、分解能約15.6ms) large_count_ever={} max_ms_ever={}",
+            stats.dispatch_delay_large_count, stats.dispatch_delay_max_ever
+        );
+    }
+
+    fn bucket_for(len: usize) -> usize {
+        BUCKET_BOUNDS.iter().position(|&b| len <= b).unwrap_or(BUCKET_BOUNDS.len() - 1)
+    }
+
+    /// コールバック内から呼ぶ。メモリ書き込みとチャネル送信のみ、
+    /// ディスクI/Oは無い。ロック競合時は記録自体を諦める（フックを
+    /// 絶対にブロックしないため。`lock()`ではなく`try_lock()`を使う）。
+    /// GetTickCountの分解能（約15.6ms）を下回る配送遅延はノイズと区別
+    /// できないため、これ未満は「無し」として扱う。
+    const DISPATCH_DELAY_NOISE_FLOOR_MS: u32 = 16;
+
+    pub(super) fn record(
+        elapsed: Duration,
+        dispatch_delay_ms: Option<u32>,
+        buffer_len: usize,
+        consumed: bool,
+    ) {
+        let us = elapsed.as_micros().min(u128::from(u32::MAX)) as u32;
+        let bucket = bucket_for(buffer_len);
+        let now = Instant::now();
+        let Ok(mut guard) = STATS.try_lock() else {
+            return;
+        };
+        let stats = guard.get_or_insert_with(|| Stats {
+            ring: Vec::with_capacity(RING_CAPACITY),
+            next: 0,
+            total_count: 0,
+            bucket_max_ever: [0; BUCKET_BOUNDS.len()],
+            bucket_count_ever: [0; BUCKET_BOUNDS.len()],
+            cold_max_ever: 0,
+            cold_count_ever: 0,
+            last_call_at: None,
+            dispatch_delay_max_ever: 0,
+            dispatch_delay_large_count: 0,
+        });
+        let cold = stats
+            .last_call_at
+            .is_some_and(|prev| now.saturating_duration_since(prev).as_millis() >= COLD_PATH_GAP_MS);
+        stats.last_call_at = Some(now);
+
+        let sample = Sample { us, bucket: bucket as u8, consumed };
+        if stats.ring.len() < RING_CAPACITY {
+            stats.ring.push(sample);
+        } else {
+            stats.ring[stats.next] = sample;
+            stats.next = (stats.next + 1) % RING_CAPACITY;
+        }
+        stats.total_count += 1;
+        stats.bucket_max_ever[bucket] = stats.bucket_max_ever[bucket].max(us);
+        stats.bucket_count_ever[bucket] += 1;
+        if cold {
+            stats.cold_max_ever = stats.cold_max_ever.max(us);
+            stats.cold_count_ever += 1;
+        }
+        if let Some(delay) = dispatch_delay_ms {
+            if delay >= DISPATCH_DELAY_NOISE_FLOOR_MS {
+                stats.dispatch_delay_max_ever = stats.dispatch_delay_max_ever.max(delay);
+                stats.dispatch_delay_large_count += 1;
+            }
+        }
+        if stats.total_count % FLUSH_EVERY == 0 {
+            // ring.clone()は最大4000要素×6バイト程度の複製で、ディスクI/O
+            // とは桁違いに速い（マイクロ秒オーダー）。整形・ソート・書き込みは
+            // 一切ここでは行わず、複製したデータをチャネル経由で専用スレッドへ
+            // 渡すだけ（`send`はブロックしない）。
+            let snapshot = Snapshot {
+                ring: stats.ring.clone(),
+                total_count: stats.total_count,
+                bucket_max_ever: stats.bucket_max_ever,
+                bucket_count_ever: stats.bucket_count_ever,
+                cold_max_ever: stats.cold_max_ever,
+                cold_count_ever: stats.cold_count_ever,
+                dispatch_delay_max_ever: stats.dispatch_delay_max_ever,
+                dispatch_delay_large_count: stats.dispatch_delay_large_count,
+            };
+            drop(guard);
+            let _ = flush_sender().send(FlushMsg::Hook(snapshot));
+        }
+    }
+}
+
 #[allow(non_snake_case)] // Win32 のコールバック名（LowLevelMouseProc と同じ流儀）
 pub extern "system" fn LowLevelKeyboardProc(
+    code: i32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    // 配送遅延（OSがこのイベントを発生させてから、このコールバックに
+    // 実際に入るまでの待ち時間）。install_hookのスレッドがメッセージ
+    // ポンプに戻れず塞がっている間、キーイベントはOS側で配送を待たされる
+    // が、この待ちはコールバック内の`Instant::now()`計測には一切現れない
+    // （コールバックに入った時点で待ちは終わっているため）。
+    // `KBDLLHOOKSTRUCT.time`にイベント発生時刻（GetTickCountベース）が
+    // 入っているので、コールバック入口の`GetTickCount()`との差を取る。
+    // 分解能は約15.6ms（GetTickCountの精度）と粗いが、判定閾値の300msを
+    // 検出するには十分。`wrapping_sub`はGetTickCountの約49.7日周期の
+    // ラップアラウンドを2の補数演算で正しく吸収する（Microsoft推奨の
+    // 比較方法）。nCode<0のときはフックの規約上メッセージを読んでは
+    // いけないため計測しない。
+    let dispatch_delay_ms = (code >= 0).then(|| {
+        let kb = unsafe { *(lparam.0 as *const KBDLLHOOKSTRUCT) };
+        unsafe { GetTickCount() }.wrapping_sub(kb.time)
+    });
+    let __hook_latency_start = std::time::Instant::now();
+    // extern "system" 境界をpanicが越えるのは未定義動作であり、フックスレッド
+    // 分離後はこのスレッドが唯一フック配送を担うため、ここでpanicして
+    // スレッドが死ぬと「変換が一切効かないが、アプリは動いている」という
+    // 最悪の見え方になる（呼び出し元には何も通知されない）。catch_unwindで
+    // 必ず捕まえ、panic時は素通し（CallNextHookEx）に倒して継続する。
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        low_level_keyboard_proc_impl(code, wparam, lparam)
+    }))
+    .unwrap_or_else(|_| unsafe { CallNextHookEx(None, code, wparam, lparam) });
+    // パスワード欄（またはフォーカス変更直後で未判定＝フェイルセーフ中）の
+    // キー入力は、計測ログにも一切残さない。バッファ長を記録しなくても、
+    // 「1打鍵につき1行」というログの構造自体が打鍵数（≒桁数）と打鍵間隔
+    // （キーストロークダイナミクス）を露呈しうるため、buffer_lenを外すだけ
+    // では不十分で、この呼び出し自体を記録から除外する必要がある
+    // （読み込みは`uia::FOCUSED_PASSWORD_STATE`のアトミックロードのみで、
+    // 新たな同期I/Oは増えない）。
+    if uia::FOCUSED_PASSWORD_STATE.load() != uia::FocusSafety::Safe {
+        return result;
+    }
+    let elapsed = __hook_latency_start.elapsed();
+    // バッファ長の取得は非ブロッキング（try_lock）。競合時は0扱いにする
+    // （フックを絶対にブロックしないため、失敗を許容する設計）。
+    let buffer_len = LIVE_CONTEXT
+        .get()
+        .and_then(|m| m.try_lock().ok())
+        .map(|c| c.hiragana_buffer.chars().count())
+        .unwrap_or(0);
+    // CallNextHookExの戻り値をそのまま返す経路は概ね0、消費（LRESULT(1)等）は
+    // 非0という既存コードの慣行に基づく近似判定（推測: 下流フックが独自に
+    // 非0を返すケースは考慮していない）。
+    let consumed = result.0 != 0;
+    hook_latency::record(elapsed, dispatch_delay_ms, buffer_len, consumed);
+    result
+}
+
+#[allow(non_snake_case)]
+fn low_level_keyboard_proc_impl(
     code: i32,
     wparam: WPARAM,
     lparam: LPARAM,
@@ -646,6 +1004,37 @@ pub extern "system" fn LowLevelKeyboardProc(
         let kb = *(lparam.0 as *const KBDLLHOOKSTRUCT);
         let event = wparam.0 as u32;
 
+        // パスワード欄では他の判定より前に完全パススルーする（ログも一切
+        // 残さない）。グローバルキーボードフック＋SendInputという構成は
+        // 振る舞いがキーロガーと完全に一致するため、この判定は配布可否に
+        // 直結する。判定は`crate::uia`の背景ポーラーが更新するキャッシュ
+        // （UI Automationの`IsPassword`プロパティ、または`ES_PASSWORD`
+        // スタイルの古典的Win32エディットコントロール）を見るだけで、
+        // フックスレッド内で同期COM呼び出しは一切行わない
+        // （`GetGUIThreadInfo`/`SendMessage`等をここで直接呼ぶと
+        // クロスプロセスの同期待ちでフックをブロックしうるため）。
+        //
+        // `Safe`（＝パスワード欄ではないと判定済み）以外は全て素通しする。
+        // `Unknown`（フォーカスが変わった直後でまだ未判定）も含めて
+        // フェイルセーフする ── ポーリング間隔の間だけ「安全」を騙って
+        // しまう窓を作らないため（`SetWinEventHook`によるフォーカス変更の
+        // 即時検出と対になる設計。`uia::FocusSafety`のドキュメント参照）。
+        if uia::FOCUSED_PASSWORD_STATE.load() != uia::FocusSafety::Safe {
+            return CallNextHookEx(None, code, wparam, lparam);
+        }
+
+        // フォアグラウンド窓が自分より高い整合性レベル（管理者権限で起動された
+        // プロセス等）で動いている場合もキーを消費せず素通しする。UIPI
+        // (User Interface Privilege Isolation)により、低整合性の自プロセスから
+        // `SendInput`で変換結果を送り込んでも高整合性側には拒否されるため、
+        // ここでキーを消費すると原文字も変換結果もどちらも届かず消える
+        // （判定は`crate::uia`の背景ポーラーが更新するキャッシュを見るだけで、
+        // フックスレッド内で`OpenProcess`/`GetTokenInformation`等の同期呼び出しは
+        // 一切行わない）。`Safe`以外は素通し（上記と同じフェイルセーフ）。
+        if uia::FOCUSED_ELEVATED_STATE.load() != uia::FocusSafety::Safe {
+            return CallNextHookEx(None, code, wparam, lparam);
+        }
+
         // 他の判定より前に、Shift押下状態をレースなく更新する
         // （早期returnの影響を受けないよう最優先で行う）。
         track_shift_state(kb.vkCode, event);
@@ -654,9 +1043,16 @@ pub extern "system" fn LowLevelKeyboardProc(
         if event == WM_KEYDOWN || event == WM_SYSKEYDOWN {
             debug_log!("キー入力検出: vkCode={}, flags={}", kb.vkCode, kb.flags.0);
         }
-        
-        // 自分が送信したキーは無視
-        if (kb.flags.0 & LLKHF_INJECTED.0) != 0 {
+
+        // 自分（IME本体）が送信したキーだけを無視する。
+        //
+        // 以前は`LLKHF_INJECTED`（SendInputによる合成キー全般）だけで
+        // 判定しており、他プロセスからの正当な注入（負荷計測用ハーネスの
+        // SendInput等）まで無条件に無視してしまっていた。dwExtraInfoに
+        // 自分専用のマーカー（`SELF_INJECTED_MAGIC`）を持つ注入だけを
+        // 自己送信として除外し、それ以外の注入（マーカー無しの他プロセス
+        // 由来）は物理キーと同様に処理する。
+        if is_self_injected(kb.flags.0, kb.dwExtraInfo) {
             debug_log!("自己送信キーをスキップ");
             return CallNextHookEx(None, code, wparam, lparam);
         }
@@ -665,6 +1061,48 @@ pub extern "system" fn LowLevelKeyboardProc(
         // 自分が送るBackspace/Enter等の連続送出を「押しっぱなし」と
         // 誤認識すると、次の本物のキー入力まで誤ってリピート扱いされる）。
         let is_key_repeat = track_key_repeat(kb.vkCode, event);
+
+        // Ctrl+Space: ライブ変換全体のトグル（緊急OFF/ON用）。
+        //
+        // 必ずこの下の`if !IS_ENABLED`パススルーより前に置くこと。以前は
+        // その下（`event == WM_KEYDOWN`ブロック内）にあったため、一度
+        // 無効化すると次のCtrl+Spaceがパススルー側で先に消費されて二度と
+        // 有効化できなくなる実機バグがあった（`set_enabled`のDLL export
+        // はキーボードから到達できず、`--background`起動ではstdinも無い
+        // ため、プロセス再起動以外に復旧手段が無かった）。
+        //
+        // Shift/Altが同時押しなら別のショートカット（今回の実機事故は
+        // Ctrl+Shift+Spaceが変換キー代わりの復元ホットキーのつもりで
+        // Ctrl+Spaceとして誤判定されたのが原因）として扱い、ここでは
+        // 反応しない。キーリピート（押しっぱなし）でも連打扱いにしない。
+        if (event == WM_KEYDOWN || event == WM_SYSKEYDOWN)
+            && is_ctrl_pressed()
+            && !is_shift_pressed()
+            && !is_alt_pressed()
+            && !is_key_repeat
+            && kb.vkCode == VK_SPACE.0 as u32
+        {
+            IS_ENABLED = !IS_ENABLED;
+            debug_log!("ライブ変換トグル: {}", if IS_ENABLED { "有効" } else { "無効" });
+            if !IS_ENABLED {
+                OUR_ACTIVE = false;
+                hide_candidate_window();
+                if let Some(context_mutex) = LIVE_CONTEXT.get() {
+                    if let Ok(mut context) = context_mutex.try_lock() {
+                        context.romaji_buffer.clear();
+                        context.hiragana_buffer.clear();
+                        context.pinned.clear();
+                        context.conversion_result.clear();
+                        context.last_sent_length = 0;
+                    }
+                }
+            }
+            // このトグルは無言で起きてはいけない（今回の実機事故で「変換が
+            // 無効になったこと」自体に気づく手段が無かった）。有効/無効
+            // どちらの方向でも必ず表示する。
+            flash_mode_indicator(if IS_ENABLED { "変換 ON" } else { "変換 OFF" });
+            return LRESULT(1);
+        }
 
         // 有効でない場合はパススルー
         if !IS_ENABLED {
@@ -689,8 +1127,10 @@ pub extern "system" fn LowLevelKeyboardProc(
             // Ctrl+Alt+A: モードに応じて設定ウィンドウを出し分ける。
             //  - 日本語変換モード（OUR_ACTIVE=true） → 単語登録ウィンドウ
             //  - それ以外（コマンドモード/英数）   → コマンド/エイリアス設定ウィンドウ
-            // 両者は交わらない別モーダル。
-            if is_ctrl_pressed() && is_alt_pressed() && vk_code == 0x41 {
+            // 両者は交わらない別モーダル。Shift併用は対象外にする（実害はほぼ
+            // 無いが、Ctrl+Spaceの件と同じ「なぜここだけ厳密一致か」を将来
+            // 悩まないよう、修飾キー判定は統一しておく）。
+            if is_ctrl_pressed() && is_alt_pressed() && !is_shift_pressed() && vk_code == 0x41 {
                 if OUR_ACTIVE {
                     open_word_settings_window();
                 } else {
@@ -705,25 +1145,8 @@ pub extern "system" fn LowLevelKeyboardProc(
                 return LRESULT(1); // 元のキーは MS-IME に渡さず消費
             }
 
-            // Ctrl+Space: ライブ変換全体のトグル (緊急 OFF 用)
-            if is_ctrl_pressed() && vk_code == VK_SPACE.0 as u32 {
-                IS_ENABLED = !IS_ENABLED;
-                debug_log!("ライブ変換トグル: {}", if IS_ENABLED { "有効" } else { "無効" });
-                if !IS_ENABLED {
-                    OUR_ACTIVE = false;
-                    hide_candidate_window();
-                    if let Some(context_mutex) = LIVE_CONTEXT.get() {
-                        if let Ok(mut context) = context_mutex.try_lock() {
-                            context.romaji_buffer.clear();
-                            context.hiragana_buffer.clear();
-                            context.pinned.clear();
-                            context.conversion_result.clear();
-                            context.last_sent_length = 0;
-                        }
-                    }
-                }
-                return LRESULT(1);
-            }
+            // （Ctrl+Spaceのライブ変換トグルは、`!IS_ENABLED`のパススルーより
+            // 前（この関数の先頭付近）へ移設済み。理由はそちらのコメント参照）。
 
             // （初期モードは sync_window_mode が環境ごとに決めるのでここでは何もしない）
 
@@ -732,13 +1155,23 @@ pub extern "system" fn LowLevelKeyboardProc(
             //     よく使うコマンドを前方一致で提案。Enterで履歴学習）。
             //   - それ以外 → 従来どおりパススルー。
             if !OUR_ACTIVE {
+                // この先は全てパススルー（確定経路を経由しない文字挿入がありうる）
+                // なので、確定後の復元用リングバッファを無効化する
+                // （[[commit-ring-buffer]]）。
+                if let Some(context_mutex) = LIVE_CONTEXT.get() {
+                    if let Ok(mut context) = context_mutex.try_lock() {
+                        context.invalidate_commit_ring();
+                    }
+                }
                 if IS_ENABLED && is_terminal_focused() {
                     // Ctrl+数字(1〜9): コマンド候補一覧を番号で直接選んで実行する。
                     // 素の数字キーは git log -1 やポート番号等、実際のコマンド
                     // 文字列で頻繁に使うため選択キーにできない（Ctrl併用なら
                     // 衝突しない）。対象候補が無ければ None が返り、下の通常の
                     // Ctrl/Alt処理（追跡中断・パススルー）にそのまま委ねる。
-                    if is_ctrl_pressed() && !is_alt_pressed() && (0x31..=0x39).contains(&vk_code) {
+                    // Shift併用は対象外（Ctrl+Space問題と同じ理由で修飾キー
+                    // 判定を統一しておく）。
+                    if is_ctrl_pressed() && !is_alt_pressed() && !is_shift_pressed() && (0x31..=0x39).contains(&vk_code) {
                         if let Some(r) = command_select_by_number((vk_code - 0x31) as usize) {
                             return r;
                         }
@@ -773,20 +1206,146 @@ pub extern "system" fn LowLevelKeyboardProc(
                 return CallNextHookEx(None, code, wparam, lparam);
             }
 
+            // 確定後の復元（[[commit-ring-buffer]]）。ホットキー（変換キー）を
+            // 押すと、直近の確定のn-best候補を候補ウィンドウに表示するだけで、
+            // この時点では画面上の文字は一切変更しない。ホットキーをもう一度
+            // 押すと選択が次候補へ進む（巡回。確定するまでは`commit_ring`
+            // 自体も変更されない）。Enterで選択中の候補を確定（Backspace+
+            // 挿入）、Escは無傷で抜ける。復元選択中に上記以外のキーが来たら、
+            // モーダルに固執せず黙って復元を打ち切り、そのキーは通常どおり
+            // 処理する。
+            //
+            // 実機事故によりCtrl+Shift+Spaceのフォールバックは廃止した:
+            // 既存のCtrl+Spaceトグル判定がShiftを見ておらず、Ctrl+Shift+
+            // SpaceがCtrl+Spaceとして誤判定されライブ変換ごと無効化されて
+            // いた（この関数の先頭付近の修正コメント参照）。Ctrl+Spaceを
+            // 含む組み合わせは既存機能と衝突するため、変換キー単体のみに
+            // する。フォールバックが必要なら、Ctrl+SpaceともCtrl+Shiftとも
+            // 独立した組み合わせ（例: Ctrl+.）を別途検討すること。
+            {
+                use windows::Win32::UI::Input::KeyboardAndMouse::VK_CONVERT;
+                let is_restore_hotkey = vk_code == VK_CONVERT.0 as u32;
+                if let Some(context_mutex) = LIVE_CONTEXT.get() {
+                    if is_restore_hotkey {
+                        // キーリピート（押しっぱなし）では候補を進めない。
+                        if !is_key_repeat {
+                            if let Ok(mut context) = context_mutex.try_lock() {
+                                if let Some((candidates, selected)) = context.press_restore_hotkey() {
+                                    drop(context);
+                                    show_candidate_window(&candidates, selected);
+                                }
+                            }
+                        }
+                        return LRESULT(1);
+                    }
+                    if let Ok(mut context) = context_mutex.try_lock() {
+                        if context.is_restoring() {
+                            if vk_code == VK_RETURN.0 as u32 {
+                                let action = context.confirm_restore();
+                                drop(context);
+                                hide_candidate_window();
+                                if let Some(action) = action {
+                                    execute_action(action);
+                                }
+                                return LRESULT(1);
+                            }
+                            if vk_code == VK_ESCAPE.0 as u32 {
+                                context.cancel_restore();
+                                drop(context);
+                                hide_candidate_window();
+                                return LRESULT(1);
+                            }
+                            // ↑↓とSpaceは候補の巡回に使う（標準IMEと同じ
+                            // 挙動。Spaceはホットキー再押下と同じ扱い＝次候補、
+                            // ↑は前候補）。この関数の外側にある「方向キーは
+                            // 無効化条件」という一般ルールより、復元選択中は
+                            // こちらを優先する（このブロックがreturnで確定する
+                            // ため、後段の無効化チェックには到達しない）。
+                            if vk_code == VK_UP.0 as u32
+                                || vk_code == VK_DOWN.0 as u32
+                                || vk_code == VK_SPACE.0 as u32
+                            {
+                                if !is_key_repeat {
+                                    let backwards = vk_code == VK_UP.0 as u32;
+                                    if let Some((candidates, selected)) =
+                                        context.cycle_restore_candidate(backwards)
+                                    {
+                                        drop(context);
+                                        show_candidate_window(&candidates, selected);
+                                    }
+                                }
+                                return LRESULT(1);
+                            }
+                            // 数字キー1-9: 標準IMEの候補一覧と同じく、番号で
+                            // 直接選んでその場で確定する（巡回不要）。
+                            if (0x31..=0x39).contains(&vk_code) {
+                                let index = (vk_code - 0x31) as usize;
+                                let action = context.confirm_restore_at(index);
+                                drop(context);
+                                if action.is_some() {
+                                    hide_candidate_window();
+                                }
+                                if let Some(action) = action {
+                                    execute_action(action);
+                                }
+                                return LRESULT(1);
+                            }
+                            // 他のキーが来たら復元を打ち切り、このキー自体は
+                            // フォールスルーして通常どおり処理する。
+                            context.cancel_restore();
+                            drop(context);
+                            hide_candidate_window();
+                        }
+                    }
+                }
+            }
+
             // 念のため: MS-IME が外部要因で再オープンされていたら毎回閉じ直す
             // (ユーザーがタスクトレイ等から触った場合の保険)
             // ※ パフォーマンス劣化を避けるため、特定キーだけにしてもよいが
             //   今はシンプルに毎回呼ぶ。
             // close_ms_ime_for_foreground();  // 必要なら有効化
 
-            // 修飾キー組み合わせはパススルー
+            // 修飾キー組み合わせはパススルー。Ctrl+V（貼り付け）等、確定経路を
+            // 経由しない文字挿入がここに含まれるため、確定後の復元用リング
+            // バッファを無効化する（[[commit-ring-buffer]]。Ctrl/Altの
+            // 組み合わせ全般を対象にする保守的な判定で、
+            // 貼り付け以外のショートカット（Ctrl+C等、文字を挿入しないもの）
+            // も含めて無効化するが、実害はない）。
             if is_ctrl_pressed() || is_alt_pressed() {
+                if let Some(context_mutex) = LIVE_CONTEXT.get() {
+                    if let Ok(mut context) = context_mutex.try_lock() {
+                        context.invalidate_commit_ring();
+                    }
+                }
                 return CallNextHookEx(None, code, wparam, lparam);
             }
 
             if let Some(context_mutex) = LIVE_CONTEXT.get() {
                 // try_lockでブロッキングを回避
                 if let Ok(mut context) = context_mutex.try_lock() {
+                    // 確定後の復元用リングバッファの無効化条件（器のみ、復元は
+                    // 未実装。[[commit-ring-buffer]]）。方向キー・Home/End/
+                    // Page/Delete/Backspaceはカーソル位置を確定直後の位置から
+                    // 動かしうるため、composing中か・ポップアップでの流用
+                    // （候補/予測一覧のUP/DOWN移動等）かを区別せず、無条件に
+                    // リングを無効化する（保守的に倒す：復元できない場面が
+                    // 増えるのは軽い不満だが、ズレた位置への復元は他の文章を
+                    // 破壊するため）。フォーカス変更（uia.rs）・マウスクリック
+                    // （on_click_outside_popup）でも同様に無効化している。
+                    {
+                        use windows::Win32::UI::Input::KeyboardAndMouse::{
+                            VK_DELETE, VK_END, VK_HOME, VK_NEXT, VK_PRIOR,
+                        };
+                        const CURSOR_MOVING_OR_DELETING_VKS: [u16; 10] = [
+                            VK_LEFT.0, VK_RIGHT.0, VK_UP.0, VK_DOWN.0, VK_HOME.0, VK_END.0,
+                            VK_PRIOR.0, VK_NEXT.0, VK_DELETE.0, VK_BACK.0,
+                        ];
+                        if CURSOR_MOVING_OR_DELETING_VKS.contains(&(vk_code as u16)) {
+                            context.invalidate_commit_ring();
+                        }
+                    }
+
                     // 数字キー 1-9: 候補一覧の表示中は番号で直接選択して確定
                     // （選んだ = その変換が正しい、として学習にも記録される）
                     if (0x31..=0x39).contains(&vk_code)
@@ -896,6 +1455,10 @@ pub extern "system" fn LowLevelKeyboardProc(
                         } else {
                             None
                         };
+                        // このキー自体はアプリへそのまま渡す＝確定経路を
+                        // 経由しない文字挿入なので、リングバッファを無効化する
+                        // （[[commit-ring-buffer]]）。
+                        context.invalidate_commit_ring();
                         drop(context);
                         if let Some(action) = action {
                             execute_action(action);
@@ -957,6 +1520,9 @@ pub extern "system" fn LowLevelKeyboardProc(
                         && vk_to_ascii(vk_code, is_shift_pressed()).is_some()
                     {
                         let action = context.commit();
+                        // このキー自体は確定経路を経由せずアプリへ渡る文字挿入
+                        // なので、リングバッファを無効化する（[[commit-ring-buffer]]）。
+                        context.invalidate_commit_ring();
                         drop(context);
                         if let Some(action) = action {
                             execute_action(action);
@@ -993,11 +1559,28 @@ pub extern "system" fn LowLevelKeyboardProc(
                         return CallNextHookEx(None, code, wparam, lparam);
                     }
 
+                    // 最初のTabで補完を要求。候補がなければ通常変換へ進む。
+                    // 表示中のTab・Shift+Tabは従来の同音候補に切り替える。
+                    if vk_code == VK_TAB.0 as u32
+                        && !is_shift_pressed()
+                        && context.is_composing()
+                        && context.candidates.is_empty()
+                        && !candidate_window_visible()
+                    {
+                        context.request_predictions();
+                        if !context.predictions.is_empty() {
+                            let preds = context.prediction_display();
+                            drop(context);
+                            show_prediction_popup(&preds, 0);
+                            return LRESULT(1);
+                        }
+                    }
+
                     // 通常変換（候補一覧）:
                     //   Tab / ↓ : 次候補（Shift+Tab は前へ）
                     //   ↑       : 前候補
                     // 変換中に押すと候補一覧を表示し、選択を移動する。
-                    // Tab は常に「通常変換（同音候補の切替）」に使う。
+                    // 予測表示中のTabは「通常変換（同音候補の切替）」に使う。
                     // もしかして/予測は Tab では確定しない（誤ったもしかしてを
                     // Tab で誤爆させないため）。予測の確定は Enter か番号キーで行う。
                     // Tab を押すと下の cycle_candidate が走り、予測ポップアップは
@@ -1048,15 +1631,9 @@ pub extern "system" fn LowLevelKeyboardProc(
                     // ←→: カーソルを1文字移動する（横矢印＝カーソル移動）。
                     //   変換中なら、まず今の変換を確定してからカーソルを動かす
                     //   （確定せず素通しすると下書きとズレるため）。
-                    //   同じ向きを素早く2回押したら行端へジャンプ（←=Home / →=End）。
+                    //   長押し・OSリピートでは追加の矢印を送り、スマホの
+                    //   スペース長押しに近い加速カーソル移動にする。
                     if vk_code == VK_LEFT.0 as u32 || vk_code == VK_RIGHT.0 as u32 {
-                        // イベントのタイムスタンプ(ms)で連打を判定（GetTickCount 相当）
-                        let now = kb.time;
-                        let is_double = LAST_ARROW_VK == vk_code
-                            && now.wrapping_sub(LAST_ARROW_TICK) <= ARROW_DOUBLE_TAP_MS;
-                        LAST_ARROW_VK = vk_code;
-                        LAST_ARROW_TICK = now;
-
                         let action = if context.is_composing() {
                             context.commit()
                         } else {
@@ -1067,20 +1644,20 @@ pub extern "system" fn LowLevelKeyboardProc(
                             execute_action(action);
                         }
                         hide_candidate_window();
-                        if is_double {
-                            // 連打 → 行端へジャンプ（元の矢印は消費して Home/End に置換）
-                            let edge = if vk_code == VK_LEFT.0 as u32 { VK_HOME } else { VK_END };
-                            send_vk(edge);
-                            return LRESULT(1);
+                        if is_key_repeat {
+                            // OSのリピート1回につき追加1回。元の矢印はそのまま
+                            // 通すため、押し始めは通常速度、長押しだけ2倍速になる。
+                            let arrow = if vk_code == VK_LEFT.0 as u32 { VK_LEFT } else { VK_RIGHT };
+                            send_vk(arrow);
                         }
-                        // 単発 → 元の矢印をアプリに渡してカーソルを1文字動かす
+                        // 元の矢印をアプリに渡してカーソルを1文字動かす
                         return CallNextHookEx(None, code, wparam, lparam);
                     }
 
                     // Enter: 確定のみ（IME標準動作: 変換中のEnterは改行しない）
                     if vk_code == VK_RETURN.0 as u32 && context.is_composing() {
                         // 予測変換（もしかして/補完）が表示中なら、Enter で
-                        // ↑↓で選択中の予測を確定する（番号キーでも選べる）。
+                        // 選択中の予測を確定する（初期選択は先頭。番号キーでも選べる）。
                         if candidate_window_visible()
                             && context.candidates.is_empty()
                             && !context.predictions.is_empty()
@@ -1169,6 +1746,19 @@ mod key_repeat_tests {
 #[cfg(test)]
 mod hook_pure_fn_tests {
     use super::*;
+
+    #[test]
+    fn self_injected_requires_both_flag_and_magic() {
+        // LLKHF_INJECTEDが立っていても、マーカーが無ければ自己送信ではない
+        // （負荷計測用ハーネス等、他プロセスからの正当な注入を通すため）。
+        assert!(!is_self_injected(LLKHF_INJECTED.0, 0));
+        assert!(!is_self_injected(LLKHF_INJECTED.0, 0xDEAD_BEEF));
+        // マーカーがあってもLLKHF_INJECTEDが立っていなければ自己送信ではない
+        // （物理キーにマーカーが付くことは無いはずだが、念のため両方を要求する）。
+        assert!(!is_self_injected(0, SELF_INJECTED_MAGIC));
+        // 両方揃って初めて自己送信として除外する
+        assert!(is_self_injected(LLKHF_INJECTED.0, SELF_INJECTED_MAGIC));
+    }
 
     #[test]
     fn vk_to_char_maps_lowercase_letters_without_shift() {

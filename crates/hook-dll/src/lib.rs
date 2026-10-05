@@ -22,7 +22,7 @@ use windows::Win32::{
         SendInput, INPUT, INPUT_KEYBOARD, KEYBDINPUT, INPUT_0,
         KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
         VK_BACK, VK_RETURN, VK_ESCAPE, VK_SPACE, VK_TAB, VK_LEFT, VK_RIGHT, VK_UP, VK_DOWN,
-        VK_HOME, VK_END, VK_SHIFT, VK_CONTROL, VK_MENU,
+        VK_SHIFT, VK_CONTROL, VK_MENU,
         VIRTUAL_KEY,
     },
     UI::Input::Ime::{
@@ -33,47 +33,26 @@ use windows::Win32::{
 };
 use windows::core::w;
 
-use common::{RomajiConverter, Dictionary, ViterbiConverter, LearningRepository};
+use common::LearningRepository;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
-/// デバッグログ有効判定（IME_DEBUG_LOG=1 のときのみ）
-///
-/// このログはシステム全体のキー入力を平文でファイルに残すため
-/// （パスワード入力も含まれ得る）、既定では完全に無効。
-/// 調査時のみ `IME_DEBUG_LOG=1` で起動して有効化すること。
-fn debug_log_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("IME_DEBUG_LOG").map(|v| v == "1").unwrap_or(false)
-    })
-}
-
-// デバッグログ（UTF-8 BOM付きで出力、IME_DEBUG_LOG=1 のときのみ）
-#[allow(unused_macros)]
-macro_rules! debug_log {
-    ($($arg:tt)*) => {
-        if crate::debug_log_enabled() {
-            use std::io::Write;
-            let path = "C:\\Projects\\ime-live-converter\\hook_debug.log";
-            let needs_bom = !std::path::Path::new(path).exists();
-            if let Ok(mut file) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-            {
-                if needs_bom {
-                    let _ = file.write_all(&[0xEF, 0xBB, 0xBF]);
-                }
-                let _ = writeln!(file, "[IME] {}", format!($($arg)*));
-            }
-        }
-    };
-}
+// `debug_log!`マクロ本体と`debug_log_enabled`は`common`へ移設した
+// （[[golden-test-harness]]でLiveConversionStateをcommonへ移した際、
+// そこからの呼び出しを成立させるため）。crateルートで再公開することで、
+// 既存の呼び出し箇所（bareな`debug_log!(...)`）は無変更のまま動く。
+pub(crate) use common::debug_log;
 
 // グローバル変数
-static mut HOOK_HANDLE: Option<HHOOK> = None;
-/// 低レベルマウスフック（ポップアップ外クリックで閉じるため。`hook::LowLevelMouseProc`）
+/// キーボードフック専用スレッド（[[hook-latency-log-thread-model]]対応）。
+/// `WH_KEYBOARD_LL`は`hook_thread::HookThread`が管理する専用スレッドで
+/// インストールする（候補ウィンドウの描画・SQLite書き込み等の同期処理から
+/// フック配送を完全に切り離すため）。`HOOK_HANDLE`（後述）はもう使わない。
+static HOOK_THREAD: Mutex<Option<hook_thread::HookThread>> = Mutex::new(None);
+/// 低レベルマウスフック（ポップアップ外クリックで閉じるため。`hook::LowLevelMouseProc`）。
+/// キーボードフックとは異なりUI（メイン）スレッドに残したままにする
+/// （クリック検出自体は軽量で、候補ウィンドウの直接操作と同じスレッドに
+/// あることに問題は無い）。
 static mut MOUSE_HOOK_HANDLE: Option<HHOOK> = None;
 /// 変換状態（OnceLock: `static mut` への参照は未定義動作の恐れがあり警告になるため）。
 /// 解放はできないため、アンインストール後も保持したまま（プロセス終了で回収）。
@@ -85,17 +64,21 @@ static mut OUR_ACTIVE: bool = false;
 static mut INITIAL_CHECK_DONE: bool = false;
 
 // 機能別モジュール（詳細は各ファイル先頭の //! を参照）
+// `conversion`（`LiveConversionState`等）と`brackets`は`common`へ移設済み
+// （CLIとhook-dllが同一の変換エンジンを使うようにするため。
+// [[golden-test-harness]]参照）。
 mod command_mode;
-mod brackets;
-mod conversion;
 mod hook;
+mod hook_thread;
 mod popup;
 mod settings_ui;
 mod uia;
+#[cfg(test)]
+mod golden_tests;
 
 // 旧単一ファイル時代からの相互参照が多いため、クレート内へフラットに再公開する
 pub(crate) use command_mode::*;
-pub(crate) use conversion::*;
+pub(crate) use common::conversion::*;
 pub(crate) use hook::*;
 pub(crate) use popup::*;
 pub(crate) use settings_ui::*;
@@ -110,6 +93,9 @@ pub extern "C" fn install_hook() -> bool {
         let mut state = LiveConversionState::new();
         // 確定時の学習（DB書き込み）はフックの外（メッセージループ）で処理する
         state.defer_learning = true;
+        // `common`crateはWin32非依存のため、遅延通知の実手段（PostMessageW）を
+        // 持たない。実運用（フック配送）ではここで注入する。
+        state.request_deferred_learning = Some(popup::request_deferred_learning);
         // 学習DBをオープン（CLIと共有。失敗しても変換は継続できる）
         match LearningRepository::open("ime-learning.db") {
             Ok(learning) => {
@@ -143,6 +129,15 @@ pub extern "C" fn install_hook() -> bool {
 
         // 入力欄の位置を追う UI Automation ポーラーを開始（ポップアップ位置用）
         start_uia_poller();
+        // パスワード欄/昇格プロセス判定を、ポーリング（最大250ms遅延）だけに
+        // 頼らず、フォーカス変更の瞬間に`Unknown`へ落とすための監視を開始する。
+        // UIスレッド（今この関数を呼んでいるスレッド）で行う必要がある
+        // （`SetWinEventHook`はWINEVENT_OUTOFCONTEXTでも登録元スレッドが
+        // メッセージポンプを回し続けている必要があるため）。
+        uia::install_focus_watch();
+        // フックレイテンシ統計のバックグラウンド書き出しスレッドを前もって
+        // 起動しておく（初回打鍵時にスレッド作成コストが乗らないように）
+        hook::hook_latency::ensure_started();
         // （LLM校正は実用性が低いため廃止。誤字補正は「もしかして」＝即時fuzzy）
         INITIAL_CHECK_DONE = false;
         
@@ -163,20 +158,30 @@ pub extern "C" fn install_hook() -> bool {
         };
         
         println!("Installing hook with HINSTANCE: {:?}", hinstance);
-        
-        let hook = SetWindowsHookExW(
-            WINDOWS_HOOK_ID(13), // WH_KEYBOARD_LL (14はWH_MOUSE_LL)
-            Some(LowLevelKeyboardProc),
-            hinstance,
-            0,
-        );
 
-        match hook {
-            Ok(h) => {
-                HOOK_HANDLE = Some(h);
-                println!("Keyboard hook installed successfully");
+        // このスレッド（install_hookの呼び出し元＝conversion-serviceの
+        // メインスレッド）をUIスレッドとして記録し、候補ウィンドウを
+        // 先に（非表示で）作っておく。フックスレッド起動より前に行う
+        // こと（post_ui_commandの宛先が無く指示が誰にも引き取られない
+        // 事故を防ぐため）。既にUIスレッドとして記録済み（再インストール）
+        // でも、候補ウィンドウは`ensure_candidate_window`内の早期returnで
+        // 二重生成されない。
+        popup::init_ui_thread();
+
+        // WH_KEYBOARD_LLは専用スレッドでインストールする
+        // （[[hook-latency-log-thread-model]]。候補ウィンドウの描画や
+        // SQLite書き込み等の同期処理からフック配送を切り離すため）。
+        match hook_thread::HookThread::start() {
+            Ok(ht) => {
+                if let Ok(mut guard) = HOOK_THREAD.lock() {
+                    *guard = Some(ht);
+                }
+                println!("Keyboard hook thread started successfully");
                 // ポップアップ（予測変換・候補一覧・コマンド候補）の外側をクリック
-                // したら閉じるためのマウスフック。失敗しても変換自体は動くので警告のみ。
+                // したら閉じるためのマウスフック。キーボードフックとは異なり
+                // UIスレッド自身にインストールする（クリック検出は軽量で、
+                // 候補ウィンドウの直接操作と同じスレッドにあっても問題ない）。
+                // 失敗しても変換自体は動くので警告のみ。
                 match SetWindowsHookExW(
                     WINDOWS_HOOK_ID(14), // WH_MOUSE_LL
                     Some(LowLevelMouseProc),
@@ -208,7 +213,18 @@ pub extern "C" fn uninstall_hook() -> bool {
         IS_ENABLED = false;
         OUR_ACTIVE = false;
         INITIAL_CHECK_DONE = false;
-        hide_candidate_window();
+        // 候補ウィンドウを破棄する前に、遅延させていた学習（`WM_APP_FLUSH_LEARNING`
+        // 待ち）を今のうちに反映させる。ここで flush せずに DestroyWindow すると、
+        // ポストされたメッセージがメッセージループに届く前にウィンドウが消え、
+        // 溜めていた学習が失われたまま無効化・アンインストールされてしまう。
+        if let Some(context_mutex) = LIVE_CONTEXT.get() {
+            if let Ok(mut context) = context_mutex.lock() {
+                context.flush_pending_learning();
+            }
+        }
+        // `hide_candidate_window()`は今やUiCommand経由の非同期post（次に
+        // WM_APP_UI_COMMANDが処理されるまで反映されない）なので、直後に
+        // DestroyWindowする以下の同期的な破棄で代替する（呼ぶ意味が無い）。
         let candidate_hwnd = CANDIDATE_HWND; // static mut への参照(take)を避けるため値コピー
         CANDIDATE_HWND = None;
         if let Some(hwnd) = candidate_hwnd {
@@ -220,13 +236,20 @@ pub extern "C" fn uninstall_hook() -> bool {
             let _ = UnhookWindowsHookEx(mh);
             MOUSE_HOOK_HANDLE = None;
         }
-        if let Some(hook) = HOOK_HANDLE {
-            let result = UnhookWindowsHookEx(hook);
-            HOOK_HANDLE = None;
-            // LIVE_CONTEXT (OnceLock) は解放できないが、プロセス終了時に回収されるため
-            // ここでは触らない（再インストール時は install_hook が中身を入れ替える）。
-            println!("Keyboard hook uninstalled");
-            result.is_ok()
+        uia::uninstall_focus_watch();
+        // IS_ENABLED=falseは既に立てた（フックスレッドは生きたままでも以降の
+        // 打鍵を処理しなくなる）ので、最後にフックスレッドを止めてjoinする。
+        // `HookThread::stop`はWM_QUITを送ってポンプを抜けさせ、スレッド自身が
+        // 同じスレッドでUnhookWindowsHookExを行ってから終了する
+        // （SetWindowsHookExWを呼んだのと同じスレッドからアンフックする必要が
+        // あるため）。
+        // LIVE_CONTEXT (OnceLock) は解放できないが、プロセス終了時に回収されるため
+        // ここでは触らない（再インストール時は install_hook が中身を入れ替える）。
+        let taken = HOOK_THREAD.lock().ok().and_then(|mut g| g.take());
+        if let Some(mut ht) = taken {
+            ht.stop();
+            println!("Keyboard hook thread stopped");
+            true
         } else {
             false
         }

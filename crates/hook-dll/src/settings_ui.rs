@@ -910,8 +910,15 @@ pub(crate) extern "system" fn settings_wndproc(hwnd: HWND, msg: u32, wparam: WPA
     }
 }
 
-/// エイリアス設定ウィンドウを開く（なければ作る）。ホットキー Ctrl+Alt+A から呼ぶ。
+/// エイリアス設定ウィンドウを開く（なければ作る）。ホットキー Ctrl+Alt+A から
+/// 呼ぶ。どのスレッドからも呼べる（実処理はUIスレッドへ`post_ui_command`で
+/// 委ねる）。
 pub(crate) unsafe fn open_settings_window() {
+    crate::popup::post_ui_command(crate::popup::UiCommand::OpenSettings);
+}
+
+pub(crate) unsafe fn open_settings_window_impl() {
+    crate::popup::debug_assert_current_thread_is_ui("open_settings_window_impl");
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, RegisterClassW, ShowWindow, SW_SHOW,
         WNDCLASSW, WS_CAPTION, WS_OVERLAPPED, WS_SYSMENU, WS_VISIBLE,
@@ -1342,8 +1349,15 @@ pub(crate) extern "system" fn word_settings_wndproc(
     }
 }
 
-/// 単語登録ウィンドウを開く（なければ作る）。日本語変換モードの Ctrl+Alt+A から呼ぶ。
+/// 単語登録ウィンドウを開く（なければ作る）。日本語変換モードの Ctrl+Alt+A から
+/// 呼ぶ。どのスレッドからも呼べる（実処理はUIスレッドへ`post_ui_command`で
+/// 委ねる）。
 pub(crate) unsafe fn open_word_settings_window() {
+    crate::popup::post_ui_command(crate::popup::UiCommand::OpenWordSettings);
+}
+
+pub(crate) unsafe fn open_word_settings_window_impl() {
+    crate::popup::debug_assert_current_thread_is_ui("open_word_settings_window_impl");
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, GetDlgItem, RegisterClassW, ShowWindow, SW_SHOW,
         WNDCLASSW, WS_CAPTION, WS_OVERLAPPED, WS_SYSMENU, WS_VISIBLE,

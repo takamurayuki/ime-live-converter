@@ -1,0 +1,79 @@
+# ゴールデンテスト: 既知バグの回帰コーパス。
+# 1行 = 1ケース、タブ区切りで「ローマ字入力<TAB>期待される確定後の表記」。
+# `#`始まりの行はコメント、空行は無視。
+#
+# 過去に見つかった誤変換パターンの再発を検知する。1件でも不一致なら
+# `golden_regressions_must_all_pass`が失敗する（既知バグの再発は許容しない）。
+# 各行の由来はMEMORY.md（`~/.claude/projects/.../memory/`）の対応するメモリ
+# ファイル、または crates/common/src/viterbi/tests.rs の対応するユニット
+# テストを参照。
+
+# 【修正済み・2026-09-13】実機での違和感報告を調査して発見・修正。
+# `trusted_phrase_bonus[("いっ","行っ")]=15000`（行っ vs 逝っ の同音動詞
+# バグ対策として導入済み）が読み・後続語の条件を一切問わず適用されて
+# いたため、「いっ」で始まる無関係な語（一貫性）まで道連れにして
+# 「行っ」に負けていた（一貫性→行っ完成）。dump_connection_costで確認した
+# ところ、素の辞書コスト＋接続コストだけなら「一貫(2353)+性(接尾,7390,
+# 接続-5447)」が「行っ(7425)+完成(2148)」より遥かに安い（4271 vs 8892）が、
+# 上記の-15000下限突破ボーナスにより「行っ」が事実上コスト-7575相当まで
+# 割り引かれ逆転していた。fragment_repairは「短い語+後続漢字語」の断片
+# 修復しか見ておらず、この形（活用語+名詞の2語構成が丸ごと誤り）は対象外。
+# 修正: node単位・無条件の`trusted_phrase_bonus`から、`iitte_verb_conn_floor`
+# （edge単位、直後が「て」「た」のときだけ効く）に変更（[[seed-override-pattern-limits]]
+# と同種のスケールしない個別上書きパターンの実例。ボーナスの値自体は
+# 変えず、適用条件だけを本来の意図（行って/行った限定）に一致させた）。
+ikkannsei	一貫性
+
+# 上と同じ修正の確認（元の「行っ vs 逝っ」バグ自体が再発しないことの
+# 回帰テスト）。「行った」（て/た続きの本来のユースケース）が稀な同音動詞
+# 「逝った」に負けないことを確認する。viterbi/tests.rs
+# test_seeded_verb_stem_beats_cheaper_rare_homophone と対応。
+kaishaniitta	会社に行った
+
+# learned-hiragana-fragments-longer-word-bug.md: Escひらがな学習が同じ読みで
+# 始まる無関係な長い複合語を断片化していた（さいきどう→さい起動）。
+saikidousuru	再起動する
+
+# adverb-particle-bigram-pollution.md / short-reading-conn-floor-general-fix.md:
+# 「どうか」（副詞）が「同化」（サ変名詞）の有利な接続コストに負けていた。
+doukashimashitaka	どうかしましたか
+
+# viterbi/tests.rs test_kyouiku_trusted_phrase_beats_negative_cost_split:
+# 「きょういく」が「今日」+「行く」に誤分割されていた。
+kyouikugadaijida	教育が大事だ
+
+# 【修正済み・2026-09-13】実機報告。「英数」がIPA辞書・extra.csvどちらにも
+# 無かったため（読み全体では辞書に無し）、「え」（フィラー、cost=3031）＋
+# 「異数」（いすう、名詞-一般、cost=5622）という無関係な分割に負けていた
+# （え異数）。dump_connection_costで確認したところ、この誤分割の真の最小
+# コストは6857。dictionaries/extra.csvに`えいすう,英数,3800`を追加し
+# （dict-builder extendでsystem.dicへ反映）、他の高頻度IT用語（変換・入力
+# 等）と同水準のコストにして解決した。
+#
+# 「英数モード」は追加後も「エイ数モード」のまま残っていた別件: 「すう」が
+# 名詞-数（数詞）として登録されており、後続の「モード」の名詞-接尾-助数詞
+# バリアント（cost=9224だが接続コストが極端に有利、数詞+助数詞という
+# カウンター文法をIPA辞書が強く優遇するため）との接続が-10731相当という
+# 桁外れの負の接続コストを持つ。英数（当初cost=5000）では負けたため、
+# 変換・入力と同じ3800まで下げて解決した（この「数詞+助数詞」接続トラップ
+# 自体は[[trusted-phrase-bonus-blast-radius]]で記録した「性/雨」の接尾語
+# トラップと同系統の、IPA辞書側の構造的な癖。今回は個別の語のコストを
+# 調整して解決したが、他の「すう」を含む語でも同様の事故が起き得る）。
+eisuu	英数
+eisuunyuuryoku	英数入力
+eisuumo-do	英数モード
+
+# viterbi/tests.rs test_suiyou_trusted_phrase_beats_negative_cost_split:
+# 「すいよう」が「酸い」+「よう」に誤分割されていた。
+suiyoubiniikimasu	水曜日に行きます
+
+# word-cost-floor-vs-negative-connection-cost.md: 「もんだいない」が
+# 「揉んだ以内」に誤分割されていた。
+sorehamondainai	それは問題ない
+
+# short-reading-guard-false-positive-fix.md: 一般化ガードが「いみのある」を
+# 誤って「異ミのある」に抑制していた。
+iminoarukotoba	意味のある言葉
+
+# short-reading-conn-floor-general-fix.md: 「とおして」が誤分割されていた。
+madowotooshite	窓を通して

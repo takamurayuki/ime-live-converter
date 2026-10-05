@@ -162,6 +162,40 @@ fn test_learned_bigram_improves_consistency() {
 }
 
 #[test]
+fn test_corpus_bigram_improves_consistency_with_prev_surfaces_prefilter() {
+    // corpus_bigram も learned_bigram と同じ経路（事前フィルタ
+    // `corpus_bigram_prev_surfaces` → 本体のHashMap）で効くことを確認する。
+    // 事前フィルタの実装ミスで常に外れるようになっていないかの回帰検知。
+    let mut dict = Dictionary::new();
+    dict.matrix = crate::dictionary::ConnectionMatrix::new(10, 10);
+    for i in 0..10 {
+        for j in 0..10 {
+            dict.matrix.set(i, j, 200);
+        }
+    }
+    dict.add_word(WordEntry {
+        surface: "貴社".to_string(), reading: "きしゃ".to_string(),
+        left_id: 1, right_id: 1, cost: 5000, pos: "名詞".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "記者".to_string(), reading: "きしゃ".to_string(),
+        left_id: 1, right_id: 1, cost: 5000, pos: "名詞".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "会見".to_string(), reading: "かいけん".to_string(),
+        left_id: 1, right_id: 1, cost: 5000, pos: "名詞".to_string(),
+    });
+    let mut converter = ViterbiConverter::new(dict);
+    let lm = crate::CorpusLm {
+        unigrams: Vec::new(),
+        bigrams: vec![("記者".to_string(), "会見".to_string(), 100)],
+    };
+    converter.load_corpus_lm(&lm);
+    let result = converter.convert_to_string("きしゃかいけん");
+    assert!(result.contains("記者"), "corpus_bigramが効いていない: {}", result);
+}
+
+#[test]
 fn test_wo_stays_particle_not_katakana() {
     // IPA辞書由来の「ヲ」(カタカナ,低コスト)より助詞「を」を優先する
     let mut dict = Dictionary::new();
@@ -356,6 +390,35 @@ fn test_learned_hiragana_preference() {
 }
 
 #[test]
+fn test_learned_hiragana_can_outweigh_heavily_learned_kanji() {
+    // Escでひらがなに戻した回数（学習頻度）は、漢字変換側の学習
+    // （`learn_unigram`、上限6000）と同じ上限・換算式で競わせる。以前は
+    // ひらがな側だけ上限が1500〜3000に抑えられており、漢字側が過去に
+    // よく使われて学習ボーナスがほぼ上限まで乗っている場合、ひらがなを
+    // 何度選び直しても漢字に勝てなかった。
+    let mut dict = Dictionary::new();
+    dict.matrix = crate::dictionary::ConnectionMatrix::new(10, 10);
+    for i in 0..10 {
+        for j in 0..10 {
+            dict.matrix.set(i, j, 200);
+        }
+    }
+    dict.add_word(WordEntry {
+        surface: "恋".into(), reading: "こい".into(),
+        left_id: 1, right_id: 1, cost: 4000, pos: "名詞-一般".into(),
+    });
+    let mut converter = ViterbiConverter::new(dict);
+    converter.enable_katakana_fallback = false;
+    // 漢字側が過去に何度も確定され、学習ボーナスがほぼ上限まで乗っている
+    // 状態を再現する。
+    converter.learn_unigram("こい", "恋", 10);
+    assert_eq!(converter.convert_to_string("こい"), "恋", "前提: 漢字学習だけならまだ恋が勝つ");
+    // それでも、ひらがなに戻した回数が十分多ければ最終的に逆転できる。
+    converter.learn_hiragana("こい", 10);
+    assert_eq!(converter.convert_to_string("こい"), "こい");
+}
+
+#[test]
 fn test_learned_hiragana_does_not_fragment_longer_word() {
     // 実例:「さいきどう」が「再起動」ではなく「さい」(ひらがな)+「起動」に
     // 誤分割される。
@@ -539,6 +602,132 @@ fn test_adverb_particle_bigram_neutralized_only_at_utterance_start() {
     // 文中の「〜かどうか」（「どう」の直前が「か」＝文頭ではない）は
     // 壊れず、正しく「木」+「か」+「どうか」に変換される
     assert_eq!(converter.convert_to_string("きかどうか"), "木かどうか");
+}
+
+#[test]
+fn test_douka_trusted_phrase_beats_doka_sahen_noun_by_default() {
+    // 実例:「どうかしましたか」「どうかしている」が、学習ゼロの状態でも
+    // 既定で「同化しましたか」「同化している」に変換されてしまう。
+    //
+    // 「どうか」（副詞、日常的な「お願い」「様子伺い」「〜かどうか」）は
+    // 「同化」（名詞-サ変接続、限定的な専門語）よりも圧倒的に高頻度だが、
+    // 「同化」はサ変接続名詞として「し」（する の連用形）に直接続く接続
+    // コストが本来かなり有利で、通常のユニグラムボーナス（0未満不可floor）
+    // では勝ちきれない。「問題ない」「水曜」と同様に0未満まで割り引ける
+    // trusted_phrase_bonus で対処する（[[adverb-particle-bigram-pollution]]
+    // の未修正事例）。
+    let mut dict = Dictionary::new();
+    dict.matrix = crate::dictionary::ConnectionMatrix::new(10, 10);
+    for i in 0..10 {
+        for j in 0..10 {
+            dict.matrix.set(i, j, 200);
+        }
+    }
+    dict.matrix.set(0, 1, 200); // BOS→どうか(副詞)/同化(名詞)
+    dict.matrix.set(1, 2, 200); // どうか(副詞)→し
+    dict.matrix.set(3, 2, -5000); // 同化(名詞-サ変接続)→し（本来かなり有利）
+    dict.matrix.set(2, 0, -500); // し→EOS
+    dict.add_word(WordEntry {
+        surface: "どうか".to_string(), reading: "どうか".to_string(),
+        left_id: 1, right_id: 1, cost: 6752, pos: "副詞-一般-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "同化".to_string(), reading: "どうか".to_string(),
+        left_id: 3, right_id: 3, cost: 4727, pos: "名詞-サ変接続-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "し".to_string(), reading: "し".to_string(),
+        left_id: 2, right_id: 2, cost: 3000, pos: "動詞-自立-*-*".to_string(),
+    });
+    let converter = ViterbiConverter::new(dict);
+
+    assert_eq!(converter.convert_to_string("どうか"), "どうか");
+    assert_eq!(converter.convert_to_string("どうかし"), "どうかし");
+}
+
+#[test]
+fn test_ikuraka_seed_beats_ikura_particle_split() {
+    // 実例:「いくらか」（幾らか、「いくつか・少し」の意味の副詞）が
+    // 単独/文末では「イクラ」（鮭の卵、いくら/幾ら と同じ品詞クラスで
+    // 辞書コストが安い）+「か」に分割されてしまう（実測: いくらか→
+    // イクラか）。後続語を伴う場合（いくらかもらった 等）は辞書本来の
+    // コストで既に正しく選ばれるため、通常のユニグラムボーナス
+    // （0未満不可floorで足りる）で単独/文末のケースも直接優先する。
+    let mut dict = Dictionary::new();
+    dict.matrix = crate::dictionary::ConnectionMatrix::new(10, 10);
+    for i in 0..10 {
+        for j in 0..10 {
+            dict.matrix.set(i, j, 200);
+        }
+    }
+    dict.matrix.set(0, 5, -300); // BOS→イクラ/幾らか
+    dict.matrix.set(5, 6, -2000); // イクラ→か（本来かなり有利）
+    dict.matrix.set(6, 0, -200); // か→EOS
+    dict.matrix.set(0, 7, -300); // BOS→幾らか
+    dict.matrix.set(7, 0, -200); // 幾らか→EOS
+    dict.add_word(WordEntry {
+        surface: "イクラ".to_string(), reading: "いくら".to_string(),
+        left_id: 5, right_id: 5, cost: 3261, pos: "名詞-一般-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "か".to_string(), reading: "か".to_string(),
+        left_id: 6, right_id: 6, cost: 3000, pos: "助詞-副助詞／並立助詞／終助詞-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "幾らか".to_string(), reading: "いくらか".to_string(),
+        left_id: 7, right_id: 7, cost: 5493, pos: "副詞-一般-*-*".to_string(),
+    });
+    let mut converter = ViterbiConverter::new(dict);
+    converter.enable_katakana_fallback = false;
+
+    assert_eq!(converter.convert_to_string("いくらか"), "幾らか");
+}
+
+#[test]
+fn test_bonused_word_with_untrusted_hiragana_homograph_beats_particle_split() {
+    // 実例:「他」(ほか)を学習で優先していても「他の/他が/他に」で、
+    // 無学習の同じ読み・同じ品詞（＝IPA辞書上ずっと安い）ひらがな表記
+    // 「ほか」に負けて「ほかの」のまま残る（「他を」や単独の「ほか」→
+    // 「他」は正しく変換できる＝この下限が掛からないエッジでは問題ない）。
+    //
+    // 原因は`bonused_short_prev_conn_floor_at_utterance_start`。「他」→「の」
+    // の辞書本来の接続コストは自然にかなり有利（負）だが、「他」自身に
+    // 学習ユニグラムボーナスが乗っているという理由だけで、この下限が
+    // ADJECTIVE_STEM_CONN_FLOORまで強制的に引き上げられる。一方、同じ
+    // 読み・同じ品詞の「ほか」は学習ボーナスが無いためこの下限の対象外で、
+    // 有利な接続コストをそのまま享受できる。結果、下限は「学習で優先したい
+    // 表記」だけを狙い撃ちで不利にし、その表記自身の無学習な同音異表記に
+    // 道を譲ってしまう（[[atomic-word-particle-connection-quirk]]と
+    // 同系統だが、対抗馬が「別の語」ではなく「同じ語の別表記」という点で
+    // 区別可能）。
+    let mut dict = Dictionary::new();
+    dict.matrix = crate::dictionary::ConnectionMatrix::new(10, 10);
+    for i in 0..10 {
+        for j in 0..10 {
+            dict.matrix.set(i, j, 200);
+        }
+    }
+    dict.matrix.set(0, 1, -300); // BOS→他/ほか（同じleft_id=1を共有）
+    dict.matrix.set(1, 2, -4000); // 他/ほか→の（辞書本来かなり有利）
+    dict.matrix.set(2, 0, -500); // の→EOS
+    dict.add_word(WordEntry {
+        surface: "他".to_string(), reading: "ほか".to_string(),
+        left_id: 1, right_id: 1, cost: 8000, pos: "名詞-副詞可能-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "ほか".to_string(), reading: "ほか".to_string(),
+        left_id: 1, right_id: 1, cost: 3000, pos: "名詞-副詞可能-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "の".to_string(), reading: "の".to_string(),
+        left_id: 2, right_id: 2, cost: 5000, pos: "助詞-連体化-*-*".to_string(),
+    });
+    let mut converter = ViterbiConverter::new(dict);
+    converter.enable_katakana_fallback = false;
+    converter.learn_unigram("ほか", "他", 4);
+
+    assert_eq!(converter.convert_to_string("ほか"), "他");
+    assert_eq!(converter.convert_to_string("ほかの"), "他の");
 }
 
 #[test]
@@ -1215,26 +1404,27 @@ fn test_bonused_adjective_inflection_prevents_unbalanced_split() {
 
     // 学習が無ければ、極端に安い活用接続はそのまま（=通常の形容詞否定を
     // 壊さない）ことも確認する
-    let mut fresh = ViterbiConverter::new(Dictionary::new());
-    fresh.dictionary.matrix = crate::dictionary::ConnectionMatrix::new(10, 10);
+    let mut fresh_dict = Dictionary::new();
+    fresh_dict.matrix = crate::dictionary::ConnectionMatrix::new(10, 10);
     for i in 0..10 {
         for j in 0..10 {
-            fresh.dictionary.matrix.set(i, j, 200);
+            fresh_dict.matrix.set(i, j, 200);
         }
     }
-    fresh.dictionary.matrix.set(1, 2, -10000);
-    fresh.dictionary.add_word(WordEntry {
+    fresh_dict.matrix.set(1, 2, -10000);
+    fresh_dict.add_word(WordEntry {
         surface: "高い".to_string(), reading: "たかい".to_string(),
         left_id: 3, right_id: 3, cost: 4692, pos: "形容詞-自立-*-*".to_string(),
     });
-    fresh.dictionary.add_word(WordEntry {
+    fresh_dict.add_word(WordEntry {
         surface: "高く".to_string(), reading: "たかく".to_string(),
         left_id: 1, right_id: 1, cost: 4000, pos: "形容詞-自立-*-*".to_string(),
     });
-    fresh.dictionary.add_word(WordEntry {
+    fresh_dict.add_word(WordEntry {
         surface: "ない".to_string(), reading: "ない".to_string(),
         left_id: 2, right_id: 2, cost: 8159, pos: "助動詞-*-*-*".to_string(),
     });
+    let mut fresh = ViterbiConverter::new(fresh_dict);
     fresh.enable_katakana_fallback = false;
     assert_eq!(fresh.convert_to_string("たかくない"), "高くない");
 }
@@ -1599,6 +1789,23 @@ fn test_n_best_applies_same_unconditional_guards_as_find_best_path() {
 }
 
 #[test]
+fn test_n_best_applies_same_fragment_repair_as_convert_with_cost() {
+    // `ime-cli`の`convert`（`Converter::generate_candidates`経由）は
+    // convert_with_cost ではなく n_best を使う。n_best が
+    // `repair_single_kanji_fragments` を適用しないと、CLIでは断片化した
+    // ままの結果が出るのに、実際のライブ変換（convert_with_cost経由）は
+    // 修復済みの結果になる、という食い違いが起きる。
+    let mut dict = flat_matrix_dict();
+    dict.add_word(word("前", "ぜん", 1, 5052, "接頭詞-名詞接続-*-*"));
+    dict.add_word(word("核", "かく", 2, 3422, "名詞-一般-*-*"));
+    dict.add_word(word("全角", "ぜんかく", 3, 5622, "名詞-一般-*-*"));
+    let mut converter = ViterbiConverter::new(dict);
+    converter.learn_unigram("ぜん", "前", 10);
+    let n_best = converter.n_best_strings("ぜんかく", 5);
+    assert_eq!(n_best[0], "全角", "n_best={:?}", n_best);
+}
+
+#[test]
 fn test_single_kanji_bound_noun_particle_attachment_not_penalized() {
     // 「際に」「際は」のような助詞への接続は正当な用法なので、
     // 学習ボーナスが乗っていてもペナルティの対象にならないことを確認する
@@ -1721,6 +1928,261 @@ fn test_rerank_by_assoc_ignores_directly_adjacent_content_words() {
     assert_eq!(converter.convert_to_string("さいきどう"), "再起動");
     // 隣接していても rerank_by_assoc に上書きされない
     assert_eq!(converter.convert_context_aware_to_string("さいきどう"), "再起動");
+}
+
+#[test]
+fn test_rerank_by_seeded_collocation_does_not_cascade_within_one_pass() {
+    // 実際に踏んだ罠の再現: 「速い」のトリガー語に「クルマ」も登録した
+    // 状態で、「はやいくるまが」を変換する。
+    //
+    // 「クルマ」（安い、既定の勝者）ではなく学習/シードで既に「車」が
+    // 勝っている状態から始め、seeded_assocに(速い,車)と(速い,クルマ)の
+    // 両方を登録する（実際に踏んだ設定を忠実に再現するため、あえて
+    // 両方残す。トリガー語の運用ルールで避けるのではなく、仕組み側で
+    // 安全であることを確認するのがこのテストの目的）。
+    //
+    // 隣接語をその場で書き換えながら読む実装だと、「はやい→速い」への
+    // 書き換えが先に起き、その「速い」を隣接語として直後の「くるま」
+    // 判定が再評価され、(速い,クルマ)のシードに反応して「クルマ」へ
+    // 巻き戻ってしまう（実際に発生した）。スナップショット方式なら、
+    // 「くるま」の判定は常に元の「はやい」を見るため巻き戻らない。
+    let mut dict = Dictionary::new();
+    dict.matrix = crate::dictionary::ConnectionMatrix::new(10, 10);
+    for i in 0..10 {
+        for j in 0..10 {
+            dict.matrix.set(i, j, 200);
+        }
+    }
+    dict.add_word(WordEntry {
+        surface: "早い".to_string(), reading: "はやい".to_string(),
+        left_id: 1, right_id: 1, cost: 3079, pos: "形容詞-自立-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "速い".to_string(), reading: "はやい".to_string(),
+        left_id: 1, right_id: 1, cost: 4769, pos: "形容詞-自立-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "クルマ".to_string(), reading: "くるま".to_string(),
+        left_id: 2, right_id: 2, cost: 3630, pos: "名詞-一般-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "車".to_string(), reading: "くるま".to_string(),
+        left_id: 2, right_id: 2, cost: 6918, pos: "名詞-一般-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "が".to_string(), reading: "が".to_string(),
+        left_id: 3, right_id: 3, cost: 100, pos: "助詞-格助詞-一般-*".to_string(),
+    });
+    let mut converter = ViterbiConverter::new(dict);
+    converter.enable_katakana_fallback = false;
+    // 「くるま→車」が既に別経路（learned_unigram、実物では
+    // COMMON_WORD_SEED+個別ボーナス）で修正済みという前提を再現する。
+    converter.learned_unigram.insert(("くるま".to_string(), "車".to_string()), 4000);
+    assert_eq!(converter.convert_to_string("はやいくるまが"), "早い車が");
+
+    // 実際に踏んだ設定: 「速い」のトリガー語に「車」と「クルマ」の両方
+    converter.seeded_assoc.insert(("車".to_string(), "速い".to_string()), 2500);
+    converter.seeded_assoc.insert(("速い".to_string(), "車".to_string()), 2500);
+    converter.seeded_assoc.insert(("クルマ".to_string(), "速い".to_string()), 2500);
+    converter.seeded_assoc.insert(("速い".to_string(), "クルマ".to_string()), 2500);
+
+    // 「速い」には直るが、「車」は巻き戻らない
+    assert_eq!(converter.convert_context_aware_to_string("はやいくるまが"), "速い車が");
+}
+
+#[test]
+fn test_find_word_assoc_collisions_detects_cross_group_reuse() {
+    // 実際に踏んだ事例の再現: グループ「速い」のトリガー語に「車」だけで
+    // なく「クルマ」も入れ、別の（架空の）グループが「クルマ」を出力
+    // 表記として持っている状況。
+    let content = "\
+はやい\t速い\t車\t2500
+はやい\t速い\tクルマ\t2500
+くるま\tクルマ\tなにか\t1000
+せいさく\t政策\t経済\t300
+";
+    let collisions = find_word_assoc_collisions(content);
+    assert_eq!(collisions.len(), 1, "{collisions:?}");
+    assert!(collisions[0].contains("クルマ"));
+    assert!(collisions[0].contains("速い"));
+}
+
+#[test]
+fn test_find_word_assoc_collisions_is_empty_for_clean_file() {
+    let content = "\
+はやい\t速い\t車\t2500
+はやい\t速い\t電車\t2500
+せいさく\t政策\t経済\t300
+かたい\t堅い\t仕事\t800
+";
+    assert!(find_word_assoc_collisions(content).is_empty());
+}
+
+#[test]
+fn test_find_word_assoc_collisions_ignores_comments_and_self_reference() {
+    let content = "\
+# コメント行
+せいさく\t政策\t政策\t100
+
+かたい\t堅い\t仕事\t800
+";
+    // 自己参照（トリガー語=出力語）は誤検出しない。空行・コメントも無視。
+    assert!(find_word_assoc_collisions(content).is_empty());
+}
+
+/// 実際の`dictionaries/word_assoc.tsv`を読み込み、グループ間の
+/// 意図しない相互作用（[[seeded-adjacent-collocation]]で発覚したクルマの
+/// 事例）が無いことを検証する。シードを数千件規模に増やす前に必ず
+/// 通ること、という安全確認の1つ（`test_rerank_by_seeded_collocation_does_not_cascade_within_one_pass`
+/// が仕組み側、こちらがデータ側の確認）。
+#[test]
+fn word_assoc_tsv_has_no_cross_group_trigger_target_collisions() {
+    let content = include_str!("../../../../dictionaries/word_assoc.tsv");
+    let collisions = find_word_assoc_collisions(content);
+    assert!(
+        collisions.is_empty(),
+        "word_assoc.tsvに相互作用の恐れがある衝突があります:\n{}",
+        collisions.join("\n")
+    );
+}
+
+#[test]
+fn test_compute_word_assoc_bonus_uses_cheapest_entry_for_duplicate_surface() {
+    // 量産バッチ2で実際に踏んだバグの再現: 同じ表記が品詞違いで複数
+    // エントリを持つ場合（実物では「工事」が名詞-サ変接続cost=1056と
+    // 名詞-固有名詞-人名-名cost=6502の両方に存在）、`.find()`で辞書内の
+    // 格納順の最初の1件だけを見ると、たまたま高コスト側を掴んで
+    // 「最安の競合にも負けている」と誤判定し、実際には最安のはずの語を
+    // 誤って不採用にしてしまっていた。
+    let mut dict = Dictionary::new();
+    // 意図的に高コスト側を先に登録する（格納順で先に来ても最安側を
+    // 選ぶことを確認するため）。
+    dict.add_word(WordEntry {
+        surface: "工事".to_string(), reading: "こうじ".to_string(),
+        left_id: 1, right_id: 1, cost: 6502, pos: "名詞-固有名詞-人名-名".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "工事".to_string(), reading: "こうじ".to_string(),
+        left_id: 2, right_id: 2, cost: 1056, pos: "名詞-サ変接続-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "公示".to_string(), reading: "こうじ".to_string(),
+        left_id: 2, right_id: 2, cost: 3227, pos: "名詞-サ変接続-*-*".to_string(),
+    });
+    let converter = ViterbiConverter::new(dict);
+    // 最安(1056)を使えば「公示」(3227)より既に安いので、必要ボーナスは
+    // マージンのみ（採用可能、かつ「既定で最安」の範囲）。
+    let bonus = converter.compute_word_assoc_bonus("こうじ", "工事");
+    assert_eq!(bonus, Some(SEEDED_ASSOC_MARGIN), "{bonus:?}");
+}
+
+#[test]
+fn test_seeded_collocation_fixes_adjacent_compound_homophone() {
+    // 「経済」＋「政策」のような、助詞を挟まない複合名詞の同音異義語選択は
+    // rerank_by_assoc（上のテストの通り隣接語を除外する）では直せない。
+    // seeded_assoc はその隙間を埋めるための別経路
+    // （[[homophone-selection-is-not-fixable-without-lm]]）。
+    let mut dict = Dictionary::new();
+    dict.matrix = crate::dictionary::ConnectionMatrix::new(10, 10);
+    for i in 0..10 {
+        for j in 0..10 {
+            dict.matrix.set(i, j, 200);
+        }
+    }
+    dict.add_word(WordEntry {
+        surface: "経済".to_string(), reading: "けいざい".to_string(),
+        left_id: 1, right_id: 1, cost: 1000, pos: "名詞-一般-*-*".to_string(),
+    });
+    // 「制作」の方を安くして、デフォルトでは誤って勝つようにする
+    // （実物の辞書で観測した「政策の方が単語コストは低いのに接続コストで
+    // 逆転される」現象を、接続コストを単純化した上で単語コスト自体の
+    // 逆転として再現している）。
+    dict.add_word(WordEntry {
+        surface: "制作".to_string(), reading: "せいさく".to_string(),
+        left_id: 1, right_id: 1, cost: 4000, pos: "名詞-一般-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "政策".to_string(), reading: "せいさく".to_string(),
+        left_id: 1, right_id: 1, cost: 5000, pos: "名詞-一般-*-*".to_string(),
+    });
+    let mut converter = ViterbiConverter::new(dict);
+    converter.enable_katakana_fallback = false;
+
+    assert_eq!(converter.convert_to_string("けいざいせいさく"), "経済制作");
+    // rerank_by_assoc（学習由来）は隣接語を無視するので効かないことの確認
+    converter.learn_assoc("経済", "政策", 10);
+    converter.learn_assoc("政策", "経済", 10);
+    assert_eq!(converter.convert_context_aware_to_string("けいざいせいさく"), "経済制作");
+
+    // seeded_assoc（隣接コロケーション）を足すと直る
+    converter.seeded_assoc.insert(("経済".to_string(), "政策".to_string()), 2000);
+    converter.seeded_assoc.insert(("政策".to_string(), "経済".to_string()), 2000);
+    assert_eq!(converter.convert_context_aware_to_string("けいざいせいさく"), "経済政策");
+}
+
+#[test]
+fn test_learned_assoc_overrides_seeded_collocation_on_conflict() {
+    // シードと学習が同じ語について異なる差し替えを示唆した場合、
+    // ユーザー本人の実際の使い方（学習）が一般的な傾向（シード）より
+    // 優先されるべき、というユーザー指定の方針
+    // （[[homophone-selection-is-not-fixable-without-lm]]）を確認する。
+    //
+    // 「経済」（隣接、seeded_assocだけが見える）は「政策」を推すが、
+    // 「検討」（非隣接、learned_assocだけが見える）は本人の実利用で
+    // 「制作」を強く推す、という競合状況を作る。
+    let mut dict = Dictionary::new();
+    dict.matrix = crate::dictionary::ConnectionMatrix::new(10, 10);
+    for i in 0..10 {
+        for j in 0..10 {
+            dict.matrix.set(i, j, 200);
+        }
+    }
+    dict.add_word(WordEntry {
+        surface: "経済".to_string(), reading: "けいざい".to_string(),
+        left_id: 1, right_id: 1, cost: 1000, pos: "名詞-一般-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "制作".to_string(), reading: "せいさく".to_string(),
+        left_id: 1, right_id: 1, cost: 4000, pos: "名詞-一般-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "政策".to_string(), reading: "せいさく".to_string(),
+        left_id: 1, right_id: 1, cost: 5000, pos: "名詞-一般-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "について".to_string(), reading: "について".to_string(),
+        left_id: 2, right_id: 2, cost: 3000, pos: "助詞-格助詞-連語-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "検討".to_string(), reading: "けんとう".to_string(),
+        left_id: 1, right_id: 1, cost: 1000, pos: "名詞-サ変接続-*-*".to_string(),
+    });
+    dict.add_word(WordEntry {
+        surface: "する".to_string(), reading: "する".to_string(),
+        left_id: 3, right_id: 3, cost: 1000, pos: "動詞-自立-*-*".to_string(),
+    });
+    let mut converter = ViterbiConverter::new(dict);
+    converter.enable_katakana_fallback = false;
+
+    let reading = "けいざいせいさくについてけんとうする";
+    assert_eq!(converter.convert_to_string(reading), "経済制作について検討する");
+
+    // シードだけなら「政策」に直る
+    converter.seeded_assoc.insert(("経済".to_string(), "政策".to_string()), 2000);
+    converter.seeded_assoc.insert(("政策".to_string(), "経済".to_string()), 2000);
+    assert_eq!(
+        converter.convert_context_aware_to_string(reading),
+        "経済政策について検討する"
+    );
+
+    // 本人が「検討」との組み合わせで「制作」を何度も使っている（強い学習）
+    // ことが分かると、非隣接の学習が隣接シードより優先されて「制作」に戻る
+    converter.learn_assoc("検討", "制作", 50);
+    converter.learn_assoc("制作", "検討", 50);
+    assert_eq!(
+        converter.convert_context_aware_to_string(reading),
+        "経済制作について検討する"
+    );
 }
 
 #[test]
@@ -1964,6 +2426,190 @@ fn test_fragment_repair_short_reading_two_kanji_head() {
 }
 
 #[test]
+fn test_fragment_repair_replaces_with_single_kanji_target_when_seeded() {
+    // 実例:「みずをのんだ」が接頭詞「未」＋名詞「図」に割れる（辞書の
+    // 「水」は表記1文字のため、従来は候補から除外されていた）。
+    // シード済み（＝安全性を確認済み）の1文字漢字は置換先として許可する。
+    let mut dict = flat_matrix_dict();
+    dict.add_word(word("未", "み", 1, 4067, "接頭詞-名詞接続-*-*"));
+    dict.add_word(word("図", "ず", 2, 6815, "名詞-一般-*-*"));
+    dict.add_word(word("水", "みず", 3, 7385, "名詞-一般-*-*"));
+    let converter = ViterbiConverter::new(dict);
+    assert_eq!(converter.convert_to_string("みず"), "水");
+}
+
+#[test]
+fn test_fragment_repair_replaces_single_content_word_tail() {
+    // 実例:「いみを」が接頭詞「異」＋カタカナ名詞「ミ」＋助詞「を」に
+    // 割れる（「ミ」は漢字を含まず、非自立名詞等の束縛形態素でもないため、
+    // 従来はtail_is_kanji_word/tail_is_bound_moraのどちらの条件にも
+    // 当てはまらず断片扱いされなかった）。tailが単一の内容語ノードであれば
+    // 対象にする一般化で、[[bonused-word-untrusted-pos-homograph-fix]]
+    // が対処できなかった局所信号では区別不能なケースを、post-pass方式で
+    // 解決する。
+    let mut dict = flat_matrix_dict();
+    dict.add_word(word("異", "い", 1, 7074, "接頭詞-名詞接続-*-*"));
+    dict.add_word(word("ミ", "み", 2, 5004, "名詞-一般-*-*"));
+    dict.add_word(word("を", "を", 4, 4183, "助詞-格助詞-一般-*"));
+    dict.add_word(word("意味", "いみ", 3, 4502, "名詞-サ変接続-*-*"));
+    let converter = ViterbiConverter::new(dict);
+    assert_eq!(converter.convert_to_string("いみを"), "意味を");
+}
+
+#[test]
+fn test_fragment_repair_replaces_bound_mora_tail_with_single_kanji_target() {
+    // 実例:「ほんをよんだ」が1文字漢字「穂」＋束縛形態素「ん」（非自立名詞）
+    // に割れる（「ん」は漢字を含まないため、従来は断片扱いされなかった）。
+    let mut dict = flat_matrix_dict();
+    dict.add_word(word("穂", "ほ", 1, 6239, "名詞-一般-*-*"));
+    dict.add_word(word("ん", "ん", 2, 6634, "名詞-非自立-一般-*"));
+    dict.add_word(word("本", "ほん", 3, 5947, "名詞-一般-*-*"));
+    let converter = ViterbiConverter::new(dict);
+    assert_eq!(converter.convert_to_string("ほん"), "本");
+}
+
+#[test]
+fn test_fragment_repair_replaces_bound_mora_tail_with_suffix_pos() {
+    // 実例:「そらを」が単独カタカナ「ソ」＋束縛形態素「ら」（名詞-接尾）
+    // に割れる（「ら」は非自立名詞ではなく接尾辞のため、従来は
+    // 断片扱いされなかった）。
+    let mut dict = flat_matrix_dict();
+    dict.add_word(word("ソ", "そ", 1, 5677, "名詞-一般-*-*"));
+    dict.add_word(word("ら", "ら", 2, 9830, "名詞-接尾-一般-*"));
+    dict.add_word(word("空", "そら", 3, 7439, "名詞-一般-*-*"));
+    let mut converter = ViterbiConverter::new(dict);
+    converter.learn_unigram("そら", "空", 10);
+    assert_eq!(converter.convert_to_string("そら"), "空");
+}
+
+#[test]
+fn test_symbol_penalty_catches_latin1_supplement_symbols() {
+    // 実例:「でんわをかける」が「電話を×」になる。「×」(U+00D7)は
+    // Latin-1 Supplementで、以前のsymbol_penaltyが対象にしていた
+    // ASCII/全角英数記号のどちらの範囲にも入らず見落としていた。
+    assert_eq!(symbol_penalty("×", "記号-一般-*-*"), 5000);
+    // 句読点（CJK記号域）は引き続き対象外
+    assert_eq!(symbol_penalty("、", "記号-読点-*-*"), 0);
+    assert_eq!(symbol_penalty("。", "記号-句点-*-*"), 0);
+    // 記号品詞でなければ何もしない
+    assert_eq!(symbol_penalty("×", "名詞-一般-*-*"), 0);
+}
+
+#[test]
+fn test_denwa_wo_kakeru_does_not_become_multiplication_sign() {
+    // 実例:「でんわをかける」→「電話を×」（IPA辞書は「かける」の読みに
+    // 記号「×」をcost=-279という負のコストで割り当てている）。
+    let mut dict = flat_matrix_dict();
+    dict.add_word(word("電話", "でんわ", 1, 2870, "名詞-サ変接続-*-*"));
+    dict.add_word(word("を", "を", 2, 4183, "助詞-格助詞-一般-*"));
+    dict.add_word(word("×", "かける", 3, 2000, "記号-一般-*-*"));
+    dict.add_word(word("掛ける", "かける", 3, 5680, "動詞-自立-*-*"));
+    let converter = ViterbiConverter::new(dict);
+    assert_eq!(converter.convert_to_string("でんわをかける"), "電話を掛ける");
+}
+
+#[test]
+fn test_fragment_repair_replaces_surname_given_name_with_verb_particle() {
+    // 実例:「いけるか」が姓「池」+名「ルカ」に分割される（IPA辞書の
+    // 姓→名の接続コストが実際のフルネームの統計的頻度を反映して
+    // 極端に有利なため、実測-7009）。結合読み「いけるか」の末尾1文字を
+    // 助詞として切り出すと残り「いける」が実在の動詞になるので、
+    // [行ける, か] に置き換える。
+    let mut dict = flat_matrix_dict();
+    let surname = word("池", "いけ", 1, 6802, "名詞-固有名詞-人名-姓");
+    let given_name = word("ルカ", "るか", 2, 4601, "名詞-固有名詞-人名-名");
+    dict.add_word(surname.clone());
+    dict.add_word(given_name.clone());
+    dict.add_word(word("行ける", "いける", 3, 5800, "動詞-自立-*-*"));
+    dict.add_word(word("か", "か", 4, 5360, "助詞-副助詞／並立助詞／終助詞-*-*"));
+    let converter = ViterbiConverter::new(dict);
+    let repaired = converter.repair_single_kanji_fragments(vec![surname, given_name]);
+    assert_eq!(
+        repaired.iter().map(|e| e.surface.as_str()).collect::<Vec<_>>(),
+        vec!["行ける", "か"]
+    );
+}
+
+#[test]
+fn test_fragment_repair_keeps_surname_given_name_when_no_verb_particle_match() {
+    // 本物の姓名入力（結合読みが偶然にも動詞+助詞に一致しない）はそのまま
+    // 維持される（田中太郎 のような一般的な姓名を壊さないことの確認）。
+    let mut dict = flat_matrix_dict();
+    let surname = word("田中", "たなか", 1, 4700, "名詞-固有名詞-人名-姓");
+    let given_name = word("太郎", "たろう", 2, 4700, "名詞-固有名詞-人名-名");
+    dict.add_word(surname.clone());
+    dict.add_word(given_name.clone());
+    let converter = ViterbiConverter::new(dict);
+    let repaired = converter.repair_single_kanji_fragments(vec![surname, given_name]);
+    assert_eq!(
+        repaired.iter().map(|e| e.surface.as_str()).collect::<Vec<_>>(),
+        vec!["田中", "太郎"]
+    );
+}
+
+#[test]
+fn test_fragment_repair_keeps_bound_mora_split_when_tail_is_not_bound_noun() {
+    // 「ん」が助動詞（非自立名詞ではない）なら束縛モーラ扱いされず、
+    // そもそも断片化の対象にならない（後処理の直接呼び出しで検証）。
+    let mut dict = flat_matrix_dict();
+    let se = word("畝", "せ", 1, 6014, "名詞-一般-*-*");
+    let n = word("ん", "ん", 2, 8124, "助動詞-*-*-*");
+    dict.add_word(se.clone());
+    dict.add_word(n.clone());
+    dict.add_word(word("廿", "せん", 3, 20000, "名詞-一般-*-*"));
+    let converter = ViterbiConverter::new(dict);
+    let repaired = converter.repair_single_kanji_fragments(vec![se, n]);
+    assert_eq!(repaired.iter().map(|e| e.surface.as_str()).collect::<Vec<_>>(), vec!["畝", "ん"]);
+}
+
+#[test]
+fn test_fragment_repair_keeps_bound_mora_split_when_target_is_unlearned_and_implausible() {
+    // 束縛形態素タイプの断片化でも、置換先が学習・シードされておらず
+    // 1文字あたりコストが妥当な範囲を超える希少語なら置き換えない
+    // （誤変換を別の誤変換で置き換えないため）。
+    let mut dict = flat_matrix_dict();
+    let se = word("畝", "せ", 1, 6014, "名詞-一般-*-*");
+    let n = word("ん", "ん", 2, 8124, "名詞-非自立-一般-*");
+    dict.add_word(se.clone());
+    dict.add_word(n.clone());
+    dict.add_word(word("廿", "せん", 3, 20000, "名詞-一般-*-*"));
+    let converter = ViterbiConverter::new(dict);
+    let repaired = converter.repair_single_kanji_fragments(vec![se, n]);
+    assert_eq!(repaired.iter().map(|e| e.surface.as_str()).collect::<Vec<_>>(), vec!["畝", "ん"]);
+}
+
+#[test]
+fn test_seeded_verb_stem_beats_cheaper_rare_homophone() {
+    // 実例:「かいしゃにいった」が稀な同音動詞「逝っ」に負けて
+    // 「会社に逝った」になる（他の活用形=行く・行きます等は別の辞書行の
+    // ため影響されない、音便形「いっ」だけの問題）。
+    //
+    // 2026-09-13、「いっ→行っ」を無条件（node単位）の trusted_phrase_bonus
+    // から、直後が「て」「た」の場合だけ効く条件付き（edge単位）の
+    // `iitte_verb_conn_floor` に変更した（無条件版は「一貫性」のような
+    // 無関係な語まで「行っ完成」に巻き込んでいた、[[seed-override-pattern-limits]]
+    // と同種の事故）。このテストも実際のバグ再現に合わせ、後続に「た」を
+    // 付けた形にした（バグの本体は「いった」であって、単独の「いっ」が
+    // 単体で入力されることは実運用では無い）。
+    let mut dict = flat_matrix_dict();
+    dict.add_word(word("逝っ", "いっ", 1, 100, "動詞-自立-*-*"));
+    dict.add_word(word("行っ", "いっ", 1, 200, "動詞-自立-*-*"));
+    dict.add_word(word("た", "た", 1, 50, "助動詞-*-*-*"));
+    let converter = ViterbiConverter::new(dict);
+    assert_eq!(converter.convert_to_string("いった"), "行った");
+}
+
+#[test]
+fn test_seeded_yomu_stem_beats_cheaper_rare_homophone() {
+    // 実例:「ほんをよんだ」が同音動詞「呼ん」に負けて「本を呼んだ」になる。
+    let mut dict = flat_matrix_dict();
+    dict.add_word(word("呼ん", "よん", 1, 100, "動詞-自立-*-*"));
+    dict.add_word(word("読ん", "よん", 1, 200, "動詞-自立-*-*"));
+    let converter = ViterbiConverter::new(dict);
+    assert_eq!(converter.convert_to_string("よん"), "読ん");
+}
+
+#[test]
 fn test_fragment_repair_does_not_touch_inflected_word_followed_by_noun() {
     // 「ではない気がする」の打鍵途中「…ではないき」: 「無い」+「気」は
     // 活用語＋名詞の正しい文節の切れ目。読み2文字の漢字語が先頭でも、
@@ -1992,4 +2638,79 @@ fn test_fragment_repair_does_not_touch_inflected_word_followed_by_noun() {
     let repaired = converter.repair_single_kanji_fragments(vec![oko, nai2]);
     let surfaces: Vec<&str> = repaired.iter().map(|e| e.surface.as_str()).collect();
     assert_eq!(surfaces, vec!["行い"]);
+}
+#[test]
+fn apology_phrase_survives_learned_fragments() {
+    let mut dict = flat_matrix_dict();
+    dict.add_word(word("ごめんなさい", "ごめんなさい", 1, 6000, "感動詞"));
+    dict.add_word(word("ゴメン", "ごめん", 1, 1000, "名詞-一般"));
+    dict.add_word(word("な", "な", 1, 1000, "助詞"));
+    dict.add_word(word("際", "さい", 1, 1000, "名詞-一般"));
+    let mut converter = ViterbiConverter::new(dict);
+    for (reading, surface) in [("ごめん", "ゴメン"), ("な", "な"), ("さい", "際")] {
+        converter.learn_unigram(reading, surface, 20);
+    }
+    converter.learn_bigram("ゴメン", "な", 20);
+    converter.learn_bigram("な", "際", 20);
+    assert_eq!(converter.convert_context_aware_to_string("ごめんなさい"), "ごめんなさい");
+    converter.clear_learning();
+    assert_eq!(converter.convert_context_aware_to_string("ごめんなさい"), "ごめんなさい");
+}
+#[test]
+fn kokontozai_is_a_phrase_without_removing_place_name() {
+    let mut dict = flat_matrix_dict();
+    dict.add_word(word("古今", "ここん", 1, 4714, "名詞-一般"));
+    dict.add_word(word("コ・コン", "ここん", 1, 4501, "名詞-固有名詞-地域-一般"));
+    dict.add_word(word("東西", "とうざい", 1, 5809, "名詞-一般"));
+    let mut converter = ViterbiConverter::new(dict);
+    assert_eq!(converter.convert_context_aware_to_string("ここんとうざい"), "古今東西");
+    assert!(converter.dictionary.lookup("ここん").unwrap().iter().any(|e| e.surface == "コ・コン"));
+    converter.clear_learning();
+    // 「古今東西」は`seed_common_words`が上乗せ辞書（`overlay`）へ注入する
+    // ため、基底辞書だけを見る`converter.dictionary.lookup`ではなく
+    // `merged_lookup`（基底＋上乗せの合成）で確認する。
+    assert_eq!(converter.merged_lookup("ここんとうざい").unwrap().len(), 1);
+}
+#[test]
+fn adjective_does_not_split_nioi_into_particle_and_verb() {
+    let mut dict = flat_matrix_dict();
+    let adjective = word("淡い", "あわい", 1, 1000, "形容詞-自立");
+    let ni = word("に", "に", 1, 100, "助詞-格助詞-一般");
+    for entry in [adjective.clone(), ni.clone(),
+        word("追い", "おい", 1, 100, "動詞-自立"),
+        word("匂い", "におい", 1, 3000, "名詞-一般")]
+    {
+        dict.add_word(entry);
+    }
+    let converter = ViterbiConverter::new(dict);
+    assert_eq!(converter.convert_context_aware_to_string("あわいにおい"), "淡い匂い");
+    assert_eq!(adjective_terminal_then_ni_penalty(&adjective, &ni, -3000), 9000);
+    let noun = word("学校", "がっこう", 1, 1000, "名詞-一般");
+    assert_eq!(adjective_terminal_then_ni_penalty(&noun, &ni, -3000), -3000);
+    let adverbial = word("淡く", "あわく", 1, 1000, "形容詞-自立");
+    assert_eq!(adjective_terminal_then_ni_penalty(&adverbial, &ni, 100), 100);
+}
+
+#[test]
+fn foreign_symbol_word_does_not_beat_japanese_compound() {
+    let mut dict = flat_matrix_dict();
+    dict.add_word(word("万", "まん", 1, 100, "名詞-数"));
+    dict.add_word(word("Χ", "かい", 1, 100, "記号-アルファベット"));
+    dict.add_word(word("満開", "まんかい", 1, 5000, "名詞-一般"));
+    let converter = ViterbiConverter::new(dict);
+    assert_eq!(converter.convert_context_aware_to_string("まんかい"), "満開");
+}
+
+#[test]
+fn effective_word_cost_applies_same_penalties_as_build_lattice() {
+    // `effective_word_cost`は`rerank_by_assoc_from`（連想再ランク）や候補一覧が
+    // 使う。`build_lattice`が各ノードに掛けるペナルティ（固有名詞のカタカナ
+    // 表記・記号）が抜けていると、find_best_pathなら選ばないはずの語を
+    // 連想再ランクが安く見積もって1-bestに紛れ込ませてしまう。
+    let converter = ViterbiConverter::new(Dictionary::new());
+    // 「コウ」はカタカナ固有名詞ペナルティ(3000)が乗る。
+    let katakana_proper_noun = word("コウ", "こう", 1, 1000, "名詞-固有名詞-人名-名");
+    assert_eq!(converter.effective_word_cost(&katakana_proper_noun), 1000 + 3000);
+    let symbol = word("&", "と", 1, 500, "記号-一般-*-*");
+    assert_eq!(converter.effective_word_cost(&symbol), 500 + 5000);
 }

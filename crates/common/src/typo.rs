@@ -24,6 +24,51 @@ pub struct TypoCorrector {
 }
 
 impl TypoCorrector {
+    /// 限定した表記・打鍵ミスを一度の走査で修正する。置換後の文字列を
+    /// 再び規則に通さず、同じ文中の複数箇所をまとめて候補にする。
+    /// 意味の推測や否定・時制の変更は行わない。
+    pub fn correct_sentence(input: &str) -> Option<String> {
+        if input.chars().count() > 128 {
+            return None;
+        }
+        // 長い規則を先に評価する。(誤記, 修正, 文頭限定, 語末限定)
+        const RULES: &[(&str, &str, bool, bool)] = &[
+            ("ありがとうございまうす", "ありがとうございます", false, false),
+            ("おねがいしまうす", "おねがいします", false, false),
+            ("おねがいしまず", "おねがいします", false, true),
+            ("こんにちわ", "こんにちは", true, true),
+            ("こんばんわ", "こんばんは", true, true),
+            ("ありがとお", "ありがとう", false, true),
+            ("わたしわ", "わたしは", true, false),
+            ("つずいて", "つづいて", false, false),
+            ("していましす", "しています", false, false),
+            ("できましす", "できます", false, false),
+        ];
+        let boundary = |c: char| c.is_whitespace() || "、。！？!?「」『』（）()".contains(c);
+        let mut output = String::with_capacity(input.len());
+        let mut offset = 0;
+        let mut previous = None;
+        while offset < input.len() {
+            let rest = &input[offset..];
+            let matched = RULES.iter().find(|(wrong, _, start, end)| {
+                rest.starts_with(wrong)
+                    && (!start || previous.map_or(true, boundary))
+                    && (!end || rest[wrong.len()..].chars().next().map_or(true, boundary))
+            });
+            if let Some((wrong, replacement, _, _)) = matched {
+                output.push_str(replacement);
+                previous = wrong.chars().last();
+                offset += wrong.len();
+            } else {
+                let ch = rest.chars().next().unwrap();
+                output.push(ch);
+                previous = Some(ch);
+                offset += ch.len_utf8();
+            }
+        }
+        (output != input).then_some(output)
+    }
+
     pub fn new() -> Self {
         let mut rules = HashMap::new();
         
@@ -141,7 +186,8 @@ impl TypoCorrector {
         }
 
         // 信頼度でソート
-        candidates.sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
+        candidates.sort_by(|a, b| b.confidence.total_cmp(&a.confidence)
+            .then_with(|| a.corrected.cmp(&b.corrected)));
         candidates
     }
 
@@ -247,6 +293,24 @@ impl Default for TypoCorrector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sentence_correction_combines_errors_and_preserves_negation() {
+        assert_eq!(TypoCorrector::correct_sentence("こんにちわ。おねがいしまうす"),
+            Some("こんにちは。おねがいします".into()));
+        assert_eq!(TypoCorrector::correct_sentence("わたしわいきません"),
+            Some("わたしはいきません".into()));
+        assert_eq!(TypoCorrector::correct_sentence("かくにんをおねがいしまうす"),
+            Some("かくにんをおねがいします".into()));
+    }
+
+    #[test]
+    fn sentence_correction_leaves_valid_and_ambiguous_text_alone() {
+        for text in ["こんにちは", "いて", "もて", "すいません", "これは", "こんにちわたし", "うけわたしわすれ", "", "ABC123"] {
+            assert_eq!(TypoCorrector::correct_sentence(text), None, "{text}");
+        }
+        assert_eq!(TypoCorrector::correct_sentence(&"こんにちわ。".repeat(30)), None);
+    }
 
     #[test]
     fn test_typo_correction_rules() {

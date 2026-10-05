@@ -41,7 +41,19 @@ pub(crate) const COMMON_WORD_SEED: &[(&str, &str)] = &[
     ("けんさく", "検索"), ("せってい", "設定"), ("がめん", "画面"), ("そうさ", "操作"),
     ("もんだい", "問題"), ("ないよう", "内容"), ("かいけつ", "解決"),
     ("うしろ", "後ろ"), ("まえ", "前"), ("となり", "隣"), ("よこ", "横"),
-    ("おなか", "お腹"),
+    ("おなか", "お腹"), ("だれ", "誰"), ("くるま", "車"),
+    // 動詞の音便形。IPA辞書は「いっ」の読みに対し稀な同音動詞（逝っ）を
+    // 頻出動詞（行っ）より低コストで持っており、「〜に行った/行って」が
+    // 「〜に逝った/逝って」に化ける（他の活用形=行く・行きます・行けば等は
+    // 別の辞書行のため影響されない）。「いっ」自体は後続語との組み合わせで
+    // 必要なボーナス幅が変わるため、`seed_common_words`側で個別に強めの
+    // 値を設定している（このプリセットには含めない）。
+    ("よん", "読ん"),
+    // 単独漢字語だが、1文字漢字＋束縛形態素への断片化（本→穂+ん、
+    // 線→畝+ん）を fragment_repair.rs が辞書語に置換する際、断片化前の
+    // 語自体がここでシード済みであることを「安全に置換してよい語」の
+    // 判定に使う（未シードの希少な当て字と区別するため）。
+    ("ほん", "本"), ("せん", "線"),
     // 長い動詞は辞書コストが高く、安いカタカナ断片(カン 等)+助詞の分割に
     // 負けやすい。よく使う動詞を優先しておく。
     ("かんがえる", "考える"), ("かんがえた", "考えた"),
@@ -49,6 +61,16 @@ pub(crate) const COMMON_WORD_SEED: &[(&str, &str)] = &[
 
 /// 頻出語プリセットのボーナス（moderate。実学習で上書きされる）
 pub(crate) const COMMON_WORD_SEED_BONUS: i32 = 1500;
+
+/// 自動算出ボーナスの安全マージン（コスト差ちょうどではなく少し上乗せする）。
+pub const SEEDED_ASSOC_MARGIN: i32 = 300;
+
+/// 自動算出ボーナスの上限。これを超える語（＝辞書上の生コスト差が元々
+/// 大きい＝一般的には競合表記の方が正しい可能性が高い）は、シードで
+/// 無理に押し退けるとリスクが大きいため採用しない
+/// （実例: 「いし」で「意志」「石」を「医師」に勝たせるには2700〜3300
+/// 必要だったが、医師が圧倒的に一般的なため不採用と判断した）。
+pub const SEEDED_ASSOC_MAX_BONUS: i32 = 2500;
 
 /// バイグラム学習ボーナスの上限（接続コスト規模に合わせ、断片パスの暴走を防ぐ）
 pub(crate) const BIGRAM_BONUS_CAP: i32 = 2500;
@@ -93,7 +115,7 @@ pub(crate) fn is_failed_segment(e: &WordEntry) -> bool {
 /// セ≈4792/字 等）だけを拾えるよう、実測に基づき安全側（高め）に設定。
 const IMPLAUSIBLE_CONTENT_WORD_PER_CHAR_COST: i32 = 3800;
 
-pub(crate) fn is_implausible_content_word(e: &WordEntry) -> bool {
+pub fn is_implausible_content_word(e: &WordEntry) -> bool {
     if !is_content_pos(&e.pos) {
         return false;
     }
@@ -266,24 +288,37 @@ pub(crate) fn content_word_particle_reading_before_eos_penalty(
     3000
 }
 
-/// 記号（＆＠ 等）表記へのコストペナルティ
+/// 記号（＆＠×÷ 等）表記へのコストペナルティ
 ///
-/// IPA辞書は「と」→「＆」のように、かな読みに ASCII/全角記号を低コストで
-/// 割り当てていることがある。かなを記号へ変換するのはほぼ誤りなので、
-/// 記号品詞かつ ASCII/全角英数記号の表記に強いペナルティを付ける。
-/// 句読点（、。「」等）は CJK 記号域なので対象外。
+/// IPA辞書は「と」→「＆」「かける」→「×」のように、かな読みに記号を
+/// 低コスト（「×」はcost=-279と負！）で割り当てていることがある。
+/// かなを記号へ変換するのはほぼ誤りなので、記号品詞かつ非日本語表記の
+/// 語に強いペナルティを付ける。句読点（、。「」等）はCJK記号域なので
+/// 対象外。
+///
+/// 以前はASCII/全角英数記号とラテン文字だけを対象にしていたが、「×」
+/// （U+00D7、Latin-1 Supplement）のようなそのどちらの範囲にも入らない
+/// 記号を見落としていた（実測:「でんわをかける」→「電話を×」）。
+/// 「日本語表記（ひらがな/カタカナ/漢字）か」で判定を反転し、
+/// CJK句読点だけを明示的に除外することで、記号品詞の非日本語表記を
+/// 網羅的に拾う。
 pub(crate) fn symbol_penalty(surface: &str, pos: &str) -> i32 {
     if !pos.starts_with("記号") {
         return 0;
     }
-    let is_ascii_symbol = !surface.is_empty()
+    let is_cjk_punctuation =
+        !surface.is_empty() && surface.chars().all(|c| ('\u{3000}'..='\u{303F}').contains(&c));
+    if is_cjk_punctuation {
+        return 0;
+    }
+    let is_japanese_script = !surface.is_empty()
         && surface.chars().all(|c| {
-            ('\u{0021}'..='\u{007E}').contains(&c) || ('\u{FF01}'..='\u{FF5E}').contains(&c)
+            ('あ'..='ん').contains(&c) || ('ァ'..='ヺ').contains(&c) || ('一'..='龯').contains(&c)
         });
-    if is_ascii_symbol {
-        5000
-    } else {
+    if is_japanese_script {
         0
+    } else {
+        5000
     }
 }
 
@@ -316,6 +351,19 @@ pub(crate) fn adjective_terminal_then_te_penalty(
         return conn_cost;
     }
     conn_cost.max(FLOOR)
+}
+
+/// イ形容詞の基本形に格助詞・副詞化の「に」を直接つなげて名詞を
+/// 分断しない（淡い＋匂い → 淡い＋に＋追い）。禁止ではなくコスト下限。
+pub(super) fn adjective_terminal_then_ni_penalty(prev: &WordEntry, cur: &WordEntry, cost: i32) -> i32 {
+    if prev.pos.starts_with("形容詞") && prev.reading.ends_with('い')
+        && cur.surface == "に"
+        && cur.pos.starts_with("助詞")
+    {
+        cost.max(9000)
+    } else {
+        cost
+    }
 }
 
 /// 1文字漢字の表記かつ読みが単独助詞と一致する語（野・葉・尾 等）が、
@@ -375,27 +423,116 @@ pub(crate) fn is_single_kanji_surface(surface: &str) -> bool {
     ('\u{4E00}'..='\u{9FFF}').contains(&c) || ('\u{3400}'..='\u{4DBF}').contains(&c)
 }
 
-pub(crate) fn katakana_kanji_suffix_penalty(prev: &WordEntry, cur: &WordEntry) -> i32 {
+/// 表記がちょうど1文字のカタカナか（`is_single_kanji_surface`のカタカナ版）
+pub(crate) fn is_single_katakana_surface(surface: &str) -> bool {
+    let mut chars = surface.chars();
+    let (Some(c), None) = (chars.next(), chars.next()) else {
+        return false;
+    };
+    ('\u{30A1}'..='\u{30FA}').contains(&c) || c == 'ー'
+}
+
+/// 束縛モーラ「ん」（名詞-非自立、読み1文字。ひらがな/カタカナ両表記）が
+/// 助詞に続く接続コストは、「言うんです」「したんだ」等の正当な用法では
+/// 実測で大きく負（-5000超）と、統計的にきわめて有利。この有利さは、
+/// 「ん」の直前が単独の1文字漢字/カタカナ（動詞・形容詞ではなく音の
+/// 断片）であるときには、「本(ほん)」のような2モーラ語が「ホ+ン」に
+/// 割れて助詞へ安く逃げる抜け道になってしまう（実測: 本を読んだ→
+/// ホンを読んだ）。学習ボーナスの有無を問わず base 辞書だけで起きるため、
+/// 他の`bonused_*`系ガードとは異なり無条件で適用する。祖先ノード
+/// （「ん」の前の語）が単独の1文字漢字/カタカナのときだけ下限を設けるので、
+/// 正当な動詞・形容詞からの「〜んです/んだ」は対象外のまま残る。
+pub(crate) fn single_char_bound_mora_then_particle_conn_floor(
+    grandparent: Option<&WordEntry>,
+    prev: &WordEntry,
+    cur: &WordEntry,
+    conn_cost: i32,
+) -> i32 {
+    const FLOOR: i32 = 0;
+    // 「ん」は複数のPOSバリアントで辞書に登録されており（名詞-非自立
+    // 「〜んです」、助動詞「行かん」等）、どちらも後続の助詞への接続
+    // コストが有利。1つのPOSだけ塞いでも別バリアント経由ですり抜ける
+    // （実測: 名詞-非自立を塞いだ後も助動詞バリアント経由で「線」が
+    // 「せ」+「ん」に割れ続けた）ため両方を対象にするが、表記は「ん/ン」
+    // に限定する（「た」等の他の1文字助動詞は「見た|が」のような正当な
+    // 「動詞+た+助詞」を無数に含むため対象にできない）。
+    let is_bound_mora_pos =
+        prev.pos.starts_with("名詞-非自立") || prev.pos.starts_with("助動詞");
+    if !(is_bound_mora_pos && (prev.surface == "ん" || prev.surface == "ン")) {
+        return conn_cost;
+    }
+    if !cur.pos.starts_with("助詞") {
+        return conn_cost;
+    }
+    let Some(gp) = grandparent else { return conn_cost };
+    // 祖先ノードは読みが1モーラの断片（表記の種類は問わない: 単独漢字・
+    // カタカナに加え、ひらがなの音そのまま（例:「せ」）も対象。単語全体の
+    // 1〜2モーラを1文字漢字/カタカナ表記で奪われた残りが「ん」に化ける
+    // のと同型で、表記の種類で区別する理由が無い）。
+    if gp.reading.chars().count() != 1 {
+        return conn_cost;
+    }
+    conn_cost.max(FLOOR)
+}
+
+/// 「いっ」→「行っ」（行くの音便形）を、稀な同音動詞「逝っ」に対して
+/// 確実に勝たせるための下限。元は`trusted_phrase_bonus`で読み・後続語を
+/// 一切問わず`word_cost`を無条件に-15000相当まで割り引いていたが、これは
+/// 「いっ」で始まる無関係な語（一貫性→行っ完成、実測cost比較で正しい
+/// 分割が4600以上安いのに逆転していた）まで巻き込む「モグラ叩き」の
+/// 典型事故だった（2026-09-13発見）。
+///
+/// 本来の導入意図（コメント参照）は「いってらっしゃい/いってきます/
+/// いってしまった/行った」のように**直後が「て」「た」の音便接続の場合
+/// だけ**確実に勝たせたい、というもの。ここでは意図をそのままedge単位の
+/// 条件（`prev`が「いっ/行っ」かつ`cur`の表記が「て」「た」）として実装し、
+/// 該当しない後続語（「性」等）には一切効かないようにする。
+pub(crate) fn iitte_verb_conn_floor(
+    prev: Option<&WordEntry>,
+    cur: Option<&WordEntry>,
+    conn_cost: i32,
+) -> i32 {
+    const BONUS: i32 = 15000;
+    let Some(prev) = prev else { return conn_cost };
+    if prev.reading != "いっ" || prev.surface != "行っ" {
+        return conn_cost;
+    }
+    let Some(cur) = cur else { return conn_cost };
+    if cur.surface != "て" && cur.surface != "た" {
+        return conn_cost;
+    }
+    conn_cost.saturating_sub(BONUS)
+}
+
+/// `katakana_kanji_suffix_penalty`のうち`cur`（現在ノード）だけで決まる判定。
+/// 辺（prevとの組）に関わらず同じ結果になるため、`find_best_path`の内側
+/// ループ（prevについてのループ）の外でnode_idxにつき1回だけ呼び、
+/// 結果を使い回す（同じ判定を辺の数だけ繰り返さないため）。
+pub(crate) fn is_unallowed_single_kanji_suffix(cur: &WordEntry) -> bool {
     if !cur.pos.contains("接尾") {
-        return 0;
+        return false;
     }
     // 対象は1文字漢字の接尾辞のみ。語・人・製 等の代表的な接尾辞の多くは
     // 1文字であり、下の例外リストで個別に救済する。
     if !is_single_kanji_surface(&cur.surface) {
-        return 0;
+        return false;
     }
     const ALLOWED_SUFFIXES: &[&str] =
         &["語", "人", "製", "風", "式", "系", "産", "型", "教", "街", "圏", "流", "調"];
-    if ALLOWED_SUFFIXES.contains(&cur.surface.as_str()) {
-        return 0;
-    }
-    let prev_katakana = prev.surface.chars().count() >= 2
+    !ALLOWED_SUFFIXES.contains(&cur.surface.as_str())
+}
+
+pub(crate) fn prev_is_katakana_word(prev: &WordEntry) -> bool {
+    prev.surface.chars().count() >= 2
         && prev.surface.chars().all(|c| {
             ('\u{30A1}'..='\u{30FA}').contains(&c)
                 || c == 'ー'
                 || ('\u{30FC}'..='\u{30FF}').contains(&c)
-        });
-    if !prev_katakana {
+        })
+}
+
+pub(crate) fn katakana_kanji_suffix_penalty(prev: &WordEntry, cur: &WordEntry) -> i32 {
+    if !is_unallowed_single_kanji_suffix(cur) || !prev_is_katakana_word(prev) {
         return 0;
     }
     2000
@@ -643,6 +780,7 @@ pub(crate) fn bonused_short_prev_conn_floor_at_utterance_start(
     prev_unigram_bonus: i32,
     cur_unigram_bonus: i32,
     bigram_bonus: i32,
+    prev_has_untrusted_pos_homograph: bool,
     conn_cost: i32,
 ) -> i32 {
     const FLOOR: i32 = 0;
@@ -651,7 +789,45 @@ pub(crate) fn bonused_short_prev_conn_floor_at_utterance_start(
     {
         return conn_cost;
     }
+    // curがEOS（文末）なら、prevは「文頭から始まる短い語1つだけの発話」
+    // そのものであり、断片化の余地が無い（後続の語と組んで誤った複合語を
+    // 作りようがない）。この場合まで下限を掛けると、正しく優先したい
+    // 短い語（例:「前」を学習ボーナス付きで優先している時に単独で
+    // 「まえ」とだけ打った場合）が、逆に不当なペナルティを受けて
+    // フィラー等の断片解釈に負けてしまう（実測: まえ→ま+え）。
+    if cur.is_none() {
+        return conn_cost;
+    }
     let Some(p) = prev else { return conn_cost };
+    // 連体詞（この・その・あの・どの・わが 等）は定義上つねに後続の語を
+    // 伴う語で、単独で使われることも、他の断片と組み合わさって置き換え
+    // られることもない。このガードが想定する「短い語が断片解釈に
+    // 押しのけられる」競合が原理的に起こり得ないため対象外にする。
+    // 除外しないと、後続語（cur）が無関係な文脈で学習ユニグラムボーナスを
+    // 持つだけで、この→空のような辞書本来は有利な接続まで不当にfloorされ、
+    // 結果として「この」自体が「こ」+「の」に分割されてしまう
+    // （実測:「このそらをみあげて」→「股の空を見上げて」。学習バイグラム
+    // 「の→空」を修正した[[bigram-atomic-word-split-exploit-fix]]とは別の
+    // 原因で同じ症状が再発したケース。ここはcurの学習ユニグラムボーナス
+    // だけで発生し、バイグラムは無関係）。
+    if p.pos.starts_with("連体詞") {
+        return conn_cost;
+    }
+    // prevと同じ読み・同じ接続クラス（left_id/right_id一致）だが学習
+    // ボーナスの乗っていない別表記（多くはひらがな）が辞書に存在するなら
+    // 対象外にする。conn_costへの下限は表記に関係なく「その接続クラス」
+    // 全体に効くわけではなく、あくまでprev（ボーナス付きの表記）のノード
+    // にだけ乗る。つまりこの下限は「学習ボーナスで有利になった表記」を
+    // 狙い撃ちで不利にし、無関係な無学習の同表記に道を譲るだけになって
+    // しまう。これは「他」(ほか)を学習で優先していても「他の/他が/他に」
+    // で無学習の「ほか」（同じ読み・同じPOS、辞書上ずっと安い）に負ける
+    // 形で実測した（他を/単独 は正しく勝てる＝この下限が掛からない
+    // エッジでは問題ない）。「位置→が」「意味→の」のような本来の不正な
+    // 断片化ケースでは、同じ読みに同じ接続クラスの無学習な別表記が
+    // 存在しないため、この条件では誤って除外されない。
+    if prev_has_untrusted_pos_homograph {
+        return conn_cost;
+    }
     if p.reading.chars().count() > 2 {
         return conn_cost;
     }

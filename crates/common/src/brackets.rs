@@ -9,7 +9,7 @@
 //!   （『 を選んでいれば `]` で 』 が出る。入れ子も対応）
 
 /// 対応する括弧の組（開き, 閉じ）。候補一覧はこの順で並ぶ。
-pub(crate) const BRACKET_PAIRS: &[(char, char)] = &[
+pub const BRACKET_PAIRS: &[(char, char)] = &[
     ('「', '」'),
     ('『', '』'),
     ('【', '】'),
@@ -21,21 +21,21 @@ pub(crate) const BRACKET_PAIRS: &[(char, char)] = &[
     ('｛', '｝'),
 ];
 
-pub(crate) fn is_opening_bracket(c: char) -> bool {
+pub fn is_opening_bracket(c: char) -> bool {
     BRACKET_PAIRS.iter().any(|&(o, _)| o == c)
 }
 
-pub(crate) fn is_closing_bracket(c: char) -> bool {
+pub fn is_closing_bracket(c: char) -> bool {
     BRACKET_PAIRS.iter().any(|&(_, cl)| cl == c)
 }
 
 /// 開き括弧に対応する閉じ括弧
-pub(crate) fn matching_closer(open: char) -> Option<char> {
+pub fn matching_closer(open: char) -> Option<char> {
     BRACKET_PAIRS.iter().find(|&&(o, _)| o == open).map(|&(_, cl)| cl)
 }
 
 /// 文字列がちょうど1文字の括弧（開き or 閉じ）ならその文字
-pub(crate) fn single_bracket_char(s: &str) -> Option<char> {
+pub fn single_bracket_char(s: &str) -> Option<char> {
     let mut chars = s.chars();
     match (chars.next(), chars.next()) {
         (Some(c), None) if is_opening_bracket(c) || is_closing_bracket(c) => Some(c),
@@ -44,7 +44,7 @@ pub(crate) fn single_bracket_char(s: &str) -> Option<char> {
 }
 
 /// `text` の末尾から見て、まだ閉じられていない最も内側の開き括弧
-pub(crate) fn unmatched_opener(text: &str) -> Option<char> {
+pub fn unmatched_opener(text: &str) -> Option<char> {
     let mut pending_closers = 0usize;
     for c in text.chars().rev() {
         if is_closing_bracket(c) {
@@ -60,7 +60,7 @@ pub(crate) fn unmatched_opener(text: &str) -> Option<char> {
 }
 
 /// 括弧の種類切替の候補: 現在の括弧を先頭に、同じ側（開き/閉じ）の全種類
-pub(crate) fn bracket_variants(current: char) -> Vec<char> {
+pub fn bracket_variants(current: char) -> Vec<char> {
     let opening = is_opening_bracket(current);
     let mut variants: Vec<char> = BRACKET_PAIRS
         .iter()

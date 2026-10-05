@@ -204,7 +204,7 @@ impl ConnectionMatrix {
 }
 
 /// メイン辞書構造
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Dictionary {
     /// 単語Trie
     pub trie: TrieNode,
@@ -251,6 +251,14 @@ impl Dictionary {
     /// 編集距離 max_dist 以内の実在する読みを返す（(読み, 距離)）。
     pub fn fuzzy_readings(&self, target: &str, max_dist: usize) -> Vec<(String, usize)> {
         self.trie.fuzzy_search(target, max_dist)
+    }
+
+    /// 単語が1つも登録されていないか（`ViterbiConverter`の上乗せ辞書
+    /// `overlay`が「一度もadd_wordされていない」状態かの判定に使う。
+    /// 空なら検索を丸ごと省略でき、基底辞書（`Arc`共有、不変）だけを
+    /// 引く既存コードと同じコストで済む）。
+    pub fn is_empty(&self) -> bool {
+        self.trie.children.is_empty() && self.trie.entries.is_empty()
     }
 }
 
