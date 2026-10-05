@@ -11,7 +11,14 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 
 /// ダンプを読み、抽出した文を `output` に書き出す。戻り値は (記事数, 文数)
+///
+/// bz2 の展開（1スレッド）がいちばん重いので、ウィキ記法の除去は記事の束ごとに
+/// 別スレッドで行う。出力は束の番号順に並べ直して書くので、何度実行しても
+/// 同じ並び（＝ `judge-train` の評価用データの選び方も同じ）になる。
 pub fn extract(input: &Path, output: &Path, max_pages: Option<usize>) -> Result<(usize, usize)> {
+    use std::sync::mpsc;
+    const BATCH: usize = 200;
+
     let file = File::open(input)?;
     let reader: Box<dyn BufRead> = if input.extension().map_or(false, |e| e == "bz2") {
         Box::new(BufReader::with_capacity(1 << 20, bzip2::read::MultiBzDecoder::new(file)))
@@ -19,68 +26,120 @@ pub fn extract(input: &Path, output: &Path, max_pages: Option<usize>) -> Result<
         Box::new(BufReader::with_capacity(1 << 20, file))
     };
     let mut out = BufWriter::with_capacity(1 << 20, File::create(output)?);
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).max(2) - 1;
 
-    let mut pages = 0usize;
-    let mut sentences = 0usize;
-    let mut ns0 = false;
-    let mut redirect = false;
-    let mut in_text = false;
-    let mut text = String::new();
+    let (job_tx, job_rx) = mpsc::sync_channel::<(usize, Vec<String>)>(threads * 4);
+    let job_rx = std::sync::Mutex::new(job_rx);
+    let (res_tx, res_rx) = mpsc::sync_channel::<(usize, Vec<String>)>(threads * 4);
 
-    for line in reader.lines() {
-        let line = line?;
-        let trimmed = line.trim_start();
-        if in_text {
-            if let Some(end) = line.find("</text>") {
-                text.push_str(&line[..end]);
-                in_text = false;
-            } else {
-                text.push_str(&line);
-                text.push('\n');
-            }
-            continue;
-        }
-        if trimmed.starts_with("<page>") {
-            ns0 = false;
-            redirect = false;
-            text.clear();
-        } else if trimmed.starts_with("<ns>") {
-            ns0 = trimmed.starts_with("<ns>0</ns>");
-        } else if trimmed.starts_with("<redirect") {
-            redirect = true;
-        } else if trimmed.starts_with("<text") {
-            let Some(gt) = line.find('>') else { continue };
-            if line[..gt].ends_with('/') {
-                continue; // <text ... /> 空本文
-            }
-            let rest = &line[gt + 1..];
-            if let Some(end) = rest.find("</text>") {
-                text.push_str(&rest[..end]);
-            } else {
-                text.push_str(rest);
-                text.push('\n');
-                in_text = true;
-            }
-        } else if trimmed.starts_with("</page>") {
-            if ns0 && !redirect && !text.is_empty() {
-                for s in clean_wikitext(&text) {
-                    out.write_all(s.as_bytes())?;
-                    out.write_all(b"\n")?;
-                    sentences += 1;
-                }
-                pages += 1;
-                if pages % 10000 == 0 {
-                    eprintln!("  {} 記事 / {} 文", pages, sentences);
-                }
-                if max_pages.map_or(false, |m| pages >= m) {
+    std::thread::scope(|scope| -> Result<(usize, usize)> {
+        for _ in 0..threads {
+            let res_tx = res_tx.clone();
+            let job_rx = &job_rx;
+            scope.spawn(move || loop {
+                let job = job_rx.lock().unwrap().recv();
+                let Ok((seq, texts)) = job else { break };
+                let sentences: Vec<String> = texts.iter().flat_map(|t| clean_wikitext(t)).collect();
+                if res_tx.send((seq, sentences)).is_err() {
                     break;
                 }
-            }
-            text.clear();
+            });
         }
-    }
-    out.flush()?;
-    Ok((pages, sentences))
+        drop(res_tx);
+
+        // 書き出し（束の番号順に並べ直す）
+        let writer = scope.spawn(move || -> Result<usize> {
+            let mut pending = std::collections::BTreeMap::new();
+            let mut next = 0usize;
+            let mut sentences = 0usize;
+            for (seq, batch) in res_rx {
+                pending.insert(seq, batch);
+                while let Some(batch) = pending.remove(&next) {
+                    for s in batch {
+                        out.write_all(s.as_bytes())?;
+                        out.write_all(b"\n")?;
+                        sentences += 1;
+                    }
+                    next += 1;
+                }
+            }
+            out.flush()?;
+            Ok(sentences)
+        });
+
+        // 読み込み・展開（このスレッド）
+        let mut pages = 0usize;
+        let mut seq = 0usize;
+        let mut batch: Vec<String> = Vec::with_capacity(BATCH);
+        let mut ns0 = false;
+        let mut redirect = false;
+        let mut in_text = false;
+        let mut text = String::new();
+        let decompress_only = std::env::var("WIKI_DECOMPRESS_ONLY").is_ok();
+        for line in reader.lines() {
+            let line = line?;
+            if decompress_only {
+                continue;
+            }
+            let trimmed = line.trim_start();
+            if in_text {
+                if let Some(end) = line.find("</text>") {
+                    text.push_str(&line[..end]);
+                    in_text = false;
+                } else {
+                    text.push_str(&line);
+                    text.push('\n');
+                }
+                continue;
+            }
+            if trimmed.starts_with("<page>") {
+                ns0 = false;
+                redirect = false;
+                text.clear();
+            } else if trimmed.starts_with("<ns>") {
+                ns0 = trimmed.starts_with("<ns>0</ns>");
+            } else if trimmed.starts_with("<redirect") {
+                redirect = true;
+            } else if trimmed.starts_with("<text") {
+                let Some(gt) = line.find('>') else { continue };
+                if line[..gt].ends_with('/') {
+                    continue; // <text ... /> 空本文
+                }
+                let rest = &line[gt + 1..];
+                if let Some(end) = rest.find("</text>") {
+                    text.push_str(&rest[..end]);
+                } else {
+                    text.push_str(rest);
+                    text.push('\n');
+                    in_text = true;
+                }
+            } else if trimmed.starts_with("</page>") {
+                if ns0 && !redirect && !text.is_empty() {
+                    batch.push(std::mem::take(&mut text));
+                    pages += 1;
+                    if batch.len() == BATCH {
+                        if job_tx.send((seq, std::mem::replace(&mut batch, Vec::with_capacity(BATCH)))).is_err() {
+                            break;
+                        }
+                        seq += 1;
+                    }
+                    if pages % 50000 == 0 {
+                        eprintln!("  {} 記事", pages);
+                    }
+                    if max_pages.map_or(false, |m| pages >= m) {
+                        break;
+                    }
+                }
+                text.clear();
+            }
+        }
+        if !batch.is_empty() {
+            let _ = job_tx.send((seq, batch));
+        }
+        drop(job_tx);
+        let sentences = writer.join().map_err(|_| anyhow::anyhow!("書き出しスレッドが異常終了しました"))??;
+        Ok((pages, sentences))
+    })
 }
 
 /// XML の文字参照を戻す（ダンプ本文は1回エスケープされている）
