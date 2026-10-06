@@ -2064,12 +2064,26 @@ impl LiveConversionState {
         // 加えた合計で並べる。これにより自動変換の1-bestと候補一覧の1位が
         // 構造的に一致する（ただし`scoring.rs`のガード関数群は含まない簡易版
         // であり、完全に同一のロジックではない）。
+        //
+        // 判断層（judge-lm）があるときは、自動変換が判断層の総合スコアで
+        // 選ばれているので、候補一覧も同じ総合スコア（その語を対象文節に置いた
+        // 文全体の `judge_path_score`）で並べる。従来の簡易式のままだと、
+        // 自動変換で表示された語が一覧では2位以下になる（「よりもかいの」で
+        // 表示は「下位」なのに一覧の1位は「回」、等）。
         struct Seg {
             surface: String,
             eff_cost: i32,
+            /// 判断層の総合スコア（判断層が無ければ None。大きいほど良い）
+            judge_score: Option<f32>,
         }
         let prev_entry = if start > 0 { entries.get(start - 1) } else { None };
         let next_entry = entries.get(end + 1);
+        let path_with = |w: &crate::WordEntry| -> Vec<crate::WordEntry> {
+            let mut path: Vec<crate::WordEntry> = entries[..start].to_vec();
+            path.push(w.clone());
+            path.extend_from_slice(&entries[end + 1..]);
+            path
+        };
         let mut segs: Vec<Seg> = Vec::new();
         if let Some(words) = converter.merged_lookup(&seg_reading) {
             for w in words.iter() {
@@ -2080,20 +2094,48 @@ impl LiveConversionState {
                 let penalty = symbol_entry_penalty(&w.pos);
                 let own_cost = converter.effective_word_cost(w).saturating_add(penalty);
                 let ctx_cost = converter.context_connection_cost(prev_entry, w, next_entry);
+                let judge_score = converter
+                    .judge_path_score(&path_with(w))
+                    .map(|s| s - penalty as f32 / 1000.0);
                 segs.push(Seg {
                     surface: w.surface.clone(),
                     eff_cost: own_cost.saturating_add(ctx_cost),
+                    judge_score,
                 });
             }
         }
         // カタカナ・ひらがな表記も候補に含める（末尾寄り）
         let katakana = crate::hiragana_to_katakana(&seg_reading);
         if katakana != seg_reading {
-            segs.push(Seg { surface: katakana, eff_cost: 50000 });
+            segs.push(Seg { surface: katakana, eff_cost: 50000, judge_score: None });
         }
-        segs.push(Seg { surface: seg_reading.clone(), eff_cost: 52000 });
+        segs.push(Seg { surface: seg_reading.clone(), eff_cost: 52000, judge_score: None });
 
-        segs.sort_by(|a, b| a.eff_cost.cmp(&b.eff_cost));
+        if converter.judge.is_some() {
+            // 判断層の点が付いた語を点の高い順に、付かないもの（カタカナ・
+            // ひらがな表記）は従来どおり末尾寄りに
+            segs.sort_by(|a, b| match (a.judge_score, b.judge_score) {
+                (Some(x), Some(y)) => y.partial_cmp(&x).unwrap_or(std::cmp::Ordering::Equal),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => a.eff_cost.cmp(&b.eff_cost),
+            });
+        } else {
+            segs.sort_by(|a, b| a.eff_cost.cmp(&b.eff_cost));
+        }
+
+        // いま自動変換で表示している対象文節の表記を必ず1位にする。
+        // 一覧の1位＝表示中の語、という対応を並べ方の式の違い（判断層の
+        // 有無、自動変換側だけにある手調整ガード等）に依らず保証する。
+        let shown_seg: String = entries[start..=end].iter().map(|e| e.surface.as_str()).collect();
+        match segs.iter().position(|s| s.surface == shown_seg) {
+            Some(0) => {}
+            Some(i) => {
+                let s = segs.remove(i);
+                segs.insert(0, s);
+            }
+            None => segs.insert(0, Seg { surface: shown_seg, eff_cost: i32::MIN, judge_score: None }),
+        }
 
         // 前半（固定）+ 対象文節表記 + 後半（固定）で候補文字列を作る
         let mut seen = std::collections::HashSet::new();
@@ -3023,6 +3065,44 @@ mod state_machine_tests {
         dict.add_word(mk("は", "は", 2, 1000, "助詞-係助詞-*-*"));
         dict.add_word(mk("に", "に", 2, 1000, "助詞-格助詞-一般-*"));
         ViterbiConverter::new(dict)
+    }
+
+    /// 判断層が辞書コストと逆の語（今日より強）を選ぶとき、候補一覧の1位も
+    /// 表示中の語になる（以前は候補一覧だけ従来の式で並べていたため、表示は
+    /// 「強」なのに一覧の1位が「今日」になり、一覧で下位の語が自動変換に
+    /// 出ているように見えた）。
+    #[test]
+    fn candidate_list_top_matches_judge_auto_conversion() {
+        use crate::judge::{vocab_key, JudgeLm, JudgeLmData};
+        let n_class = 10usize;
+        let data = JudgeLmData {
+            vocab: vec![
+                "<s>".into(),
+                "</s>".into(),
+                vocab_key("強", "きょう", 1),
+                vocab_key("今日", "きょう", 1),
+            ],
+            word_class: vec![0, 0, 1, 1],
+            emit_logp: vec![0.0, 0.0, -1.0, -12.0],
+            backoff: vec![0.0; 4],
+            bi_offsets: vec![0; 5],
+            class_logp: vec![-(n_class as f32).ln(); n_class * n_class],
+            unk_emit_logp: vec![-20.0; n_class],
+            n_class: n_class as u32,
+            ..Default::default()
+        };
+        let mut converter = particle_test_converter();
+        converter.set_judge(Some(std::sync::Arc::new(JudgeLm::from_data(data))));
+        let mut state = LiveConversionState::new();
+        state.converter = Some(converter);
+        for ch in "kyou".chars() {
+            let _ = state.add_char(ch);
+        }
+        let shown: String = state.convert_buffer("きょう").iter().map(|e| e.surface.as_str()).collect();
+        assert_eq!(shown, "強", "判断層が LM の強い方を選んでいること（テストの前提）");
+        let (_, _, seg_surfaces, _, _, _, _) = state.build_candidates();
+        assert_eq!(seg_surfaces.first().map(String::as_str), Some("強"), "{seg_surfaces:?}");
+        assert!(seg_surfaces.contains(&"今日".to_string()));
     }
 
     /// 画面上のテキストを模擬してアクションを適用する

@@ -192,6 +192,7 @@ fn main() {
             unk_char_logp: unk_char,
             seed_bonus,
             learn_scale,
+            start_mix: std::env::var("JUDGE_START_MIX").ok().and_then(|s| s.parse().ok()).unwrap_or(judge.params().start_mix),
         });
         JudgeLm::save_data(judge.data(), lm_path).expect("保存失敗");
         println!("パラメータを書き戻しました: {}", lm_path.display());

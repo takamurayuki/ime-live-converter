@@ -65,6 +65,11 @@ pub struct JudgeParams {
     /// Wikipedia の統計より優先されるべきだから（同じ尺度だと1回の確定が
     /// 0.75 しか効かず、何度直しても LM に押し戻される）。
     pub learn_scale: f32,
+    /// 入力の先頭の語の確率に「文頭からの確率」をどれだけ使うか（残りは語全体の
+    /// 出現頻度）。Wikipedia の文頭は百科事典の見出し語・固有名詞に偏っており
+    /// （けいき→京畿、こうたい→抗体）、前後に何も無い単語を打ったときの事前
+    /// 確率としては語全体の頻度の方が素直なため混ぜる。1.0 で文頭の確率だけ。
+    pub start_mix: f32,
 }
 
 impl Default for JudgeParams {
@@ -76,6 +81,7 @@ impl Default for JudgeParams {
             unk_char_logp: -2.0,
             seed_bonus: 4.0,
             learn_scale: 750.0,
+            start_mix: 0.5,
         }
     }
 }
@@ -111,6 +117,8 @@ pub struct JudgeLmData {
     pub class_logp: Vec<f32>,
     /// 語彙外の語の log P(語 | クラス)（クラスごと）
     pub unk_emit_logp: Vec<f32>,
+    /// 各語の語全体の出現頻度 log P(語)（入力の先頭の語の事前確率に混ぜる、`start_mix`）
+    pub uni_logp: Vec<f32>,
     /// `JudgeParams` の JSON。パラメータの項目を増やしても学習済みのモデルを
     /// 作り直さずに読めるよう、bincode の固定レイアウトではなく JSON で持つ
     /// （無い項目は既定値になる）
@@ -231,6 +239,7 @@ impl JudgeLm {
                 && data.class_logp.len() == (data.n_class as usize) * (data.n_class as usize)
                 && data.unk_emit_logp.len() == data.n_class as usize
                 && data.word_class.iter().all(|&c| (c as u32) < data.n_class)
+                && (data.uni_logp.is_empty() || data.uni_logp.len() == n)
                 && (data.tri_offsets.is_empty()
                     || (data.tri_offsets.len() == data.bi_next.len() + 1
                         && data.tri_backoff.len() == data.bi_next.len()
@@ -345,6 +354,19 @@ impl JudgeLm {
     /// バックオフ重み × クラスモデル。直前の語が語彙外ならクラスモデルだけ。
     /// 今の語が語彙外なら「そのクラスの未知の語」として採点する。
     pub fn logp(&self, prev: LmCtx, cur: Option<u32>, cur_class: u16) -> f32 {
+        let lp = self.logp_raw(prev, cur, cur_class);
+        // 入力の先頭の語は、文頭からの確率と語全体の頻度を混ぜる（`start_mix`）
+        let mix = self.params.start_mix;
+        match (prev.word, cur) {
+            (Some(BOS_ID), Some(w)) if mix < 1.0 && !self.data.uni_logp.is_empty() => {
+                let uni = self.data.uni_logp[w as usize];
+                log_add(mix.max(1e-6).ln() + lp, (1.0 - mix).max(1e-6).ln() + uni)
+            }
+            _ => lp,
+        }
+    }
+
+    fn logp_raw(&self, prev: LmCtx, cur: Option<u32>, cur_class: u16) -> f32 {
         let d = &self.data;
         if let (Some(v), Some(w)) = (prev.word, cur) {
             let (s, e) = (d.bi_offsets[v as usize] as usize, d.bi_offsets[v as usize + 1] as usize);
@@ -518,6 +540,12 @@ impl JudgeLm {
     }
 }
 
+/// log(exp(a) + exp(b))
+fn log_add(a: f32, b: f32) -> f32 {
+    let m = a.max(b);
+    m + ((a - m).exp() + (b - m).exp()).ln()
+}
+
 /// 温度つき softmax（数値安定化のため最大値を引く）
 pub fn softmax(scores: &[f32], temperature: f32) -> Vec<f32> {
     if scores.is_empty() {
@@ -602,6 +630,7 @@ mod tests {
             n_class: 5,
             class_logp,
             unk_emit_logp: vec![-12.0; 5],
+            uni_logp: Vec::new(),
             params_json: String::new(),
         };
         JudgeLm::from_data(data)
@@ -617,6 +646,19 @@ mod tests {
         assert_eq!(lm.logp(lm.ctx_of(2), None, P), -1.0 + -0.7 + -12.0);
         // 直前が語彙外ならクラスモデルだけ
         assert_eq!(lm.logp(LmCtx { word: None, class: N }, Some(3), P), -0.7 + -1.0);
+    }
+
+    #[test]
+    fn start_of_input_mixes_in_overall_frequency() {
+        let mut lm = tiny();
+        let from_bos = lm.logp(LmCtx::BOS, Some(4), N); // 京: 文頭からはクラスモデル経由
+        lm.data.uni_logp = vec![0.0, 0.0, -5.0, -1.0, -2.0, -7.0, -6.0, -0.5];
+        lm.params.start_mix = 0.5;
+        let mixed = lm.logp(LmCtx::BOS, Some(4), N);
+        let expected = log_add(0.5f32.ln() + from_bos, 0.5f32.ln() + -2.0);
+        assert!((mixed - expected).abs() < 1e-5);
+        // 文頭以外の文脈には影響しない
+        assert_eq!(lm.logp(lm.ctx_of(2), Some(3), P), -0.3);
     }
 
     #[test]

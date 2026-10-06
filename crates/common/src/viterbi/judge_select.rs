@@ -290,6 +290,16 @@ impl ViterbiConverter {
         Some(path)
     }
 
+    /// 語列1本の総合スコア（`judge_candidates` / `lm_viterbi` と同じ式、大きいほど良い）。
+    /// 候補一覧の並び順を自動変換と同じ物差しにそろえるために使う。
+    /// 判断層が無ければ None。
+    pub fn judge_path_score(&self, path: &[WordEntry]) -> Option<f32> {
+        let judge = self.judge.as_ref()?;
+        let lm = judge.sequence_logp(None, path);
+        let (dict_cost, learned) = self.path_costs(path);
+        Some(judge.combine(lm, dict_cost, learned, self.path_seed_hits(path)))
+    }
+
     /// 候補を採点し、確率の高い順に並べて返す。`baseline` は従来エンジンの
     /// 変換結果（必ず候補に含める）。判断層が無ければ空。
     pub fn judge_candidates(

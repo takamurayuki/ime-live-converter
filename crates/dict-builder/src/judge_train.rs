@@ -387,6 +387,7 @@ fn build_model(c: &Counts, opts: &TrainOptions) -> (JudgeLmData, Vec<u32>) {
         }
     }
 
+    let total_word_tokens: u64 = c.uni[2..].iter().sum::<u64>().max(1);
     // クラスごとの語の総数と、刈り込まれる語の総数・異なり数
     let mut class_tokens = vec![0u64; nc];
     let mut pruned_tokens = vec![0u64; nc];
@@ -473,6 +474,11 @@ fn build_model(c: &Counts, opts: &TrainOptions) -> (JudgeLmData, Vec<u32>) {
         n_class: nc as u32,
         class_logp,
         unk_emit_logp,
+        // 語全体の出現頻度（BOS/EOS は使わないので 0）
+        uni_logp: keep
+            .iter()
+            .map(|&i| if i < 2 { 0.0 } else { (c.uni[i] as f64 / total_word_tokens as f64).ln() as f32 })
+            .collect(),
         params_json: serde_json::to_string(&JudgeParams::default()).unwrap_or_default(),
     };
     (data, new_id)
