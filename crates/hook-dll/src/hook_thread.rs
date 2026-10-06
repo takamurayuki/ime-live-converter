@@ -38,6 +38,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 /// フックスレッドへの制御メッセージ。停止はWM_QUITを使うのでここには含めない。
 const WM_HOOK_REINSTALL: u32 = WM_USER + 1;
+/// 動作確認用: フックを外すだけ（`hook_watchdog` の自己テスト）
+const WM_HOOK_UNHOOK_SELFTEST: u32 = WM_USER + 2;
 
 thread_local! {
     /// HHOODはフックスレッドからしか触らないのでthread_localで持つ。
@@ -67,6 +69,8 @@ impl Drop for AliveGuard {
 
 pub(crate) struct HookThread {
     join: Option<JoinHandle<()>>,
+    /// フックが外されていないか見張るスレッド（`hook_watchdog`）
+    watchdog: Option<JoinHandle<()>>,
 }
 
 impl HookThread {
@@ -117,7 +121,7 @@ impl HookThread {
             .map_err(|e| format!("フックスレッドの起動に失敗: {e}"))?;
 
         match ready_rx.recv() {
-            Ok(Ok(())) => Ok(Self { join: Some(join) }),
+            Ok(Ok(())) => Ok(Self { join: Some(join), watchdog: crate::hook_watchdog::start() }),
             Ok(Err(e)) => {
                 let _ = join.join();
                 Err(e)
@@ -140,14 +144,23 @@ impl HookThread {
         HOOK_ALIVE.load(Ordering::Acquire)
     }
 
-    /// フックだけを張り直す（例: 外部要因でフックが外された場合の復旧）。
-    #[allow(dead_code)] // ウォッチドッグからの利用を想定した予備API（未配線）
+    /// フックだけを張り直す（外部要因でフックが外された場合の復旧。
+    /// `hook_watchdog` が「入力がフックに届いていない」ことを検出したときに呼ぶ）。
     pub(crate) fn request_reinstall() -> bool {
         post(WM_HOOK_REINSTALL)
     }
 
+    /// 動作確認用: フックを外すだけ（Windows に黙って外された状態の再現）
+    pub(crate) fn request_unhook_for_selftest() -> bool {
+        post(WM_HOOK_UNHOOK_SELFTEST)
+    }
+
     /// 停止してjoinする。Dropからも呼ばれる。
     pub(crate) fn stop(&mut self) {
+        if let Some(w) = self.watchdog.take() {
+            crate::hook_watchdog::request_stop();
+            let _ = w.join();
+        }
         if let Some(join) = self.join.take() {
             // WM_QUITを投げてポンプを抜けさせる。アンフックはスレッド側で行う。
             post(WM_QUIT);
@@ -211,6 +224,9 @@ fn pump() {
 
         // フックのコールバック自体はGetMessageWの内部でOSから直接呼ばれるため、
         // ここに現れるのは自前の制御メッセージだけ。
+        if msg.message == WM_HOOK_UNHOOK_SELFTEST {
+            uninstall_hook_on_this_thread();
+        }
         if msg.message == WM_HOOK_REINSTALL {
             uninstall_hook_on_this_thread();
             if install_hook_on_this_thread().is_err() {

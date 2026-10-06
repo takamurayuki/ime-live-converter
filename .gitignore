@@ -12,3 +12,5 @@ dictionaries/system.dic
 dictionaries/judge_lm.bin
 # 判断層の共起モデル（dict-builder judge-cooc で再生成できる大きなバイナリ）
 dictionaries/judge_cooc.bin
+# フックの見張り番のログ（時刻と回数のみ）
+hook_watchdog.log

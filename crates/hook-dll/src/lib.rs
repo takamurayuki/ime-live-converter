@@ -70,6 +70,7 @@ static mut INITIAL_CHECK_DONE: bool = false;
 mod command_mode;
 mod hook;
 mod hook_thread;
+mod hook_watchdog;
 mod popup;
 mod settings_ui;
 mod uia;

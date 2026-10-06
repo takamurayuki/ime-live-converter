@@ -641,6 +641,7 @@ pub(crate) fn on_click_outside_popup() {
 /// マウス移動・ホイールはボタン押下でないため即座に次のフックへ渡す。
 #[allow(non_snake_case)]
 pub extern "system" fn LowLevelMouseProc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    crate::hook_watchdog::note_mouse_called();
     unsafe {
         if code >= 0 && is_mouse_button_down_message(wparam.0 as u32) {
             let outside_popup = if candidate_window_visible() {
@@ -954,6 +955,8 @@ pub extern "system" fn LowLevelKeyboardProc(
         let kb = unsafe { *(lparam.0 as *const KBDLLHOOKSTRUCT) };
         unsafe { GetTickCount() }.wrapping_sub(kb.time)
     });
+    // フックが生きていることをウォッチドッグに知らせる（外されたら張り直すため）
+    crate::hook_watchdog::note_hook_called();
     let __hook_latency_start = std::time::Instant::now();
     // extern "system" 境界をpanicが越えるのは未定義動作であり、フックスレッド
     // 分離後はこのスレッドが唯一フック配送を担うため、ここでpanicして
