@@ -26,7 +26,7 @@ pub fn extract(input: &Path, output: &Path, max_pages: Option<usize>) -> Result<
         Box::new(BufReader::with_capacity(1 << 20, file))
     };
     let mut out = BufWriter::with_capacity(1 << 20, File::create(output)?);
-    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).max(2) - 1;
+    let threads = crate::resources::worker_threads();
 
     let (job_tx, job_rx) = mpsc::sync_channel::<(usize, Vec<String>)>(threads * 4);
     let job_rx = std::sync::Mutex::new(job_rx);

@@ -19,3 +19,7 @@ vibrato = "0.5"
 zstd = "0.13"
 # Wikipedia ダンプ（.xml.bz2）の展開用（judge-lm の学習コーパス抽出、オフライン専用）
 bzip2 = "0.4"
+
+# 長時間の学習でプロセス優先度を下げるため（resources.rs、Windows のみ）
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_Threading"] }

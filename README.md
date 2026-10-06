@@ -144,8 +144,21 @@ JUDGE_SCALE=2000 JUDGE_UNK=-2 cargo run --release -p common --example judge_eval
   ./dictionaries/judge_lm.bin judge_dev.tsv 3000 --write
 ```
 
+dict-builder は既定で CPU の約半分（作業スレッド＝論理コア数の半分）を使い、
+プロセス優先度を「通常以下」に下げて動きます（他のアプリの操作を妨げないため）。
+急ぐときは `DICT_BUILDER_THREADS=<数>`（作業スレッド数）や
+`DICT_BUILDER_PRIORITY=normal`（優先度を下げない）で変えられます。
+
+共起モデル（任意、`dictionaries/judge_cooc.bin`）は文中・直前の確定文の名詞どうしの
+結びつきで同音異義語を選び分けます:
+
+```bash
+cargo run --release -p dict-builder -- judge-cooc   ipadic-mecab-2_7_0/system.dic.zst ./mecab-ipadic-2.7.0-20070801 ./dictionaries/system.dic   jawiki.txt ./dictionaries/judge_cooc.bin judge_cooc_dev.tsv
+```
+
 **無効化（元に戻す）**: 環境変数 `IME_JUDGE=0` で起動するか、
-`dictionaries/judge_lm.bin` を削除/リネームしてください。調査用に
+`dictionaries/judge_lm.bin` を削除/リネームしてください。共起だけ止めるなら
+`IME_JUDGE_COOC=0` か `dictionaries/judge_cooc.bin` の削除/リネームです。調査用に
 `examples/judge_show`（候補ごとの内訳）・`judge_bench`（打鍵ごとの時間）があります。
 
 ## 使い方

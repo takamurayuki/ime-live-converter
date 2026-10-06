@@ -328,6 +328,7 @@ dependencies = [
  "serde",
  "serde_json",
  "vibrato",
+ "windows-sys 0.59.0",
  "zstd",
 ]
 

@@ -10,6 +10,7 @@ use std::io::{BufRead, BufReader, BufWriter};
 use std::path::Path;
 
 mod judge_cooc;
+mod resources;
 mod judge_train;
 mod wiki;
 
@@ -740,6 +741,8 @@ fn save_corpus_lm(
 }
 
 fn main() -> Result<()> {
+    // 長時間 CPU を使うので、他のアプリの操作を妨げないよう優先度を下げる
+    resources::lower_priority();
     let args: Vec<String> = std::env::args().collect();
 
     if args.len() < 2 {
@@ -917,7 +920,7 @@ fn main() -> Result<()> {
                 dev_every: 100,
                 max_dev: 20000,
                 max_sentences: args.get(8).and_then(|s| s.parse().ok()),
-                threads: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).max(2) - 1,
+                threads: resources::worker_threads(),
             };
             judge_cooc::train(
                 Path::new(&args[2]),
@@ -941,7 +944,7 @@ fn main() -> Result<()> {
             if args.len() < 7 {
                 anyhow::bail!("使い方: judge-train <vibrato辞書.dic.zst> <IPA辞書ディレクトリ> <sentences.txt> <出力judge_lm.bin> <出力dev.tsv> [最大文数]");
             }
-            let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).max(2) - 1;
+            let threads = resources::worker_threads();
             let opts = judge_train::TrainOptions {
                 min_unigram: std::env::var("JUDGE_MIN_UNIGRAM").ok().and_then(|s| s.parse().ok()).unwrap_or(5),
                 min_bigram: std::env::var("JUDGE_MIN_BIGRAM").ok().and_then(|s| s.parse().ok()).unwrap_or(3),
