@@ -9,6 +9,7 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter};
 use std::path::Path;
 
+mod judge_cooc;
 mod judge_train;
 mod wiki;
 
@@ -749,6 +750,7 @@ fn main() -> Result<()> {
         println!("  {} corpus <vibrato辞書.dic.zst> <コーパステキストディレクトリ> <出力corpus_lm.dic> [最小頻度]", args[0]);
         println!("  {} wiki-extract <jawiki-pages-articles.xml.bz2> <出力sentences.txt> [最大記事数]", args[0]);
         println!("  {} judge-train <vibrato辞書.dic.zst> <IPA辞書ディレクトリ> <sentences.txt> <出力judge_lm.bin> <出力dev.tsv> [最大文数]", args[0]);
+        println!("  {} judge-cooc <vibrato辞書.dic.zst> <IPA辞書ディレクトリ> <system.dic> <sentences.txt> <出力judge_cooc.bin> <出力dev.tsv> [最大文数]", args[0]);
         println!();
         println!("wiki-extract / judge-train は判断層（judge-lm）の学習用。Wikipedia本文を文に分け、");
         println!("(表記,読み)単位のKneser-Neyバイグラムと評価用データ(読み→正解表記)を作る。");
@@ -902,6 +904,30 @@ fn main() -> Result<()> {
                 let t = worker.token(i);
                 println!("{}	{}	{}	{}", t.surface(), t.left_id(), t.right_id(), t.feature());
             }
+        }
+        "judge-cooc" => {
+            if args.len() < 8 {
+                anyhow::bail!("使い方: judge-cooc <vibrato辞書.dic.zst> <IPA辞書ディレクトリ> <system.dic> <sentences.txt> <出力judge_cooc.bin> <出力dev.tsv> [最大文数]");
+            }
+            let env = |k: &str| std::env::var(k).ok();
+            let opts = judge_cooc::CoocOptions {
+                min_pair: env("COOC_MIN_PAIR").and_then(|s| s.parse().ok()).unwrap_or(5),
+                min_ctx: env("COOC_MIN_CTX").and_then(|s| s.parse().ok()).unwrap_or(20),
+                min_pmi: env("COOC_MIN_PMI").and_then(|s| s.parse().ok()).unwrap_or(1.0),
+                dev_every: 100,
+                max_dev: 20000,
+                max_sentences: args.get(8).and_then(|s| s.parse().ok()),
+                threads: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).max(2) - 1,
+            };
+            judge_cooc::train(
+                Path::new(&args[2]),
+                Path::new(&args[3]),
+                Path::new(&args[4]),
+                Path::new(&args[5]),
+                Path::new(&args[6]),
+                Path::new(&args[7]),
+                &opts,
+            )?;
         }
         "wiki-extract" => {
             if args.len() < 4 {

@@ -118,6 +118,8 @@ fn build_state(dict: &std::sync::Arc<Dictionary>) -> LiveConversionState {
     // 判断層ありで期待値との差分を見る（[[jev-style-judge-direction]]）。
     if let Some(judge) = shared_judge() {
         converter.set_judge(Some(judge));
+        // `IME_JUDGE_COOC=<judge_cooc.bin>` で共起モデルも付ける
+        converter.set_cooc(shared_cooc());
     }
     let mut state = LiveConversionState::new();
     state.converter = Some(converter);
@@ -135,6 +137,18 @@ fn shared_judge() -> Option<std::sync::Arc<common::JudgeLm>> {
             ))
         })
         .clone()
+}
+
+/// `IME_JUDGE_COOC` で指定された共起モデル（全ケースで1回だけ読み込んで共有する）
+fn shared_cooc() -> Option<std::sync::Arc<common::judge_cooc::JudgeCooc>> {
+    static COOC: std::sync::OnceLock<Option<std::sync::Arc<common::judge_cooc::JudgeCooc>>> = std::sync::OnceLock::new();
+    COOC.get_or_init(|| {
+        let path = std::env::var("IME_JUDGE_COOC").ok()?;
+        Some(std::sync::Arc::new(
+            common::judge_cooc::JudgeCooc::load(std::path::Path::new(&path)).expect("IME_JUDGE_COOC の読み込みに失敗"),
+        ))
+    })
+    .clone()
 }
 
 /// `ConversionAction{delete_count, insert_text}`を、`hook.rs::execute_action`

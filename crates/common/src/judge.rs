@@ -70,6 +70,10 @@ pub struct JudgeParams {
     /// （けいき→京畿、こうたい→抗体）、前後に何も無い単語を打ったときの事前
     /// 確率としては語全体の頻度の方が素直なため混ぜる。1.0 で文頭の確率だけ。
     pub start_mix: f32,
+    /// 共起モデル（`judge_cooc`）の加点の重み（対象語ごとの最大 PMI に掛ける）
+    pub cooc_weight: f32,
+    /// 対象語1つあたりの PMI の上限（極端に珍しい組の過大評価を抑える）
+    pub cooc_cap: f32,
 }
 
 impl Default for JudgeParams {
@@ -82,6 +86,8 @@ impl Default for JudgeParams {
             seed_bonus: 4.0,
             learn_scale: 750.0,
             start_mix: 0.5,
+            cooc_weight: 1.0,
+            cooc_cap: 5.0,
         }
     }
 }
@@ -181,6 +187,8 @@ pub struct JudgeScore {
     pub learned: i32,
     /// 隣接コロケーション（word_assoc.tsv）に当たった組の数
     pub seed_hits: u32,
+    /// 共起モデルの加点（重みを掛ける前、`ViterbiConverter::path_cooc_bonus`）
+    pub cooc: f32,
     /// 総合スコア（大きいほど良い）
     pub score: f32,
 }
@@ -526,12 +534,14 @@ impl JudgeLm {
         (total, unk_chars)
     }
 
-    /// LM 対数確率・辞書コスト・個人学習・コロケーション一致数から総合スコアを出す
-    pub fn combine(&self, lm_logp: f32, dict_cost: i32, learned: i32, seed_hits: u32) -> f32 {
+    /// LM 対数確率・辞書コスト・個人学習・コロケーション一致数・共起の加点から
+    /// 総合スコアを出す
+    pub fn combine(&self, lm_logp: f32, dict_cost: i32, learned: i32, seed_hits: u32, cooc: f32) -> f32 {
         let p = self.params;
         p.lm_weight * lm_logp - dict_cost as f32 / p.dict_scale
             + learned as f32 / p.learn_scale
             + p.seed_bonus * seed_hits as f32
+            + p.cooc_weight * cooc
     }
 
     /// スコア列を確率分布にする（softmax、温度つき）

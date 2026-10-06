@@ -37,7 +37,7 @@ pub struct TrainOptions {
 }
 
 /// 分かち書き済みの1文節（(語キー, 文脈ID) の列）
-type Clause = Vec<(String, u16)>;
+pub(crate) type Clause = Vec<(String, u16)>;
 
 struct ChunkResult {
     clauses: Vec<Clause>,
@@ -48,7 +48,7 @@ struct ChunkResult {
 /// IPADic の CSV を読み、"表記\t素性" → 文脈ID の表を作る（素性は CSV の
 /// 5列目以降。vibrato のトークン素性と同じ並び）。IPADic は左右の文脈IDが
 /// 常に同じなので左IDだけ持つ。
-fn load_ipadic_ids(dir: &Path) -> Result<(HashMap<String, u16>, u16)> {
+pub(crate) fn load_ipadic_ids(dir: &Path) -> Result<(HashMap<String, u16>, u16)> {
     let mut map = HashMap::new();
     let mut max_id = 0u16;
     for entry in std::fs::read_dir(dir).with_context(|| format!("IPADic ディレクトリを開けません: {}", dir.display()))? {
@@ -74,7 +74,7 @@ fn load_ipadic_ids(dir: &Path) -> Result<(HashMap<String, u16>, u16)> {
     Ok((map, max_id))
 }
 
-fn katakana_to_hiragana(s: &str) -> String {
+pub(crate) fn katakana_to_hiragana(s: &str) -> String {
     s.chars()
         .map(|c| match c {
             '\u{30A1}'..='\u{30F6}' => char::from_u32(c as u32 - 0x60).unwrap_or(c),
@@ -83,7 +83,7 @@ fn katakana_to_hiragana(s: &str) -> String {
         .collect()
 }
 
-fn is_reading_char(c: char) -> bool {
+pub(crate) fn is_reading_char(c: char) -> bool {
     ('\u{3041}'..='\u{3096}').contains(&c) || c == 'ー'
 }
 
@@ -144,7 +144,7 @@ fn tokenize_clauses(
 }
 
 /// 評価用データに使える文節か（漢字を含み、長さが手頃）
-fn is_dev_clause(words: &Clause, reading: &str, surface: &str) -> bool {
+pub(crate) fn is_dev_clause(words: &Clause, reading: &str, surface: &str) -> bool {
     let n = reading.chars().count();
     words.len() >= 2
         && (5..=30).contains(&n)

@@ -146,6 +146,12 @@ pub struct ViterbiConverter {
     /// N-best＋統計言語モデルの確率で選び直す。`None`なら従来の挙動と完全に同じ
     /// （[[jev-style-judge-direction]]、`set_judge`で切り替える）。
     pub judge: Option<Arc<crate::judge::JudgeLm>>,
+    /// 判断層の共起モデル（`crate::judge_cooc`、離れた名詞どうしの結びつき）。
+    /// `judge` があるときだけ使う。`None` なら共起は見ない。
+    pub cooc: Option<Arc<crate::judge_cooc::JudgeCooc>>,
+    /// 直前に確定した文の名詞（新しい順に最大 `CONTEXT_NOUNS_MAX` 個）。共起モデルの
+    /// 文脈として、句読点で確定した後の続きの入力にも前の文の話題を効かせる。
+    pub context_nouns: Vec<String>,
 }
 
 impl ViterbiConverter {
@@ -209,6 +215,8 @@ impl ViterbiConverter {
             corpus_bigram: HashMap::new(),
             seeded_assoc: HashMap::new(),
             judge: None,
+            cooc: None,
+            context_nouns: Vec::new(),
         };
         conv.seed_common_words();
         conv

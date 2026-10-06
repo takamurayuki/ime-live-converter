@@ -10,3 +10,5 @@ hook_debug.log
 dictionaries/system.dic
 # 判断層（judge-lm）のモデル。Wikipedia から dict-builder judge-train で再生成できる大きなバイナリ
 dictionaries/judge_lm.bin
+# 判断層の共起モデル（dict-builder judge-cooc で再生成できる大きなバイナリ）
+dictionaries/judge_cooc.bin

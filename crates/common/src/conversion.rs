@@ -51,6 +51,12 @@ pub const AUTO_COMPOUND_MIN_FREQ: u32 = 3;
 /// 自動登録する複合語の読みの最大文字数（暴走的に長い結合を防ぐ）。
 pub const AUTO_COMPOUND_MAX_READING_LEN: usize = 8;
 
+/// バックグラウンドで読み込んだ判断層と共起モデル
+struct PendingJudge {
+    judge: Option<std::sync::Arc<crate::judge::JudgeLm>>,
+    cooc: Option<std::sync::Arc<crate::judge_cooc::JudgeCooc>>,
+}
+
 /// 判断層（judge-lm）を使うか。環境変数 `IME_JUDGE=0` で無効化できる
 /// （既定は有効。`judge_lm.bin` が無ければいずれにせよ使われない）。
 pub fn judge_enabled() -> bool {
@@ -80,8 +86,8 @@ pub struct LiveConversionState {
     /// その間のキー入力がフックの制限時間を超えるのを避ける）。読み込みが
     /// 終わるまでは従来の変換のまま動く。
     pub load_judge_async: bool,
-    /// バックグラウンド読み込み中の判断層（`attach_pending_judge` で取り付ける）
-    pending_judge: Option<std::sync::mpsc::Receiver<Option<std::sync::Arc<crate::judge::JudgeLm>>>>,
+    /// バックグラウンド読み込み中の判断層と共起モデル（`attach_pending_judge` で取り付ける）
+    pending_judge: Option<std::sync::mpsc::Receiver<PendingJudge>>,
     /// 現在のローマ字入力バッファ
     pub romaji_buffer: String,
     /// 現在のひらがなバッファ
@@ -413,9 +419,12 @@ impl LiveConversionState {
     fn attach_pending_judge(&mut self) {
         let Some(rx) = self.pending_judge.as_ref() else { return };
         match rx.try_recv() {
-            Ok(judge) => {
-                if let (Some(judge), Some(conv)) = (judge, self.converter.as_mut()) {
-                    conv.set_judge(Some(judge));
+            Ok(loaded) => {
+                if let Some(conv) = self.converter.as_mut() {
+                    if loaded.judge.is_some() {
+                        conv.set_judge(loaded.judge);
+                        conv.set_cooc(loaded.cooc);
+                    }
                 }
                 self.pending_judge = None;
             }
@@ -435,6 +444,11 @@ impl LiveConversionState {
     pub fn invalidate_commit_ring(&mut self) {
         self.commit_ring.clear();
         self.restore_selection = None;
+        // 同じ理由（カーソル位置や入力先が変わった）で、共起の文脈にしている
+        // 直前の確定文の名詞も前の文とつながらなくなるので捨てる
+        if let Some(conv) = self.converter.as_mut() {
+            conv.clear_context();
+        }
     }
 
     /// 復元ホットキーが押された。`commit_ring`の最新エントリ（最新1件のみ、
@@ -1475,15 +1489,36 @@ impl LiveConversionState {
                 self.pending_judge = None;
                 let judge_path = path.with_file_name("judge_lm.bin");
                 if judge_enabled() && judge_path.exists() {
-                    let load = move || match crate::judge::JudgeLm::load(&judge_path) {
-                        Ok(judge) => {
-                            debug_log!("判断層を読み込みました: {:?}", judge);
-                            Some(std::sync::Arc::new(judge))
-                        }
-                        Err(e) => {
-                            debug_log!("判断層の読み込みに失敗（従来の変換で続行）: {}", e);
+                    // 共起モデル（judge_cooc.bin）は任意。無い・読めない・IME_JUDGE_COOC=0
+                    // なら判断層だけで動く
+                    let cooc_path = path.with_file_name("judge_cooc.bin");
+                    let load = move || {
+                        let judge = match crate::judge::JudgeLm::load(&judge_path) {
+                            Ok(judge) => {
+                                debug_log!("判断層を読み込みました: {:?}", judge);
+                                Some(std::sync::Arc::new(judge))
+                            }
+                            Err(e) => {
+                                debug_log!("判断層の読み込みに失敗（従来の変換で続行）: {}", e);
+                                None
+                            }
+                        };
+                        let cooc_enabled = std::env::var("IME_JUDGE_COOC").map(|v| v != "0").unwrap_or(true);
+                        let cooc = if judge.is_some() && cooc_enabled && cooc_path.exists() {
+                            match crate::judge_cooc::JudgeCooc::load(&cooc_path) {
+                                Ok(c) => {
+                                    debug_log!("共起モデルを読み込みました: {:?}", c);
+                                    Some(std::sync::Arc::new(c))
+                                }
+                                Err(e) => {
+                                    debug_log!("共起モデルの読み込みに失敗（共起なしで続行）: {}", e);
+                                    None
+                                }
+                            }
+                        } else {
                             None
-                        }
+                        };
+                        PendingJudge { judge, cooc }
                     };
                     if self.load_judge_async {
                         let (tx, rx) = std::sync::mpsc::channel();
@@ -1491,8 +1526,12 @@ impl LiveConversionState {
                             let _ = tx.send(load());
                         });
                         self.pending_judge = Some(rx);
-                    } else if let (Some(judge), Some(conv)) = (load(), self.converter.as_mut()) {
-                        conv.set_judge(Some(judge));
+                    } else {
+                        let loaded = load();
+                        if let Some(conv) = self.converter.as_mut() {
+                            conv.set_judge(loaded.judge);
+                            conv.set_cooc(loaded.cooc);
+                        }
                     }
                 }
                 // ユーザー登録の単語を辞書へ注入（辞書に無い複合語を変換可能に）
@@ -2295,6 +2334,10 @@ impl LiveConversionState {
         // （文全体の整合性）も学習される。
         let mut segments = std::mem::take(&mut self.committed_segments);
         segments.extend(self.segment_remaining());
+        // 確定した名詞を次の入力の共起の文脈として覚える（判断層の共起モデル）
+        if let Some(conv) = self.converter.as_mut() {
+            conv.note_committed(&segments);
+        }
         self.learn_segments_or_defer(&segments);
 
         // Escでひらがなに戻した末尾は「この読みはひらがな優先」として学習。
@@ -3103,6 +3146,61 @@ mod state_machine_tests {
         let (_, _, seg_surfaces, _, _, _, _) = state.build_candidates();
         assert_eq!(seg_surfaces.first().map(String::as_str), Some("強"), "{seg_surfaces:?}");
         assert!(seg_surfaces.contains(&"今日".to_string()));
+    }
+
+    /// 共起モデル: 前に確定した文の名詞（駅）が、次の入力の同音異義語の選択
+    /// （きしゃ → 記者/汽車）に効く。文脈を捨てると既定（辞書・LM の強い記者）に戻る。
+    #[test]
+    fn committed_context_noun_steers_homophone_choice() {
+        use crate::judge::{vocab_key, JudgeLm, JudgeLmData};
+        use crate::judge_cooc::{JudgeCooc, JudgeCoocData};
+        let n_class = 10usize;
+        let lm = JudgeLmData {
+            vocab: vec![
+                "<s>".into(),
+                "</s>".into(),
+                vocab_key("記者", "きしゃ", 1),
+                vocab_key("汽車", "きしゃ", 1),
+            ],
+            word_class: vec![0, 0, 1, 1],
+            emit_logp: vec![0.0, 0.0, -2.0, -3.0],
+            backoff: vec![0.0; 4],
+            bi_offsets: vec![0; 5],
+            class_logp: vec![-(n_class as f32).ln(); n_class * n_class],
+            unk_emit_logp: vec![-20.0; n_class],
+            n_class: n_class as u32,
+            ..Default::default()
+        };
+        // 汽車 は 駅 と強く共起する
+        let cooc = JudgeCoocData {
+            nouns: vec!["汽車".into(), "駅".into()],
+            offsets: vec![0, 1, 1],
+            ctx: vec![1],
+            pmi: vec![4.0],
+        };
+        let mut dict = crate::Dictionary::new();
+        dict.matrix = crate::ConnectionMatrix::new(10, 10);
+        for (s, cost) in [("記者", 3000i16), ("汽車", 3500)] {
+            dict.add_word(crate::WordEntry {
+                surface: s.into(),
+                reading: "きしゃ".into(),
+                left_id: 1,
+                right_id: 1,
+                cost,
+                pos: "名詞-一般-*-*".into(),
+            });
+        }
+        let mut converter = ViterbiConverter::new(dict);
+        converter.set_judge(Some(std::sync::Arc::new(JudgeLm::from_data(lm))));
+        converter.set_cooc(Some(std::sync::Arc::new(JudgeCooc::from_data(cooc))));
+        let shown = |c: &ViterbiConverter| -> String {
+            c.convert_context_aware("きしゃ").iter().map(|e| e.surface.as_str()).collect()
+        };
+        assert_eq!(shown(&converter), "記者");
+        converter.note_committed(&[("えき".into(), "駅".into(), "名詞-一般-*-*".into())]);
+        assert_eq!(shown(&converter), "汽車");
+        converter.clear_context();
+        assert_eq!(shown(&converter), "記者");
     }
 
     /// 画面上のテキストを模擬してアクションを適用する

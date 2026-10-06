@@ -36,7 +36,7 @@ fn main() {
             }
             let units = t.elapsed().as_micros();
             let t = Instant::now();
-            let _ = conv.lm_viterbi(&judge, &lattice);
+            let _ = conv.lm_viterbi(&judge, &lattice, None);
             let vit = t.elapsed().as_micros();
             println!(
                 "内訳: ノード{}個（分解{}個） 構築{:.1}ms / 単位{:.1}ms / lm_viterbi全体{:.1}ms",

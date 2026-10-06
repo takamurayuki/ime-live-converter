@@ -8,6 +8,7 @@ pub mod learning;
 pub mod rerank;
 pub mod corpus_lm;
 pub mod judge;
+pub mod judge_cooc;
 pub mod brackets;
 pub mod conversion;
 

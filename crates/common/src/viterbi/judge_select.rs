@@ -33,11 +33,109 @@ impl JudgedCandidate {
 
 /// 2次 Viterbi（`lm_viterbi`）で各ノードに残す状態数
 pub const JUDGE_BEAM: usize = 4;
+/// 共起の文脈として覚えておく直前の確定文の名詞の数
+pub const CONTEXT_NOUNS_MAX: usize = 12;
 
 impl ViterbiConverter {
     /// 判断層を付け替える（`None` で従来の挙動に戻る）
     pub fn set_judge(&mut self, judge: Option<Arc<JudgeLm>>) {
         self.judge = judge;
+    }
+
+    /// 判断層の共起モデルを付け替える（`None` で共起を見ない）
+    pub fn set_cooc(&mut self, cooc: Option<Arc<crate::judge_cooc::JudgeCooc>>) {
+        self.cooc = cooc;
+    }
+
+    /// 確定した文節（読み, 表記, 品詞）の名詞を、次の入力の共起の文脈として覚える
+    pub fn note_committed(&mut self, segments: &[(String, String, String)]) {
+        for (_, surface, pos) in segments {
+            if crate::judge_cooc::is_cooc_noun_entry(pos, surface) {
+                self.context_nouns.retain(|n| n != surface);
+                self.context_nouns.insert(0, surface.clone());
+            }
+        }
+        self.context_nouns.truncate(CONTEXT_NOUNS_MAX);
+    }
+
+    /// 共起の文脈（直前の確定文の名詞）を捨てる（フォーカス移動など、前の文と
+    /// 話題がつながらないとき）
+    pub fn clear_context(&mut self) {
+        self.context_nouns.clear();
+    }
+
+    /// 共起モデルの文脈語ID: 直前の確定文の名詞 ＋ `extra`
+    fn cooc_context_ids<'a>(
+        &self,
+        cooc: &crate::judge_cooc::JudgeCooc,
+        extra: impl Iterator<Item = &'a str>,
+    ) -> Vec<u32> {
+        let mut ids: Vec<u32> = self.context_nouns.iter().filter_map(|s| cooc.noun_id(s)).collect();
+        ids.extend(extra.filter_map(|s| cooc.noun_id(s)));
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    /// 語列の共起の加点（重み前）: 候補中の名詞ごとに、文中の他の名詞と直前の
+    /// 確定文の名詞の中で最も強い PMI（上限 `cooc_cap`）の合計
+    pub fn path_cooc_bonus(&self, path: &[WordEntry]) -> f32 {
+        let (Some(judge), Some(cooc)) = (self.judge.as_ref(), self.cooc.as_ref()) else {
+            return 0.0;
+        };
+        let cap = judge.params().cooc_cap;
+        let targets: Vec<&str> = path
+            .iter()
+            .filter(|e| crate::judge_cooc::is_cooc_target_entry(&e.pos, &e.surface))
+            .map(|e| e.surface.as_str())
+            .collect();
+        if targets.is_empty() {
+            return 0.0;
+        }
+        let nouns = path
+            .iter()
+            .filter(|e| crate::judge_cooc::is_cooc_noun_entry(&e.pos, &e.surface))
+            .map(|e| e.surface.as_str());
+        let ctx = self.cooc_context_ids(cooc, nouns);
+        targets.iter().map(|t| cooc.assoc(t, &ctx, cap)).sum()
+    }
+
+    /// ラティスの各ノードの共起の加点（重み込み）。文脈は1回目の探索で選ばれた
+    /// 経路 `first` の名詞のうち、そのノードと読みの範囲が重ならないもの ＋
+    /// 直前の確定文の名詞。
+    fn cooc_node_bonus(&self, judge: &JudgeLm, lattice: &Lattice, first: &[WordEntry]) -> Option<Vec<f32>> {
+        let cooc = self.cooc.as_ref()?;
+        let params = judge.params();
+        // 1回目の経路の名詞と、その読みのバイト範囲
+        let mut spans: Vec<(usize, usize, &str)> = Vec::new();
+        let mut pos = 0usize;
+        for e in first {
+            let end = pos + e.reading.len();
+            if crate::judge_cooc::is_cooc_noun_entry(&e.pos, &e.surface) {
+                spans.push((pos, end, e.surface.as_str()));
+            }
+            pos = end;
+        }
+        if spans.is_empty() && self.context_nouns.is_empty() {
+            return None;
+        }
+        let bonus = lattice
+            .nodes
+            .iter()
+            .map(|n| {
+                let Some(e) = n.entry.as_ref() else { return 0.0 };
+                if !crate::judge_cooc::is_cooc_target_entry(&e.pos, &e.surface) {
+                    return 0.0;
+                }
+                let others = spans
+                    .iter()
+                    .filter(|&&(s, t, _)| t <= n.start || s >= n.end)
+                    .map(|&(_, _, w)| w);
+                let ctx = self.cooc_context_ids(cooc, others);
+                params.cooc_weight * cooc.assoc(&e.surface, &ctx, params.cooc_cap)
+            })
+            .collect();
+        Some(bonus)
     }
 
     /// 1語の (辞書側の実効コスト, 個人学習のボーナス)。`effective_word_cost` から
@@ -145,13 +243,28 @@ impl ViterbiConverter {
         } else {
             self.build_pinned_lattice(reading, pinned)
         };
-        let Some(path) = self.lm_viterbi(judge, &lattice) else {
+        let Some(path) = self.lm_viterbi(judge, &lattice, None) else {
             return Vec::new();
         };
-        let n = pinned.len().min(path.len());
-        let mut repaired = path[..n].to_vec();
-        repaired.extend(self.repair_single_kanji_fragments(path[n..].to_vec()));
-        vec![path, repaired]
+        let mut paths = vec![path];
+        // 共起モデルがあれば、1回目の経路の名詞（と直前の確定文の名詞）を文脈に
+        // もう一度探索する（文中の離れた名詞どうしの結びつきは辺に分解できない
+        // ため、文脈を固定した2回目の探索でノードごとの加点として扱う）
+        if let Some(bonus) = self.cooc_node_bonus(judge, &lattice, &paths[0]) {
+            if let Some(second) = self.lm_viterbi(judge, &lattice, Some(&bonus)) {
+                paths.push(second);
+            }
+        }
+        let n_pinned = pinned.len();
+        let mut out = Vec::new();
+        for path in paths {
+            let n = n_pinned.min(path.len());
+            let mut repaired = path[..n].to_vec();
+            repaired.extend(self.repair_single_kanji_fragments(path[n..].to_vec()));
+            out.push(path);
+            out.push(repaired);
+        }
+        out
     }
 
     /// ラティス上で総合スコア（`JudgeLm::combine` と同じ式。ただし離れた語どうしの
@@ -162,7 +275,7 @@ impl ViterbiConverter {
     /// 2次の Viterbi になる。各ノードでは直前ノードごとに最良の1状態だけを残し、
     /// さらにスコア上位 `JUDGE_BEAM` 個に絞る（ビーム）。トライグラムの無い
     /// モデルでは状態が直前ノードに依らないので、厳密な1次の Viterbi と一致する。
-    pub fn lm_viterbi(&self, judge: &JudgeLm, lattice: &Lattice) -> Option<Vec<WordEntry>> {
+    pub fn lm_viterbi(&self, judge: &JudgeLm, lattice: &Lattice, node_bonus: Option<&[f32]>) -> Option<Vec<WordEntry>> {
         #[derive(Clone, Copy)]
         struct State {
             score: f32,
@@ -249,6 +362,7 @@ impl ViterbiConverter {
                         let base = -(conn.saturating_add(wc) as f32) / params.dict_scale
                             + conn_learned.saturating_add(wc_learned) as f32 / params.learn_scale
                             + seed
+                            + node_bonus.map_or(0.0, |b| b[cur])
                             + params.lm_weight * (params.unk_char_logp * u.unk_chars as f32 + u.internal);
                         (base, Some(u.first), judge.logp(prev_ctx, u.first, u.first_class))
                     };
@@ -297,7 +411,7 @@ impl ViterbiConverter {
         let judge = self.judge.as_ref()?;
         let lm = judge.sequence_logp(None, path);
         let (dict_cost, learned) = self.path_costs(path);
-        Some(judge.combine(lm, dict_cost, learned, self.path_seed_hits(path)))
+        Some(judge.combine(lm, dict_cost, learned, self.path_seed_hits(path), self.path_cooc_bonus(path)))
     }
 
     /// 候補を採点し、確率の高い順に並べて返す。`baseline` は従来エンジンの
@@ -329,8 +443,9 @@ impl ViterbiConverter {
                 let lm_logp = lm_base + judge.params().unk_char_logp * unk_chars as f32;
                 let (dict_cost, learned) = self.path_costs(&entries);
                 let seed_hits = self.path_seed_hits(&entries);
-                let score = judge.combine(lm_logp, dict_cost, learned, seed_hits);
-                (entries, JudgeScore { lm_logp, lm_base, unk_chars, dict_cost, learned, seed_hits, score }, is_baseline)
+                let cooc = self.path_cooc_bonus(&entries);
+                let score = judge.combine(lm_logp, dict_cost, learned, seed_hits, cooc);
+                (entries, JudgeScore { lm_logp, lm_base, unk_chars, dict_cost, learned, seed_hits, cooc, score }, is_baseline)
             })
             .collect();
         let probs = judge.distribution(&scored.iter().map(|(_, s, _)| s.score).collect::<Vec<_>>());
