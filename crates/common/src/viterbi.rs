@@ -403,6 +403,9 @@ impl ViterbiConverter {
         // 顕著）。行くは日常会話で圧倒的に高頻度、逝くは文語的・訃報等の
         // 限定的な場面でしか使わないため、`trusted_phrase_bonus`で
         // 0未満まで割り引いて確実に優先する。
+        // ※この組はノード単位では適用されない（`node_trusted_bonus`）。実際に
+        // 効くのは`iitte_verb_conn_floor`（後続が て/た 系の付属語のときだけ、
+        // 減額3000）で、ここの値は「信頼済みの語」という印としてだけ使われる。
         self.trusted_phrase_bonus
             .insert(("いっ".to_string(), "行っ".to_string()), 15000);
         // 「いちがい」も、「位置」（無関係な文脈で単語コストが学習ボーナスで
@@ -1288,6 +1291,20 @@ impl ViterbiConverter {
     /// `build_lattice`が各ラティスノードに適用するのと同じ計算式。候補一覧
     /// （`hook-dll`の`build_candidates`）からも参照するため`pub(crate)`にしている。
     pub fn effective_word_cost(&self, e: &WordEntry) -> i32 {
+        let learned = self
+            .learned_unigram
+            .get(&(e.reading.clone(), e.surface.clone()))
+            .copied()
+            .unwrap_or(0);
+        self.word_cost_with_learned(e, learned)
+    }
+
+    /// `effective_word_cost` の学習ユニグラム分を `learned` に差し替えたもの。
+    /// 判断層は個人学習を辞書コストと別の尺度で効かせるため、`learned = 0` で
+    /// 辞書側だけのコストを求める（学習込みで0に floor してから学習分を足し戻すと、
+    /// 元のコストが学習ボーナスより安い語ほど学習が目減りし、断片側の高コスト語
+    /// （行っ 等）だけが学習を満額受け取る非対称になる）。
+    pub(crate) fn word_cost_with_learned(&self, e: &WordEntry, learned: i32) -> i32 {
         // `build_lattice`がラティスの各ノードに適用するのと同じ3つのペナルティ
         // （1文字漢字・カタカナ固有名詞・記号）を揃える。ここが揃っていないと、
         // これを使う`rerank_by_assoc_from`（連想再ランク）や候補一覧が、
@@ -1297,16 +1314,31 @@ impl ViterbiConverter {
             + proper_noun_penalty(&e.surface, &e.pos)
             + symbol_penalty(&e.surface, &e.pos);
         let key = (e.reading.clone(), e.surface.clone());
-        let bonus = self.learned_unigram.get(&key).copied().unwrap_or(0);
-        let trusted_bonus = self.trusted_phrase_bonus.get(&key).copied().unwrap_or(0);
+        let trusted_bonus = self.node_trusted_bonus(&key);
         let corpus_bonus = self.corpus_unigram.get(&key).copied().unwrap_or(0);
         let floor = if trusted_bonus != 0 { -20000 } else { 0 };
         (e.cost as i32)
             .saturating_add(pen)
-            .saturating_sub(bonus)
+            .saturating_sub(learned)
             .saturating_sub(trusted_bonus)
             .saturating_sub(corpus_bonus)
             .max(floor)
+    }
+
+    /// ノード単位（前後の語を見ずに）語コストへ適用してよい `trusted_phrase_bonus`。
+    ///
+    /// 「いっ」→「行っ」は読み・後続語を問わない無条件適用にすると無関係な語
+    /// （一貫性→行っ完成、一旦→行ったん）まで巻き込む（2026-09-13発見、
+    /// [[trusted-phrase-bonus-blast-radius]]）。この1組だけノード単位の適用から
+    /// 除外し、`iitte_verb_conn_floor`で後続が「て」「た」のときだけedge単位で
+    /// 効かせる。ラティス・実効コスト（候補一覧・連想再ランク・判断層）の
+    /// すべてがここを通ること（2026-10-09、`effective_word_cost`側だけ除外が
+    /// 漏れていて判断層経由で「一旦→行ったん」が再発した）。
+    pub(crate) fn node_trusted_bonus(&self, key: &(String, String)) -> i32 {
+        if key.0 == "いっ" && key.1 == "行っ" {
+            return 0;
+        }
+        self.trusted_phrase_bonus.get(key).copied().unwrap_or(0)
     }
 
     /// ひらがな文字列を最適な単語列に変換
@@ -1372,6 +1404,17 @@ impl ViterbiConverter {
                     self.unknown_cost,
                 );
             } else {
+                // 同じ位置から始まる語のうち、固有名詞以外で最も長いものの長さ。
+                // `trusted_phrase_bonus`（0未満まで割り引ける固定ボーナス）は
+                // 同音語・断片分割に勝たせるためのもので、その読みで始まる
+                // より長い語（水曜→水溶液・水溶性、どうか→導火線、一旦等）まで
+                // 上書きしてはならない（2026-10-09）。
+                let longest_common_len = matches
+                    .iter()
+                    .filter(|(_, entries)| entries.iter().any(|e| !e.pos.contains("固有名詞")))
+                    .map(|(len, _)| *len)
+                    .max()
+                    .unwrap_or(0);
                 // マッチした単語をすべて追加
                 for (len, entries) in matches {
                     let end_pos = byte_pos + len;
@@ -1385,15 +1428,12 @@ impl ViterbiConverter {
                         // 学習したユニグラムはコストを減額（優先度を上げる）
                         let key = (entry.reading.clone(), entry.surface.clone());
                         let bonus = self.learned_unigram.get(&key).copied().unwrap_or(0);
-                        // 「いっ」→「行っ」は読み・後続語を問わない無条件適用にすると
-                        // 無関係な語（一貫性→行っ完成）まで巻き込む（2026-09-13発見、
-                        // [[trusted-phrase-bonus-blast-radius]]）。この1組だけ
-                        // node単位の適用から除外し、`iitte_verb_conn_floor`で
-                        // 後続が「て」「た」のときだけedge単位で効かせる。
-                        let trusted_bonus = if key.0 == "いっ" && key.1 == "行っ" {
+                        // 「いっ」→「行っ」はノード単位では適用しない（`node_trusted_bonus`）。
+                        // より長い語が同じ位置から始まる場合も適用しない（上記）。
+                        let trusted_bonus = if longest_common_len > len {
                             0
                         } else {
-                            self.trusted_phrase_bonus.get(&key).copied().unwrap_or(0)
+                            self.node_trusted_bonus(&key)
                         };
                         // コーパス由来のユニグラム頻度も同じ「使うほど優先」の
                         // 発想の減額だが、個人の学習履歴とは別チャネル（詳細は

@@ -140,14 +140,14 @@ impl ViterbiConverter {
 
     /// 1語の (辞書側の実効コスト, 個人学習のボーナス)。`effective_word_cost` から
     /// 学習ユニグラムのボーナスだけを切り出したもの（判断層では個人学習を
-    /// 辞書コストと別の尺度で効かせるため）。
+    /// 辞書コストと別の尺度で効かせるため。辞書側は学習を入れずに求める）。
     pub(crate) fn judge_word_cost(&self, e: &WordEntry) -> (i32, i32) {
         let learned = self
             .learned_unigram
             .get(&(e.reading.clone(), e.surface.clone()))
             .copied()
             .unwrap_or(0);
-        (self.effective_word_cost(e).saturating_add(learned), learned)
+        (self.word_cost_with_learned(e, 0), learned)
     }
 
     /// 2語間の (辞書側の接続コスト, 個人学習のバイグラムボーナス)

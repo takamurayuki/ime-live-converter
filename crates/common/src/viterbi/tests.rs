@@ -2600,6 +2600,66 @@ fn test_seeded_verb_stem_beats_cheaper_rare_homophone() {
 }
 
 #[test]
+fn test_iitte_floor_does_not_override_word_starting_with_itta() {
+    // 実例（2026-10-09）:「いったん」→「行ったん」。「行っ」→「た/て」の
+    // 接続下限が15000と必要量（逝っとの語コスト差、約900）の十数倍で、
+    // 「いった/いって」で始まる1語（一旦・一定・一転 等）を上書きしていた。
+    // 語コストは実辞書の値（一旦3271・行っ7425）に合わせてある。
+    let mut dict = flat_matrix_dict();
+    dict.add_word(word("一旦", "いったん", 1, 3271, "名詞-副詞可能-*-*"));
+    dict.add_word(word("逝っ", "いっ", 2, 6526, "動詞-自立-*-*"));
+    dict.add_word(word("行っ", "いっ", 2, 7425, "動詞-自立-*-*"));
+    dict.add_word(word("た", "た", 3, 50, "助動詞-*-*-*"));
+    dict.add_word(word("たら", "たら", 3, 4644, "助動詞-*-*-*"));
+    dict.add_word(word("ん", "ん", 4, 3000, "名詞-非自立-一般-*"));
+    let converter = ViterbiConverter::new(dict);
+    assert_eq!(converter.convert_to_string("いったん"), "一旦");
+    // 本来の用途（逝っより行っ）は「た」以外の て/た 系付属語でも保たれる
+    assert_eq!(converter.convert_to_string("いった"), "行った");
+    assert_eq!(converter.convert_to_string("いったら"), "行ったら");
+}
+
+#[test]
+fn test_iitte_trusted_bonus_is_not_in_effective_word_cost() {
+    // ラティスでは「いっ/行っ」の固定ボーナスをノード単位で適用しないが、
+    // 判断層・候補一覧・連想再ランクが使う `effective_word_cost` 側だけ
+    // 除外が漏れていて、判断層経由で「一旦→行ったん」が再発した（2026-10-09）。
+    let mut dict = flat_matrix_dict();
+    let itt = word("行っ", "いっ", 1, 7425, "動詞-自立-*-*");
+    dict.add_word(itt.clone());
+    let converter = ViterbiConverter::new(dict);
+    assert!(converter.trusted_phrase_bonus.contains_key(&("いっ".to_string(), "行っ".to_string())));
+    assert_eq!(converter.effective_word_cost(&itt), 7425);
+}
+
+#[test]
+fn test_judge_word_cost_dictionary_part_does_not_depend_on_learning() {
+    // 判断層は個人学習を辞書コストと別の尺度で足す。学習込みで0に floor して
+    // から学習分を足し戻すと、元のコストが学習ボーナスより安い語（一旦3271に
+    // 学習6000）ほど辞書側のコストが水増しされ、学習が目減りしていた。
+    let mut dict = flat_matrix_dict();
+    let ittan = word("一旦", "いったん", 1, 3271, "名詞-副詞可能-*-*");
+    dict.add_word(ittan.clone());
+    let mut converter = ViterbiConverter::new(dict);
+    converter.learn_unigram("いったん", "一旦", 4);
+    assert_eq!(converter.judge_word_cost(&ittan), (3271, UNIGRAM_BONUS_CAP));
+}
+
+#[test]
+fn test_trusted_phrase_bonus_does_not_override_longer_word() {
+    // 「水曜」の固定ボーナス（0未満まで割り引ける）が、同じ読みで始まる
+    // より長い語「水溶液」を「水曜駅」に割っていた（2026-10-09）。
+    let mut dict = flat_matrix_dict();
+    dict.add_word(word("水曜", "すいよう", 1, 5306, "名詞-副詞可能-*-*"));
+    dict.add_word(word("駅", "えき", 2, 4000, "名詞-一般-*-*"));
+    dict.add_word(word("水溶液", "すいようえき", 3, 6000, "名詞-一般-*-*"));
+    let converter = ViterbiConverter::new(dict);
+    assert_eq!(converter.convert_to_string("すいようえき"), "水溶液");
+    // 単独の「すいよう」には従来どおり効く
+    assert_eq!(converter.convert_to_string("すいよう"), "水曜");
+}
+
+#[test]
 fn test_seeded_yomu_stem_beats_cheaper_rare_homophone() {
     // 実例:「ほんをよんだ」が同音動詞「呼ん」に負けて「本を呼んだ」になる。
     let mut dict = flat_matrix_dict();

@@ -1,9 +1,12 @@
 //! 判断層（judge-lm）の候補と内訳を表示する調査用ツール。
 //!
 //! 使い方: printf 'ぐんぐんすすむ\n' | cargo run --release -p common --example judge_show -- <judge_lm.bin>
-//! 学習DBは読まない（IME_LEARN で個人学習を模擬できる）。JUDGE_COOC で共起モデルを使い、
+//! 学習DBは読まない（IME_LEARN で個人学習を模擬できる。IME_LEARN_DB=<path> で実際の学習DBの
+//! ユニグラム・バイグラム・連想を読み込む）。JUDGE_COOC で共起モデルを使い、
 //! 行を「前の文の読み|今の読み」にすると前の文を確定済みの文脈として扱う。各候補の 確率 / 総合スコア / LM対数確率 / 語彙外文字数 / 辞書コスト と、
 //! 語ごとの (表記/読み, 語彙内か) を出す。
+//! 行を「!表記/読み 表記/読み ...」にすると、その語列1本だけを同じ式で採点する
+//! （候補に出てこない正解の経路が何点差で負けているかを見るため）。
 use common::judge::JudgeLm;
 use common::{Dictionary, ViterbiConverter};
 use std::io::BufRead;
@@ -22,6 +25,18 @@ fn main() {
             conv.learn_unigram(r, s, 1);
         }
     }
+    if let Ok(db) = std::env::var("IME_LEARN_DB") {
+        let learning = common::LearningRepository::open(&db).expect("学習DBオープン失敗");
+        for (r, s, f) in learning.all_unigrams().unwrap_or_default() {
+            conv.learn_unigram(&r, &s, f);
+        }
+        for (p, s, f) in learning.all_bigrams().unwrap_or_default() {
+            conv.learn_bigram(&p, &s, f);
+        }
+        for (p, c, f) in learning.all_assocs().unwrap_or_default() {
+            conv.learn_assoc(&p, &c, f);
+        }
+    }
     let judge = Arc::new(JudgeLm::load(Path::new(&lm_path)).expect("judge_lm ロード失敗"));
     // JUDGE_COOC=<judge_cooc.bin> で共起モデルも使う
     if let Ok(p) = std::env::var("JUDGE_COOC") {
@@ -37,6 +52,31 @@ fn main() {
         // 「前の文の読み|今の読み」なら、前の文を変換・確定した扱いにして
         // その名詞を共起の文脈にする
         conv.clear_context();
+        if let Some(spec) = line.strip_prefix('!') {
+            conv.set_judge(Some(Arc::clone(&judge)));
+            let path: Option<Vec<common::WordEntry>> = spec
+                .split_whitespace()
+                .map(|w| {
+                    let (surface, reading) = w.split_once('/')?;
+                    conv.dictionary.lookup(reading)?.iter().find(|e| e.surface == surface).cloned()
+                })
+                .collect();
+            match path {
+                Some(path) => {
+                    let (dict, learned) = conv.path_costs(&path);
+                    println!(
+                        "== {} score={:.2} lm={:.2} dict={} learned={}",
+                        spec,
+                        conv.judge_path_score(&path).unwrap_or(f32::NAN),
+                        judge.sequence_logp(None, &path),
+                        dict,
+                        learned
+                    );
+                }
+                None => println!("== {} : 辞書に無い語があります", spec),
+            }
+            continue;
+        }
         let reading = match line.split_once('|') {
             Some((prev, cur)) => {
                 conv.set_judge(Some(Arc::clone(&judge)));

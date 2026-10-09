@@ -485,20 +485,31 @@ pub(crate) fn single_char_bound_mora_then_particle_conn_floor(
 /// 本来の導入意図（コメント参照）は「いってらっしゃい/いってきます/
 /// いってしまった/行った」のように**直後が「て」「た」の音便接続の場合
 /// だけ**確実に勝たせたい、というもの。ここでは意図をそのままedge単位の
-/// 条件（`prev`が「いっ/行っ」かつ`cur`の表記が「て」「た」）として実装し、
+/// 条件（`prev`が「いっ/行っ」かつ`cur`が「て」「た」系の付属語）として実装し、
 /// 該当しない後続語（「性」等）には一切効かないようにする。
+///
+/// 減額幅は「逝っ」等の同音動詞との語コスト差（約900）に余裕を持たせた3000。
+/// 当初の15000は必要量の十数倍で、edge単位にしても「行っ＋た/て＋残り」が
+/// 「いった/いって」で始まる1語（一旦→行ったん、一定→行ってい、一転・一滴・
+/// 一徹 等）をまとめて上書きしていた（2026-10-09）。後続は表記の完全一致ではなく
+/// 「て/たで始まる付属語」（て・た・てる・たら・たり・ては 等）で判定する
+/// （「たら」「たり」「てる」が対象外で煎ったら/逝ったり/煎ってるに負けていた）。
 pub(crate) fn iitte_verb_conn_floor(
     prev: Option<&WordEntry>,
     cur: Option<&WordEntry>,
     conn_cost: i32,
 ) -> i32 {
-    const BONUS: i32 = 15000;
+    const BONUS: i32 = 3000;
     let Some(prev) = prev else { return conn_cost };
     if prev.reading != "いっ" || prev.surface != "行っ" {
         return conn_cost;
     }
     let Some(cur) = cur else { return conn_cost };
-    if cur.surface != "て" && cur.surface != "た" {
+    let te_ta = cur.surface.starts_with('て') || cur.surface.starts_with('た');
+    let functional = cur.pos.starts_with("助詞")
+        || cur.pos.starts_with("助動詞")
+        || cur.pos.starts_with("動詞-非自立");
+    if !te_ta || !functional {
         return conn_cost;
     }
     conn_cost.saturating_sub(BONUS)
