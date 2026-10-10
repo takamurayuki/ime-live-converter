@@ -3,23 +3,33 @@
 //! 要件定義書 13章 MVP・21章「次に着手するタスク」に基づく実装。
 //! 標準入力からひらがな/ローマ字を受け取り、N-best変換結果と
 //! 誤字補正・自動変換判定の結果を表示する。
+//!
+//! 変換本体は`common::LiveConversionState`（hook-dllの実運用エンジンそのもの、
+//! `common`へ移設済み）を直接駆動する。以前は独立の`LiveConverter`を使って
+//! いたが、`n_best`経路のみでfragment-repair post-passや学習連想リランクを
+//! 通らず、CLIでの手動確認が実機の変換結果と食い違う既知のリスクがあった
+//! （[[golden-test-harness]]）。これを解消するため、CLIも実機と同じ
+//! `LiveConversionState::add_char`/`commit`を使う。
 
 use anyhow::{Context, Result};
 use common::{
-    katakana_to_hiragana, should_auto_convert, Candidate, CandidateKind, Dictionary,
-    LearningRepository, LiveConverter, RomajiConverter, TypoCorrector, ViterbiConverter,
+    katakana_to_hiragana, should_auto_convert, ConversionAction, Dictionary, LearningRepository,
+    LiveConversionState, RomajiConverter, TypoCorrector, ViterbiConverter,
 };
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
 struct Cli {
-    converter: LiveConverter,
+    /// 実運用と同じ変換エンジン本体。
+    converter: LiveConversionState,
+    /// ひらがな/カタカナ入力の正規化用（`:nbest`/`:typo`/`:auto`はローマ字化を
+    /// 経由せず直接この変換だけを使うため、`converter.romaji`とは独立に持つ）。
     romaji: RomajiConverter,
     typo: TypoCorrector,
+    /// `:nbest`診断用に独立して持つViterbiConverter（`converter`内部のものとは
+    /// 別インスタンス。以前からある設計をそのまま踏襲）。
     viterbi: Option<ViterbiConverter>,
-    /// 直近の変換候補（:commit N で参照）
-    last_candidates: Vec<Candidate>,
-    /// 直近の入力ひらがな
+    /// 直近の入力ひらがな（表示・:commit 用）
     last_reading: String,
     /// 学習DBのパス（履歴記録のため保持）
     learning_db_path: Option<PathBuf>,
@@ -28,24 +38,19 @@ struct Cli {
 impl Cli {
     fn new() -> Self {
         Self {
-            converter: LiveConverter::new(),
+            converter: LiveConversionState::new(),
             romaji: RomajiConverter::new(),
             typo: TypoCorrector::new(),
             viterbi: None,
-            last_candidates: Vec::new(),
             last_reading: String::new(),
             learning_db_path: None,
         }
     }
 
     fn load_dictionary(&mut self, path: &Path) -> Result<()> {
-        let dict = Dictionary::load(path)
-            .with_context(|| format!("辞書のロードに失敗: {}", path.display()))?;
-        // LiveConverter と独立の ViterbiConverter の両方にロード
+        // `converter`と独立のViterbiConverterの両方にロードする（`:nbest`での
+        // 直接診断用に後者を保持する。以前からある設計をそのまま踏襲）。
         let mut viterbi = ViterbiConverter::new(Dictionary::load(path)?);
-        // 優先語彙ファイル（同音異義語の優先順位）。hook-dll と同じ既定パスを
-        // 読む。CLI が読まないと `:nbest` での検証が本番と食い違い、修正済みの
-        // 誤変換が「直っていない」ように見える（らいしゅう→来襲 で実測）。
         let priority_path = path.with_file_name("word_priority.tsv");
         match viterbi.load_word_priority_file(&priority_path) {
             Ok(count) if count > 0 => println!("優先語彙をロード: {}件", count),
@@ -68,7 +73,13 @@ impl Cli {
             }
         }
         self.viterbi = Some(viterbi);
-        self.converter.set_dictionary(dict);
+
+        // `LiveConversionState::load_dictionary`は実運用（hook-dll）と全く
+        // 同じ経路（word_priority/コーパスLMの読み込みも内部で行う）。
+        if !self.converter.load_dictionary(path) {
+            anyhow::bail!("辞書のロードに失敗: {}", path.display());
+        }
+        self.converter.inject_user_words();
         Ok(())
     }
 
@@ -76,13 +87,16 @@ impl Cli {
         let learning = LearningRepository::open(path)
             .with_context(|| format!("学習DBのオープンに失敗: {}", path.display()))?;
         self.learning_db_path = Some(path.to_path_buf());
-        self.converter.set_learning(learning);
+        self.converter.learning = Some(learning);
+        self.converter.reload_learning_into_converter();
+        self.converter.inject_user_words();
         Ok(())
     }
 
-    /// 入力文字列をひらがなに正規化
+    /// 入力文字列をひらがなに正規化（`:nbest`/`:typo`/`:auto`専用。
+    /// これらは`converter`を経由せず直接ViterbiConverter/TypoCorrectorを叩く
+    /// 診断コマンドのため、ローマ字・カタカナのどちらで入力しても良い）。
     fn normalize_input(&self, input: &str) -> String {
-        // ASCII のみならローマ字としてひらがな化、それ以外はカタカナ→ひらがな変換
         if input.chars().all(|c| c.is_ascii()) {
             self.romaji.convert(input)
         } else {
@@ -90,106 +104,124 @@ impl Cli {
         }
     }
 
+    /// 入力（ローマ字）を1文字ずつ`converter`に流し込む。実際のキー入力と
+    /// 同じ意味論（`crates/hook-dll/src/hook.rs`の文字キー処理、
+    /// `crates/hook-dll/src/golden_tests.rs`と同一のパターン）。
     fn convert(&mut self, input: &str) -> Result<()> {
-        let hiragana = self.normalize_input(input);
-        if hiragana.is_empty() {
-            return Ok(());
+        // 前の行の未確定状態を持ち越さない。
+        if self.converter.is_composing() {
+            self.converter.cancel();
         }
+        for ch in input.chars() {
+            self.converter.add_char(ch);
+        }
+        self.last_reading = self.converter.hiragana_buffer.clone();
 
-        self.last_reading = hiragana.clone();
-        self.last_candidates = self.converter.generate_candidates(&hiragana);
+        // `candidates`はTab相当（`cycle_candidate`）を呼ぶまで空のまま
+        // （バッファ変更のたびにクリアされる設計）。ここで明示的に開く。
+        // 候補が1件しかない場合は何もせず空のままなので、その場合は
+        // `conversion_result`（現在の単独変換結果）を使う。
+        self.converter.cycle_candidate(false);
 
-        // 最も目立つ表示: 入力 → 変換結果
-        let best = self
-            .last_candidates
-            .first()
-            .map(|c| c.text.as_str())
-            .unwrap_or(hiragana.as_str());
+        let best = if !self.converter.candidates.is_empty() {
+            self.converter.candidates[self.converter.candidate_index].clone()
+        } else {
+            self.converter.conversion_result.clone()
+        };
 
-        if hiragana == input {
+        if self.last_reading == input {
             println!("  {}  →  {}", input, best);
         } else {
-            println!("  {}  →  {}  →  {}", input, hiragana, best);
+            println!("  {}  →  {}  →  {}", input, self.last_reading, best);
         }
 
-        if self.viterbi.is_none() {
+        if self.converter.converter.is_none() {
             println!("  (辞書未ロード: 漢字変換は無効、カタカナ/ひらがなのみ)");
         }
 
-        if self.last_candidates.is_empty() {
-            println!("  (候補なし)");
-            return Ok(());
+        if self.converter.candidates.is_empty() {
+            println!("  (他の候補なし)");
+        } else {
+            println!("  候補:");
+            for (i, c) in self.converter.candidates.iter().enumerate().take(10) {
+                println!("    {}. {}", i + 1, c);
+            }
         }
 
-        println!("  候補:");
-        for (i, c) in self.last_candidates.iter().enumerate().take(10) {
-            println!(
-                "    {}. {}  [{} score={:.1}]",
-                i + 1,
-                c.text,
-                kind_label(&c.kind),
-                c.score
-            );
-        }
-
-        if should_auto_convert(&hiragana, 0) {
+        if should_auto_convert(&self.last_reading, 0) {
             println!("  (自動仮変換タイミング: 即時)");
         }
         Ok(())
     }
 
+    /// 直近の`convert`が出した候補のN番目を選択して実際に確定する
+    /// （`select_candidate`+`commit`。学習にも記録される、実運用と同じ経路）。
+    /// 候補一覧が無い（1件しかない）場合は N=1 のときだけ現在の結果を確定する。
     fn commit(&mut self, n: usize) -> Result<()> {
-        if n == 0 || n > self.last_candidates.len() {
+        if self.converter.candidates.is_empty() {
+            if n != 1 || self.converter.conversion_result.is_empty() {
+                println!("候補番号が範囲外: {}", n);
+                return Ok(());
+            }
+            let candidate = self.converter.conversion_result.clone();
+            self.converter.commit();
+            println!("確定: {} ({} → {})", candidate, self.last_reading, candidate);
+            return Ok(());
+        }
+        if n == 0 || n > self.converter.candidates.len() {
             println!("候補番号が範囲外: {}", n);
             return Ok(());
         }
-        let candidate = &self.last_candidates[n - 1];
-        self.converter
-            .record_commit(&self.last_reading, &candidate.text);
-        println!(
-            "確定: {} ({} → {})",
-            candidate.text, self.last_reading, candidate.text
-        );
+        let candidate = self.converter.candidates[n - 1].clone();
+        self.converter.select_candidate(n - 1);
+        self.converter.commit();
+        println!("確定: {} ({} → {})", candidate, self.last_reading, candidate);
         Ok(())
     }
 
     fn user_add(&mut self, reading: &str, surface: &str) -> Result<()> {
-        match self.converter.add_user_word(reading, surface, None) {
-            Ok(()) => println!("ユーザー辞書に登録: {} → {}", reading, surface),
-            Err(e) => println!("登録失敗: {} (:learning <path> で学習DBをロードしてください)", e),
-        }
+        let Some(learning) = self.converter.learning.as_ref() else {
+            println!("登録失敗: 学習DBが未設定です (:learning <path> で学習DBをロードしてください)");
+            return Ok(());
+        };
+        learning.add_user_word(reading, surface, None, 50)?;
+        self.converter.inject_user_words();
+        println!("ユーザー辞書に登録: {} → {}", reading, surface);
         Ok(())
     }
 
+    /// ここから先の学習DB操作は、パスから毎回`LearningRepository::open`で
+    /// 開き直すのではなく、`converter.learning`（既に開いている接続）を直接
+    /// 使う。以前はファイルパス経由での再オープンだった（WALモードなら
+    /// 同じファイルへの書き込みは他接続からも見えるため動いてはいた）が、
+    /// それだと既定が一時DB（インメモリ、パスを持たない）のときに動かない。
     fn user_list(&self) -> Result<()> {
-        if let Some(path) = &self.learning_db_path {
-            let learning = LearningRepository::open(path)?;
-            let entries = learning.get_all_user_words()?;
-            if entries.is_empty() {
-                println!("(ユーザー辞書は空です)");
-            } else {
-                println!("ユーザー辞書 ({}件):", entries.len());
-                for e in entries {
-                    println!("  {} → {}", e.reading, e.surface);
-                }
-            }
-        } else {
+        let Some(learning) = self.converter.learning.as_ref() else {
             println!("学習DBが未ロード。:learning <path> でロードしてください。");
+            return Ok(());
+        };
+        let entries = learning.get_all_user_words()?;
+        if entries.is_empty() {
+            println!("(ユーザー辞書は空です)");
+        } else {
+            println!("ユーザー辞書 ({}件):", entries.len());
+            for e in entries {
+                println!("  {} → {}", e.reading, e.surface);
+            }
         }
         Ok(())
     }
 
     fn user_del(&self, reading: &str, surface: &str) -> Result<()> {
-        if let Some(path) = &self.learning_db_path {
-            let learning = LearningRepository::open(path)?;
-            let removed = learning.remove_user_word(reading, surface)?;
-            if removed {
-                println!("削除: {} → {}", reading, surface);
-            } else {
-                println!("該当なし: {} → {}", reading, surface);
-            }
-        } else {
+        let Some(learning) = self.converter.learning.as_ref() else {
             println!("学習DBが未ロード");
+            return Ok(());
+        };
+        let removed = learning.remove_user_word(reading, surface)?;
+        if removed {
+            println!("削除: {} → {}", reading, surface);
+        } else {
+            println!("該当なし: {} → {}", reading, surface);
         }
         Ok(())
     }
@@ -216,15 +248,11 @@ impl Cli {
     }
 
     fn show_phrase(&self, reading: &str) {
-        let Some(p) = &self.learning_db_path else {
+        let Some(learning) = self.converter.learning.as_ref() else {
             println!("学習DB未ロード。:learning <path> でロードしてください。");
             return;
         };
-        let Ok(repo) = LearningRepository::open(p) else {
-            println!("学習DBを開けませんでした。");
-            return;
-        };
-        match repo.predict_phrase_tail(reading) {
+        match learning.predict_phrase_tail(reading) {
             Ok(Some((surface, tail))) => println!("{} → {}{}", reading, surface, tail),
             Ok(None) => println!("(定型句の続き予測なし)"),
             Err(e) => println!("エラー: {}", e),
@@ -249,6 +277,18 @@ impl Cli {
     }
 }
 
+/// `ConversionAction{delete_count, insert_text}`を、実運用の
+/// `hook.rs::execute_action`と同じ意味論（末尾`delete_count`文字を消してから
+/// `insert_text`を追記）で文書に反映する。
+fn apply_conversion_action(doc: &mut String, action: Option<ConversionAction>) {
+    let Some(action) = action else { return };
+    if action.delete_count > 0 {
+        let keep = doc.chars().count().saturating_sub(action.delete_count);
+        *doc = doc.chars().take(keep).collect();
+    }
+    doc.push_str(&action.insert_text);
+}
+
 /// ライブ変換モード
 ///
 /// キー単位で入力を受け付け、macOSのライブ変換のように
@@ -271,7 +311,9 @@ fn live_mode(cli: &mut Cli) -> Result<()> {
     println!("Space:次候補  Shift+Space:前候補  Enter:確定  Esc:かなに戻す  Ctrl+C:終了");
     println!();
 
-    cli.converter.clear();
+    if cli.converter.is_composing() {
+        cli.converter.cancel();
+    }
     terminal::enable_raw_mode()?;
     let result = live_loop(cli);
     terminal::disable_raw_mode()?;
@@ -285,7 +327,7 @@ fn live_loop(cli: &mut Cli) -> Result<()> {
     use crossterm::execute;
     use crossterm::terminal::{Clear, ClearType};
     use std::io::Write;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     let mut stdout = io::stdout();
     // この行に確定済みテキストを積んでいく
@@ -294,19 +336,41 @@ fn live_loop(cli: &mut Cli) -> Result<()> {
     let mut showing_conversion = false;
     // 前回描画した行（点滅防止のため、変化したときだけ再描画する）
     let mut last_render = String::new();
+    // 直近の入力停止判定用（`LiveConversionState`自体はキー入力の実時刻を
+    // 追わないため、実際のキー入力タイミングを追うのはCLI側の責務）。
+    let mut last_input_at: Option<Instant> = None;
+
+    // 現在のひらがな（確定済み+未確定ローマ字の仮変換）を組み立てる。
+    // `hook.rs`はキー入力ごとにこれを毎回描画し直す代わりに実テキストへ
+    // 差分送信するが、CLIは端末に直接文字列として描画するのでこの形で良い。
+    let current_hiragana = |cli: &Cli| -> String {
+        format!(
+            "{}{}",
+            cli.converter.hiragana_buffer,
+            cli.converter.romaji.convert(&cli.converter.romaji_buffer)
+        )
+    };
 
     loop {
-        // 表示を更新
+        // 表示を更新。`candidates`はTab/2回目以降のSpace（`cycle_candidate`）を
+        // 呼ぶまで空のまま（バッファ変更のたびにクリアされる設計）なので、
+        // 最初のSpaceを押した直後は`conversion_result`（現在の単独変換結果）
+        // にフォールバックする。
         let composing_text = if showing_conversion {
-            cli.converter.get_display_text().to_string()
-        } else {
-            cli.converter.get_hiragana_buffer()
-        };
-        let position = if showing_conversion {
             cli.converter
-                .candidate_position()
-                .map(|(i, n)| format!(" [{}/{}]", i + 1, n))
-                .unwrap_or_default()
+                .candidates
+                .get(cli.converter.candidate_index)
+                .cloned()
+                .unwrap_or_else(|| cli.converter.conversion_result.clone())
+        } else {
+            current_hiragana(cli)
+        };
+        let position = if showing_conversion && !cli.converter.candidates.is_empty() {
+            format!(
+                " [{}/{}]",
+                cli.converter.candidate_index + 1,
+                cli.converter.candidates.len()
+            )
         } else {
             String::new()
         };
@@ -322,11 +386,13 @@ fn live_loop(cli: &mut Cli) -> Result<()> {
         // キー入力待ち（30ms でタイムアウトして自動変換判定）
         if !poll(Duration::from_millis(30))? {
             // 入力停止・文節境界の判定（要件 7.4）
-            if !showing_conversion
-                && cli.converter.is_composing()
-                && cli.converter.should_auto_convert()
-            {
-                showing_conversion = true;
+            if !showing_conversion && cli.converter.is_composing() {
+                let elapsed = last_input_at
+                    .map(|t| t.elapsed().as_millis() as u64)
+                    .unwrap_or(u64::MAX);
+                if should_auto_convert(&current_hiragana(cli), elapsed) {
+                    showing_conversion = true;
+                }
             }
             continue;
         }
@@ -347,28 +413,29 @@ fn live_loop(cli: &mut Cli) -> Result<()> {
                     if !showing_conversion {
                         showing_conversion = true;
                     } else if key.modifiers.contains(KeyModifiers::SHIFT) {
-                        cli.converter.prev_candidate();
+                        cli.converter.cycle_candidate(true);
                     } else {
-                        cli.converter.next_candidate();
+                        cli.converter.cycle_candidate(false);
                     }
                 } else {
                     committed.push(' ');
                 }
             }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                cli.converter.input_romaji(c);
+                cli.converter.add_char(c);
+                last_input_at = Some(Instant::now());
                 // 句読点などは即時に仮変換、それ以外は入力停止を待つ
-                showing_conversion = cli.converter.should_auto_convert();
+                showing_conversion = should_auto_convert(&current_hiragana(cli), 0);
             }
             KeyCode::Enter => {
                 if cli.converter.is_composing() {
                     // 仮変換中はその表示を、ひらがな表示中はひらがなを確定
-                    let text = if showing_conversion {
+                    let action = if showing_conversion {
                         cli.converter.commit()
                     } else {
                         cli.converter.cancel()
                     };
-                    committed.push_str(&text);
+                    apply_conversion_action(&mut committed, action);
                     showing_conversion = false;
                 } else if !committed.is_empty() {
                     // 行を確定して次の行へ
@@ -384,14 +451,14 @@ fn live_loop(cli: &mut Cli) -> Result<()> {
                     showing_conversion = false;
                 } else if cli.converter.is_composing() {
                     // ひらがな表示中の Esc は入力自体を破棄
-                    cli.converter.clear();
+                    cli.converter.cancel();
                 } else {
                     break;
                 }
             }
             KeyCode::Backspace => {
                 if key.modifiers.contains(KeyModifiers::CONTROL) {
-                    cli.converter.clear();
+                    cli.converter.cancel();
                 } else if cli.converter.is_composing() {
                     cli.converter.backspace();
                     showing_conversion = false;
@@ -406,22 +473,10 @@ fn live_loop(cli: &mut Cli) -> Result<()> {
     Ok(())
 }
 
-fn kind_label(kind: &CandidateKind) -> &'static str {
-    match kind {
-        CandidateKind::KanjiConversion => "漢字",
-        CandidateKind::KatakanaConversion => "カナ",
-        CandidateKind::Prediction => "予測",
-        CandidateKind::TypoCorrection => "補正",
-        CandidateKind::UserDictionary => "ユ辞",
-        CandidateKind::RawKana => "かな",
-    }
-}
-
 fn print_help() {
     println!();
     println!("=== IME 変換エンジン CLI ===");
-    println!("入力をそのまま打つと変換候補を表示します。");
-    println!("ASCIIはローマ字、それ以外はひらがな/カタカナとして扱います。");
+    println!("入力をそのまま打つとローマ字として変換候補を表示します（実機と同じエンジン）。");
     println!();
     println!("コマンド:");
     println!("  :live                       ライブ変換モード（自動仮変換を体験）");
@@ -429,14 +484,14 @@ fn print_help() {
     println!("  :quit / :exit               終了");
     println!("  :dict <path>                辞書(.dic)をロード");
     println!("  :learning <path>            学習DB(SQLite)をオープン");
-    println!("  :commit <N>                 直近のN番目の候補を確定して履歴に記録");
+    println!("  :commit <N>                 直近のN番目の候補を確定して学習に記録");
     println!("  :user add <読み> <表記>     ユーザー辞書に登録");
     println!("  :user list                  ユーザー辞書を一覧");
     println!("  :user del <読み> <表記>     ユーザー辞書から削除");
     println!("  :history clear              履歴をクリア");
-    println!("  :typo <入力>                誤字補正候補のみ表示");
-    println!("  :auto <入力>                自動変換タイミング判定");
-    println!("  :nbest <入力> [N]           Viterbi N-best 結果のみ表示");
+    println!("  :typo <入力>                誤字補正候補のみ表示（ひらがな/カタカナ可）");
+    println!("  :auto <入力>                自動変換タイミング判定（ひらがな/カタカナ可）");
+    println!("  :nbest <入力> [N]           Viterbi N-best 結果のみ表示（ひらがな/カタカナ可）");
     println!();
 }
 
@@ -521,13 +576,23 @@ fn run() -> Result<()> {
         i += 1;
     }
 
-    // 学習DBが未指定なら既定パスを自動オープン
-    // （ユーザー辞書・変換履歴を :user add / :commit で使えるようにする）
+    // 学習DBが未指定なら、既定で一時DB（インメモリ）を使う。本番の
+    // ime-learning.db（conversion-serviceが実際に使うファイル）へは
+    // 決して自動で触らない。危険な方（本番ファイル）をデフォルトにすると、
+    // 動作確認のつもりの:commit/:user addが本番の学習データを書き換えて
+    // しまう（実際にこの事故が起きた）。本番DBを使いたい場合は
+    // `--learning ime-learning.db`（または`:learning ime-learning.db`）で
+    // 明示すること。
     if cli.learning_db_path.is_none() {
-        let default_db = PathBuf::from("ime-learning.db");
-        match cli.load_learning(&default_db) {
-            Ok(()) => println!("既定の学習DBをオープン: {}", default_db.display()),
-            Err(e) => eprintln!("学習DBの自動オープンに失敗: {}", e),
+        match LearningRepository::in_memory() {
+            Ok(learning) => {
+                cli.converter.learning = Some(learning);
+                println!(
+                    "学習DB: 一時DB（インメモリ）を使用中。本番ime-learning.dbには触れません。\
+                     本番DBを使うには --learning ime-learning.db (または :learning ime-learning.db) を指定してください。"
+                );
+            }
+            Err(e) => eprintln!("一時学習DBの作成に失敗: {}", e),
         }
     }
 
@@ -625,9 +690,8 @@ fn handle_command(cli: &mut Cli, cmd: &str) -> Result<bool> {
         }
         "history" => {
             if parts.get(1).copied() == Some("clear") {
-                if let Some(p) = &cli.learning_db_path {
-                    let l = LearningRepository::open(p)?;
-                    l.clear_history()?;
+                if let Some(learning) = cli.converter.learning.as_ref() {
+                    learning.clear_history()?;
                     println!("履歴をクリアしました");
                 } else {
                     println!("学習DBが未ロード");

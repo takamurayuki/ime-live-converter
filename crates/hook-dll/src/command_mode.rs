@@ -12,6 +12,12 @@ pub(crate) static mut COMMAND_SEL: usize = 0;
 // ============ コマンドモード ============
 
 /// 母音(a,i,u,e,o)の長さ k の全組合せ（5^k 通り）を返す。ローマ字補正の母音補完/置換用。
+///
+/// `common::conversion`（`LiveConversionState`をcommonへ移設した際）に同一の
+/// 実装を複製している（[[golden-test-harness]]）。こちらは本体からは
+/// 呼ばれなくなった（元は`conversion.rs`から呼ばれていたが移設先で完結する
+/// ようにしたため）が、この関数自身のテストのために残している。
+#[allow(dead_code)]
 pub(crate) fn vowel_combos(k: usize) -> Vec<Vec<char>> {
     const V: [char; 5] = ['a', 'i', 'u', 'e', 'o'];
     let mut result: Vec<Vec<char>> = vec![Vec::new()];

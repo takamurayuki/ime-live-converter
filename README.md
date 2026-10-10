@@ -1,5 +1,33 @@
 # IME Live Converter
 
+## 入力中の文章修正
+
+日本語入力中に、挨拶・依頼文などの限定した誤記を「もしかして」候補として
+提示します。例: `おねがいしまうす` → `おねがいします`、文頭の
+`わたしわ` → `わたしは`。同じ入力内の複数の該当箇所はまとめて修正します。
+修正した読みは通常の辞書で漢字変換されます。
+
+未入力時・確定直後には予測を表示しません。入力中の候補は全文ではなく、
+変更箇所（`会社 → 学校`）を表示します。元の表記に文字を足すだけの
+`＋生活`のような補完や、定型句の続きを追記する予測は提示しません。長い箇所は
+省略表示しますが、採用時には省略されていない候補を反映します。
+ローマ字補正では、異なる表記の候補が僅差の場合は提案を見送ります。
+
+通常の入力中はライブ変換と「もしかして」だけを自動表示します。
+追加だけの候補を除いた履歴補完は、候補一覧が閉じている状態で **Tab** を押すと表示します。
+↑/↓で選択し、Enterまたは番号キーで採用できます。候補がない場合や、
+候補表示中にもう一度Tabを押した場合は通常の同音候補に切り替わります。
+Shift+Tabでも通常の同音候補を呼び出せます。入力を再開すると補完表示は終了します。
+
+- 「もしかして」表示中は Enter だけで先頭の修正候補を採用します。
+- ↑/↓ で候補を移動した場合は Enter でその候補を採用します。番号キーでも選べます。
+- 採用した修正は学習します。学習済みの修正は候補の Delete で取り消せます。
+- 未確定のローマ字がある間や Esc でかなに戻した部分には、新しい規則補正を提示しません。
+
+対象は入力中の未確定テキスト（規則補正は128文字まで）です。確定済み文書の
+書き換え、事実誤認の訂正、意味全体を判断する校正には対応していません。
+外部サービスへの文章送信はありません。
+
 Windows向けのmacOSライブ変換風IME（日本語入力システム）です。タブやスペースキーを押さずに、入力した文字がリアルタイムで漢字変換されます。
 
 ## 機能
@@ -86,6 +114,52 @@ cargo run --release -p dict-builder --bin dict-builder -- \
 
 `dictionaries/system.dic` があれば CLI 起動時に自動でロードされます
 （なければ `dictionaries/sample.dic` にフォールバック）。
+
+### 3. 判断層（judge-lm、任意）
+
+文脈を見て自動変換の結果を選び直す統計言語モデルです。日本語 Wikipedia で
+学習した単語トライグラム＋文法クラスモデル（IPADic の品詞・活用形）で、
+ラティス全体から「LM の確率＋辞書コスト＋個人学習」が最大の経路を選びます。
+計算は決定論的でローカル完結です（外部通信なし）。
+
+`dictionaries/judge_lm.bin` があれば起動時に自動で読み込まれ（フック常駐時は
+バックグラウンドで読み込み、終わるまでは従来の変換で動きます）、無ければ
+従来の変換とまったく同じ動作です。
+
+```bash
+# 1. 素材: Wikipedia ダンプ（約4.7GB）と vibrato 用 IPADic モデル
+curl -L -o jawiki.xml.bz2 https://dumps.wikimedia.org/jawiki/latest/jawiki-latest-pages-articles.xml.bz2
+curl -L https://github.com/daac-tools/vibrato/releases/download/v0.5.0/ipadic-mecab-2_7_0.tar.xz | tar xJ
+
+# 2. 本文の文を抽出（展開律速、全量で約45分）
+cargo run --release -p dict-builder -- wiki-extract jawiki.xml.bz2 jawiki.txt
+
+# 3. 学習（IPA辞書ディレクトリは「辞書の準備」で展開したもの）
+cargo run --release -p dict-builder -- judge-train \
+  ipadic-mecab-2_7_0/system.dic.zst ./mecab-ipadic-2.7.0-20070801 \
+  jawiki.txt ./dictionaries/judge_lm.bin judge_dev.tsv
+
+# 4. 評価とパラメータの書き込み（従来エンジンとの正解率比較）
+JUDGE_SCALE=2000 JUDGE_UNK=-2 cargo run --release -p common --example judge_eval -- \
+  ./dictionaries/judge_lm.bin judge_dev.tsv 3000 --write
+```
+
+dict-builder は既定で CPU の約半分（作業スレッド＝論理コア数の半分）を使い、
+プロセス優先度を「通常以下」に下げて動きます（他のアプリの操作を妨げないため）。
+急ぐときは `DICT_BUILDER_THREADS=<数>`（作業スレッド数）や
+`DICT_BUILDER_PRIORITY=normal`（優先度を下げない）で変えられます。
+
+共起モデル（任意、`dictionaries/judge_cooc.bin`）は文中・直前の確定文の名詞どうしの
+結びつきで同音異義語を選び分けます:
+
+```bash
+cargo run --release -p dict-builder -- judge-cooc   ipadic-mecab-2_7_0/system.dic.zst ./mecab-ipadic-2.7.0-20070801 ./dictionaries/system.dic   jawiki.txt ./dictionaries/judge_cooc.bin judge_cooc_dev.tsv
+```
+
+**無効化（元に戻す）**: 環境変数 `IME_JUDGE=0` で起動するか、
+`dictionaries/judge_lm.bin` を削除/リネームしてください。共起だけ止めるなら
+`IME_JUDGE_COOC=0` か `dictionaries/judge_cooc.bin` の削除/リネームです。調査用に
+`examples/judge_show`（候補ごとの内訳）・`judge_bench`（打鍵ごとの時間）があります。
 
 ## 使い方
 
@@ -228,6 +302,9 @@ python scripts\clean-learning-db.py --dry-run  # 何が消えるか確認だけ
 | `:help` / `:quit` | ヘルプ / 終了 |
 
 ## 開発
+
+配布・バージョン管理の方針（版の上げ方、ファイルの置き場所、リリース手順）と
+その判断理由は [docs/release-and-versioning.md](docs/release-and-versioning.md) を参照。
 
 ### プロジェクト構造
 

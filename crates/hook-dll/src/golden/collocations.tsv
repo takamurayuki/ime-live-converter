@@ -1,0 +1,179 @@
+# ゴールデンテスト: 隣接コロケーションシード（word_assoc.tsv、
+# [[seeded-adjacent-collocation]]）専用のコーパス。
+#
+# 元は golden/general.tsv に追記していたが、量産（200→2000グループ）で
+# ケース数が増え続けることが分かっているため、専用ファイルに分離した
+# （general.tsv は日常文の安定したコーパスとして小さく保つ）。
+#
+# 実行時間対策: `cargo test`（既定）では`golden_collocations_sample_must_pass`
+# が全体の一部（3件に1件）だけを実際に変換して確認する（速い）。全件を
+# 確認する`golden_collocations_full_must_pass`は`#[ignore]`しており、
+# `cargo test -- --ignored`で明示的に実行する（量産バッチ追加時・マージ前
+# に1回通すことを想定）。サンプルも100%一致が前提（regressions.tsvと同じ
+# must-all-pass方式。一般文のような「そのまま記録」スナップショットでは
+# ないため、accuracy floor方式ではなくこちらを採用）。
+#
+# 1行 = 1ケース、タブ区切りで「ローマ字入力<TAB>期待される確定後の表記」。
+# `#`始まりの行はコメント、空行は無視。
+
+# --- 量産バッチ1: 隣接コロケーションシード（word_assoc.tsv） ---
+# 2026-09-13。24グループ生成→実際に変換して確認→11グループ採用、という
+# 検証パイプラインで確定した組（[[seeded-adjacent-collocation]]）。
+# 各グループについて、シードが効く方向と、シードのトリガー語が無い/別の
+# 意味を要求する方向の両方を記録する（片方向だけ強めた結果もう片方が
+# 壊れる事故を自動検出するため）。
+atsuioyu	熱いお湯
+atsuihon	篤い本
+mohankaitou	模範解答
+anke-tonokaitou	アンケートの回答
+sayuutaishou	左右対称
+kenkyuutaishou	研究対照
+obonkisei	お盆帰省
+kiseikanwa	規制緩和
+kiseichuu	寄生虫
+eiwajiten	英和辞典
+hyakkajiten	百科辞典
+kinkyuutaihi	緊急退避
+ryoushanotaihi	両社の対比
+chi-mukousei	チーム構成
+seitoubouei	正当防衛
+yotouseitou	与党政党
+seikatsushuukan	生活習慣
+
+# --- 量産バッチ2: パイプライン検証(2026-09-13、34件中20件が合格) ---
+# 失敗14件は個別に検証済み（採用しない。[[seeded-adjacent-collocation]]）。
+hakasekatei	博士課程
+seichoukatei	成長過程
+seizoukatei	製造過程
+kiteirosen	既定路線
+kakekkokyousou	かけっこ競走
+shakkinseisan	借金清算
+junbitaisei	準備態勢
+keikaitaisei	警戒態勢
+songaihoshou	損害補償
+shuushironbun	修士論文
+jikichiryou	磁気治療
+jikishachou	次期社長
+seikikoyou	正規雇用
+shinseiki	新世紀
+seihinkaishuu	製品回収
+kaishuukouji	改修工事
+dourokaishuu	道路改修
+sonzaiigi	存在意義
+igimoushitate	異議申立
+jinjiidou	人事異動
+
+# --- 量産バッチ2: 逆方向確認（2026-09-13、本番word_assoc.tsvに入っている
+# 12個の読みグループそれぞれについて、トリガー語が無い/別解が正しい文脈で
+# 別の表記が正しく出ることを確認する。ユーザー指摘: 「本番データである以上
+# パイプライン検証だからと省略してはいけない」） ---
+kateiryouri	家庭料理
+kiteidoori	規定通り
+kyousoushakai	競争社会
+jidoushaseisan	自動車生産
+seijitaisei	政治体制
+shakaihoshou	社会保障
+shuushi	終止
+sonojiki	その時期
+seiki	正規
+kaishuu	改修
+igi	異議
+idoujikan	移動時間
+
+# --- 量産バッチ3: A/C修正後の再挑戦(2026-09-13、7件中6件が合格=85.7%) ---
+# 失敗1件はB（グローバル分割の巻き込み）のみ。詳細は
+# [[seeded-adjacent-collocation]]。
+taishoujikken	対照実験
+shuushihoukoku	収支報告
+mojikousei	文字校正
+kousakukikai	工作機械
+kikaitaisou	器械体操
+dokushokansou	読書感想
+# きかい/かんそうは新規の読みグループなので逆方向確認も追加する。
+kikai	機会
+kansou	還送
+
+# --- 量産バッチ4: 200グループへの第一段階(2026-09-13、18件中15件が合格
+# =83.3%) ---
+kenntouchigai	見当違い
+fukaikaitei	深い海底
+seiriyouhinn	生理用品
+taishitsukaizenn	体質改善
+teikiyokinn	定期預金
+hakkoushokuhinn	発酵食品
+houshinntennkann	方針転換
+yuushiichidou	有志一同
+taishokunegai	退職願
+toushishinntaku	投資信託
+kouritsugakkou	公立学校
+shizennsaikou	自然採光
+shijoumeirei	至上命令
+yakyuuhoshu	野球捕手
+shinnnennhoufu	新年抱負
+# 逆方向（15個全て新規の読みグループのため必須）
+kenntou	検討
+kaitei	改訂
+seiri	整理
+taishitsu	対質
+teiki	提起
+hakkou	発行
+houshinn	放神
+yuushi	雄視
+taishoku	退職
+toushi	投資
+kouritsu	効率
+saikou	最高
+shijou	市場
+hoshu	保守
+houfu	抱負
+
+# --- 量産バッチ5: 24グループ（26/30合格→逆方向確認で2件除外、詳細は
+# dictionaries/word_assoc.tsvのコメント参照） ---
+ijoukoudou	異常行動
+ijou	以上
+shinnritesuto	心理テスト
+shinnri	審理
+sennkoubunnya	専攻分野
+sennkou	先行
+kousoubiru	高層ビル
+kousou	構想
+yobouchuusha	予防注射
+chuusha	駐車
+keikikaifuku	景気回復
+keiki	継起
+toukiorinnpikku	冬季オリンピック
+touki	登記
+kakakuhikaku	価格比較
+hikaku	非核
+migarakousoku	身柄拘束
+kousoku	高速
+minnjisaibann	民事裁判
+saibann	歳晩
+konnponngenninn	根本原因
+genninn	減員
+gennchishisatsu	現地視察
+shisatsu	刺殺
+kougaimonndai	公害問題
+kougai	口外
+kouekihoujinn	公益法人
+koueki	交易
+taifuuhigai	台風被害
+higai	ヒガイ
+rosennshuusei	路線修正
+shuusei	終生
+kishoukeihou	気象警報
+kishou	起床
+shinnchokujoukyou	進捗状況
+joukyou	上京
+shikichimennseki	敷地面積
+mennsekijikou	免責事項
+koutaikennsa	抗体検査
+koutai	交代
+shakaikoukenn	社会貢献
+koukenn	高検
+kinnyuushisann	金融資産
+shisann	四散
+mokugekishouninn	目撃証人
+shouninn	承認
+tairyokugennkai	体力限界
+gennkai	厳戒

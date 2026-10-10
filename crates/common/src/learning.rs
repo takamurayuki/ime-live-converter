@@ -588,6 +588,11 @@ impl LearningRepository {
     /// 語を候補にする。prefix と完全一致する語（＝補完にならない）と、
     /// ひらがなそのままの語は除く。
     pub fn predict_by_prefix(&self, prefix: &str, limit: usize) -> Result<Vec<(String, String, u32)>> {
+        self.predict_by_prefix_in_context(prefix, "", limit)
+    }
+
+    /// 読みの一致を必須にし、直前の表記との連接履歴を頻度より優先する。
+    pub fn predict_by_prefix_in_context(&self, prefix: &str, previous: &str, limit: usize) -> Result<Vec<(String, String, u32)>> {
         if prefix.is_empty() {
             return Ok(Vec::new());
         }
@@ -595,14 +600,15 @@ impl LearningRepository {
         let escaped = prefix.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
         let pattern = format!("{}%", escaped);
         let mut stmt = self.conn.prepare(
-            "SELECT reading, surface, MAX(frequency) as f FROM conversion_history
-             WHERE reading LIKE ?1 ESCAPE '\\' AND reading <> ?2 AND surface <> reading
-             GROUP BY surface
-             ORDER BY f DESC, length(reading) ASC
+            "SELECT h.reading, h.surface, MAX(h.frequency) as f FROM conversion_history h
+             LEFT JOIN word_bigram b ON b.prev_surface = ?4 AND b.surface = h.surface
+             WHERE h.reading LIKE ?1 ESCAPE '\\' AND h.reading <> ?2 AND h.surface <> h.reading
+             GROUP BY h.reading, h.surface
+             ORDER BY COALESCE(MAX(b.frequency), 0) DESC, f DESC, length(h.reading) ASC, h.surface ASC
              LIMIT ?3",
         )?;
         let rows = stmt
-            .query_map(params![pattern, prefix, limit as i64], |r| {
+            .query_map(params![pattern, prefix, limit as i64, previous], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, u32>(2)?))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;

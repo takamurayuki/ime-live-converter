@@ -185,7 +185,7 @@ impl IncrementalViterbi {
             let remaining = &full_input[byte_pos..];
 
             // 辞書からプレフィックス検索
-            let matches = self.converter.dictionary.common_prefix_search(remaining);
+            let matches = self.converter.merged_prefix_search(remaining);
 
             if matches.is_empty() {
                 // 未知語として1文字を追加

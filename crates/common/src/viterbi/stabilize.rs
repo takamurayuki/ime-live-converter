@@ -116,6 +116,25 @@ impl ViterbiConverter {
         if pinned.is_empty() {
             return self.convert(reading);
         }
+        let mut lattice = self.build_pinned_lattice(reading, pinned);
+        self.find_best_path(&mut lattice);
+        if lattice.nodes[lattice.eos_index].total_cost == i32::MAX {
+            return self.convert(reading);
+        }
+        let path = self.extract_result(&lattice);
+        let n = pinned.len();
+        if path.len() < n {
+            return path;
+        }
+        let mut out = path[..n].to_vec();
+        out.extend(self.repair_single_kanji_fragments(path[n..].to_vec()));
+        out
+    }
+
+    /// 固定領域を固定文節だけに制限したラティスを作る（Viterbi 前の状態）。
+    /// `pinned` は `matching_pinned_prefix` 済みであること。
+    /// `convert_with_pinned_prefix` と判断層の N-best（`judge_select.rs`）で共有する。
+    pub(crate) fn build_pinned_lattice(&self, reading: &str, pinned: &[WordEntry]) -> Lattice {
         let mut lattice = self.build_lattice(reading);
 
         let mut spans: Vec<(usize, usize)> = Vec::with_capacity(pinned.len());
@@ -135,6 +154,19 @@ impl ViterbiConverter {
                 .any(|&idx| node_matches(&lattice.nodes[idx], s, t, e));
             if !exists {
                 lattice.add_word(s, t, e.clone());
+                // `build_lattice`は学習ユニグラムボーナスをノード生成後に
+                // 一括で埋めるが、ここで追加するノードはそのタイミングより
+                // 後に生えるため素通りしてしまう。`find_best_path`の断片化
+                // 防止ガード群は`learned_bonus`だけを見て学習の関与を判定
+                // するため、ここで埋め忘れるとガードが素通りしてしまう。
+                if !self.learned_unigram.is_empty() {
+                    let idx = lattice.nodes.len() - 1;
+                    lattice.nodes[idx].learned_bonus = self
+                        .learned_unigram
+                        .get(&(e.reading.clone(), e.surface.clone()))
+                        .copied()
+                        .unwrap_or(0);
+                }
             }
         }
 
@@ -156,19 +188,7 @@ impl ViterbiConverter {
         for list in lattice.nodes_ending_at.iter_mut() {
             list.retain(|&idx| allowed(idx));
         }
-
-        self.find_best_path(&mut lattice);
-        if lattice.nodes[lattice.eos_index].total_cost == i32::MAX {
-            return self.convert(reading);
-        }
-        let path = self.extract_result(&lattice);
-        let n = pinned.len();
-        if path.len() < n {
-            return path;
-        }
-        let mut out = path[..n].to_vec();
-        out.extend(self.repair_single_kanji_fragments(path[n..].to_vec()));
-        out
+        lattice
     }
 
     /// `convert_context_aware` の固定文節対応版。連想リランクも固定部分には
@@ -179,7 +199,9 @@ impl ViterbiConverter {
             return self.convert_context_aware(reading);
         }
         let base = self.convert_with_pinned_prefix(reading, pinned);
-        self.rerank_by_assoc_from(base, n)
+        let base = self.rerank_by_seeded_collocation_from(base, n);
+        let base = self.rerank_by_assoc_from(base, n);
+        self.judge_or_keep(reading, pinned, base)
     }
 }
 

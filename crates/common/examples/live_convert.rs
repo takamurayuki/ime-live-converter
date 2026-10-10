@@ -13,7 +13,8 @@
 //!   - IME_STAB_MIN / IME_STAB_KEEP でしきい値を上書き
 //! - IME_PROFILE=1     : ラティス規模と変換時間の内訳を表示する
 //! - IME_NO_ASSOC=1    : 学習した内容語連想（rerank_by_assoc）を読まない
-use common::{Dictionary, LearningRepository, ViterbiConverter, WordEntry};
+//! - IME_NO_CORPUS_LM=1: 同じディレクトリの corpus_lm.dic（あれば）を読まない
+use common::{CorpusLm, Dictionary, LearningRepository, ViterbiConverter, WordEntry};
 use std::io::BufRead;
 use std::path::Path;
 
@@ -22,6 +23,22 @@ fn main() {
     let dict = Dictionary::load(dict_path).expect("辞書ロード失敗");
     let mut conv = ViterbiConverter::new(dict);
     let _ = conv.load_word_priority_file(&dict_path.with_file_name("word_priority.tsv"));
+    let _ = conv.load_word_assoc_file(&dict_path.with_file_name("word_assoc.tsv"));
+    if std::env::var("IME_NO_CORPUS_LM").is_err() {
+        let corpus_lm_path = dict_path.with_file_name("corpus_lm.dic");
+        if corpus_lm_path.exists() {
+            match CorpusLm::load(&corpus_lm_path) {
+                Ok(lm) => {
+                    eprintln!(
+                        "コーパスLMをロード: unigram={} bigram={}",
+                        lm.unigrams.len(), lm.bigrams.len()
+                    );
+                    conv.load_corpus_lm(&lm);
+                }
+                Err(e) => eprintln!("コーパスLMのロードに失敗: {e}"),
+            }
+        }
+    }
     if std::env::var("IME_NO_LEARNING").is_err() {
         let learning = LearningRepository::open("ime-learning.db").expect("学習DBオープン失敗");
         for (r, s, f) in learning.all_unigrams().unwrap_or_default() {
@@ -39,7 +56,7 @@ fn main() {
             conv.learn_hiragana(&r, f);
         }
         for e in learning.get_all_user_words().unwrap_or_default() {
-            conv.dictionary.add_word(WordEntry {
+            conv.overlay.add_word(WordEntry {
                 surface: e.surface.clone(),
                 reading: e.reading.clone(),
                 left_id: 1285,

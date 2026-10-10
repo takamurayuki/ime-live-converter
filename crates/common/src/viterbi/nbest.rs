@@ -95,6 +95,7 @@ pub(crate) fn n_best_from_lattice(lattice: &Lattice, dict: &Dictionary, n: usize
             if let (Some(pe), Some(ce)) = (&prev.entry, head_entry) {
                 conn_cost = conn_cost.saturating_add(katakana_kanji_suffix_penalty(pe, ce));
                 conn_cost = adjective_terminal_then_te_penalty(pe, ce, conn_cost);
+                conn_cost = adjective_terminal_then_ni_penalty(pe, ce, conn_cost);
                 conn_cost =
                     conn_cost.saturating_add(single_kanji_lone_particle_reading_penalty(ce));
             }

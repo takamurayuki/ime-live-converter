@@ -36,13 +36,20 @@ fn main() {
     }
     
     // いくつかのテスト単語
-    let test_words = ["こんにちは", "ありがとう", "わたし", "あ", "い"];
+    let requested: Vec<String> = std::env::args().skip(2).collect();
+    let test_words: Vec<&str> = if requested.is_empty() {
+        vec!["こんにちは", "ありがとう", "わたし", "あ", "い"]
+    } else {
+        requested.iter().map(String::as_str).collect()
+    };
     println!("\nその他の検索:");
     for word in &test_words {
         let result = dict.trie.search(word);
         match result {
             Some(entries) => {
-                println!("  {} → {}", word, entries.iter().map(|e| e.surface.as_str()).collect::<Vec<_>>().join(", "));
+                for e in entries {
+                    println!("  {} → {} cost={} ids={}/{} pos={}", word, e.surface, e.cost, e.left_id, e.right_id, e.pos);
+                }
             }
             None => println!("  {} → 見つかりません", word),
         }

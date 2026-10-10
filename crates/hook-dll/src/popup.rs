@@ -1,8 +1,10 @@
 //! 候補一覧ポップアップ（かな漢字候補・コマンド候補・モード切替フラッシュの表示）
 
 use crate::*;
+use std::sync::mpsc;
 
-/// 候補一覧ウィンドウのハンドル（フックスレッドで生成・操作）
+/// 候補一覧ウィンドウのハンドル（UIスレッドで生成・操作。フックスレッドから
+/// 直接触ってはいけない。`post_ui_command`経由で指示すること）
 pub(crate) static mut CANDIDATE_HWND: Option<HWND> = None;
 
 /// 候補一覧ウィンドウの表示内容（WndProc の描画と共有）
@@ -61,9 +63,161 @@ pub(crate) const WM_APP_TERMINAL_CLOSED: u32 = 0x8000 + 2;
 /// （DB書き込み）を処理する（WM_APP+3）。キーボードフックの中で行うと
 /// 応答上限(300ms)を超えて生キーが漏れるため、フックから戻った後に行う。
 pub(crate) const WM_APP_FLUSH_LEARNING: u32 = 0x8000 + 3;
+/// フックスレッド→UIスレッドへの通知: `UI_COMMAND_RX`に溜まった
+/// `UiCommand`をドレインして適用する（WM_APP+5）。候補ウィンドウの
+/// 直接操作（`SetWindowPos`/`ShowWindow`等）はフックスレッド分離後、
+/// UIスレッド所有のウィンドウへの操作になるため、フックスレッドから
+/// 直接呼ぶとクロススレッドのマーシャリングでブロックする。必ずこの
+/// チャネル経由で依頼し、実際のWin32呼び出しはUIスレッド自身にさせる。
+pub(crate) const WM_APP_UI_COMMAND: u32 = 0x8000 + 5;
+
+/// 候補ウィンドウ関連の指示。フックスレッドから`post_ui_command`で送る。
+/// 実行（Win32呼び出し）は必ずUIスレッド側（`drain_ui_commands`）で行う。
+///
+/// 状態系（Show*/Hide）は「最後の1件だけ」が意味を持つ。動作系
+/// （OpenSettings等）は出現順にすべて実行する必要がある。両者を区別
+/// せず1本のキューとして順に処理すると、UIスレッドが重い間にフック
+/// スレッドが積んだShow→Hide→Show→Hideが全部律儀に実行され、
+/// ポップアップがちらつく。`is_state`で区別し、`drain_ui_commands`が
+/// 状態系は最後の1件だけ・動作系は全件を適用する。
+pub(crate) enum UiCommand {
+    ShowCandidateWindow { items: Vec<String>, selected: usize, caret: (i32, i32, i32) },
+    ShowCommandPopup {
+        items: Vec<String>,
+        descs: Vec<String>,
+        auto_runs: Vec<bool>,
+        selected: usize,
+        caret: (i32, i32, i32),
+    },
+    FlashModeIndicator { label: String, caret: (i32, i32, i32) },
+    Hide,
+    OpenSettings,
+    OpenWordSettings,
+}
+
+impl UiCommand {
+    fn is_state(&self) -> bool {
+        matches!(
+            self,
+            UiCommand::ShowCandidateWindow { .. }
+                | UiCommand::ShowCommandPopup { .. }
+                | UiCommand::FlashModeIndicator { .. }
+                | UiCommand::Hide
+        )
+    }
+}
+
+static UI_COMMAND_TX: OnceLock<mpsc::Sender<UiCommand>> = OnceLock::new();
+static UI_COMMAND_RX: Mutex<Option<mpsc::Receiver<UiCommand>>> = Mutex::new(None);
+
+/// UIスレッド（候補ウィンドウを所有するスレッド）のスレッドID。
+/// `init_ui_thread`で一度だけ記録し、`debug_assert_current_thread_is_ui`が
+/// 「本当にUIスレッドから呼ばれているか」を機械的に検証するための基準値。
+/// レビューと規律だけで「フックスレッドから直接呼ばない」規約を守るのは
+/// 破綻するため、実行時アサーションで構造的に強制する。
+static UI_THREAD_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub(crate) fn debug_assert_current_thread_is_ui(fn_name: &str) {
+    let expected = UI_THREAD_ID.load(std::sync::atomic::Ordering::Acquire);
+    let actual = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
+    debug_assert!(
+        expected == 0 || expected == actual,
+        "{fn_name} はUIスレッド専用だが、別スレッド（tid={actual}, 期待={expected}）から呼ばれた。\
+         候補ウィンドウへの直接操作はpost_ui_command経由にすること。"
+    );
+}
+
+/// UIスレッド起動時（`install_hook`の呼び出し元スレッド＝`conversion-service`の
+/// メインスレッド）に一度だけ呼ぶ。
+/// (1) このスレッドをUIスレッドとして記録する。
+/// (2) 候補ウィンドウを非表示のまま先に作っておく。フックスレッドからの
+///     最初の`post_ui_command`より前にHWNDが存在しないと、`PostMessageW`の
+///     宛先が無くコマンドが誰にも引き取られずに残る（起動直後の1回だけ
+///     候補が出ない、という再現しにくい形で出る）。
+/// (3) コマンドチャネルを準備する。
+pub(crate) fn init_ui_thread() {
+    UI_THREAD_ID.store(
+        unsafe { windows::Win32::System::Threading::GetCurrentThreadId() },
+        std::sync::atomic::Ordering::Release,
+    );
+    unsafe {
+        ensure_candidate_window();
+    }
+    let (tx, rx) = mpsc::channel::<UiCommand>();
+    let _ = UI_COMMAND_TX.set(tx);
+    if let Ok(mut guard) = UI_COMMAND_RX.lock() {
+        *guard = Some(rx);
+    }
+}
+
+/// フックスレッドから呼ぶ。実際のWin32呼び出しは一切せず、コマンドを
+/// チャネルへ積んでUIスレッドを起こすだけ。`mpsc::channel`（unbounded）を
+/// 使っており、`sync_channel`にしてはいけない（バッファが埋まると`send`が
+/// ブロックし、フックスレッドがUIスレッド待ちで止まって分離した意味が
+/// 消える）。宛先の候補ウィンドウは`init_ui_thread`で先に作成済みなので、
+/// 「作成前に送って誰にも引き取られない」事故は起きない。
+pub(crate) fn post_ui_command(cmd: UiCommand) {
+    if let Some(tx) = UI_COMMAND_TX.get() {
+        let _ = tx.send(cmd);
+    }
+    unsafe {
+        if let Some(hwnd) = CANDIDATE_HWND {
+            let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                hwnd,
+                WM_APP_UI_COMMAND,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
+    }
+}
+
+/// UIスレッド側（`WM_APP_UI_COMMAND`ハンドラ）から呼ぶ。キューを最後まで
+/// 引き切ってから、状態系は最後の1件だけ・動作系は出現順に全て適用する。
+fn drain_ui_commands() {
+    let mut latest_state: Option<UiCommand> = None;
+    let mut actions: Vec<UiCommand> = Vec::new();
+    {
+        let Ok(guard) = UI_COMMAND_RX.lock() else { return };
+        let Some(rx) = guard.as_ref() else { return };
+        while let Ok(cmd) = rx.try_recv() {
+            if cmd.is_state() {
+                latest_state = Some(cmd);
+            } else {
+                actions.push(cmd);
+            }
+        }
+    }
+    if let Some(state) = latest_state {
+        apply_ui_command(state);
+    }
+    for action in actions {
+        apply_ui_command(action);
+    }
+}
+
+fn apply_ui_command(cmd: UiCommand) {
+    match cmd {
+        UiCommand::ShowCandidateWindow { items, selected, caret } => {
+            show_candidate_window_impl(&items, selected, caret)
+        }
+        UiCommand::ShowCommandPopup { items, descs, auto_runs, selected, caret } => {
+            show_command_popup_impl(&items, &descs, &auto_runs, selected, caret)
+        }
+        UiCommand::FlashModeIndicator { label, caret } => flash_mode_indicator_impl(&label, caret),
+        UiCommand::Hide => hide_candidate_window_impl(),
+        UiCommand::OpenSettings => unsafe { open_settings_window_impl() },
+        UiCommand::OpenWordSettings => unsafe { open_word_settings_window_impl() },
+    }
+}
 
 /// 溜めた学習の処理をメッセージループへ依頼する。依頼できたら true
 /// （候補ウィンドウが無く作れない場合は false → 呼び出し側は同期で学習する）。
+///
+/// 注意: フックスレッド分離（[[hook-latency-log-thread-model]]）後は、
+/// このメッセージループは候補ウィンドウを所有するUIスレッドで動き、
+/// フックスレッドとは別になる。したがってこの依頼は本来の意図通り
+/// フックの応答時間から完全に切り離される。
 pub(crate) fn request_deferred_learning() -> bool {
     unsafe {
         let hwnd = match CANDIDATE_HWND {
@@ -90,7 +244,16 @@ pub(crate) extern "system" fn candidate_wndproc(hwnd: HWND, msg: u32, wparam: WP
     };
     match msg {
         WM_PAINT => {
+            let start = std::time::Instant::now();
+            // A/B証明専用（`cargo ... --features ab_proof`時のみ有効）。
+            // 同一スレッド構造が本当にフック配送を塞ぐことを、GetTickCountの
+            // 分解能(約15.6ms)を余裕で超える人工的な遅延（LowLevelHooksTimeout
+            // の既定300msに対して安全域を取り100ms）で証明するための仕込み。
+            // featureゲートのため通常ビルドには物理的に含まれない。
+            #[cfg(feature = "ab_proof")]
+            std::thread::sleep(std::time::Duration::from_millis(100));
             unsafe { paint_candidates(hwnd) };
+            crate::hook::hook_latency::record_handler("paint_candidates", start.elapsed());
             LRESULT(0)
         }
         // コマンドモードのポップアップ内「設定」ボタンのクリックで設定画面を開く
@@ -136,6 +299,7 @@ pub(crate) extern "system" fn candidate_wndproc(hwnd: HWND, msg: u32, wparam: WP
         // フックから戻った後に、確定時に溜めた学習（DB書き込み）を処理する。
         // ロックが取れなければ（別スレッドが参照中）後で再試行する。
         WM_APP_FLUSH_LEARNING => {
+            let start = std::time::Instant::now();
             if let Some(cm) = LIVE_CONTEXT.get() {
                 match cm.try_lock() {
                     Ok(mut c) => c.flush_pending_learning(),
@@ -144,6 +308,14 @@ pub(crate) extern "system" fn candidate_wndproc(hwnd: HWND, msg: u32, wparam: WP
                     }
                 }
             }
+            crate::hook::hook_latency::record_handler("flush_pending_learning", start.elapsed());
+            LRESULT(0)
+        }
+        // フックスレッドから積まれた候補ウィンドウ操作をまとめて適用する。
+        WM_APP_UI_COMMAND => {
+            let start = std::time::Instant::now();
+            drain_ui_commands();
+            crate::hook::hook_latency::record_handler("drain_ui_commands", start.elapsed());
             LRESULT(0)
         }
         // Z順が変更されるたびに「最前面(HWND_TOPMOST)」を強制し、他ウィンドウに
@@ -474,6 +646,10 @@ pub(crate) unsafe fn ensure_candidate_window() -> Option<HWND> {
     if let Some(hwnd) = CANDIDATE_HWND {
         return Some(hwnd);
     }
+    // ここから先は実際にウィンドウを作る経路。`init_ui_thread`がフック
+    // スレッド起動前に一度作っておくため、通常はここへ到達しない
+    // （到達＝起動順序の前提が崩れている）。
+    debug_assert_current_thread_is_ui("ensure_candidate_window (creation path)");
 
     let hinstance = GetModuleHandleW(None).ok()?;
     let class_name = w!("ImeLiveCandidateList");
@@ -599,12 +775,25 @@ pub(crate) fn caret_screen_pos() -> (i32, i32, i32) {
     }
 }
 
-/// 候補一覧ウィンドウを表示・更新
+/// 候補一覧ウィンドウを表示・更新する（どのスレッドからも呼べる）。
+/// キャレット位置を呼び出し元スレッドで取得したうえで`UiCommand`に載せ、
+/// 実際のWin32呼び出しはUIスレッド側（`show_candidate_window_impl`）に
+/// 委ねる。
 pub(crate) fn show_candidate_window(items: &[String], selected: usize) {
     if items.is_empty() {
         hide_candidate_window();
         return;
     }
+    let caret = caret_screen_pos();
+    post_ui_command(UiCommand::ShowCandidateWindow {
+        items: items.to_vec(),
+        selected,
+        caret,
+    });
+}
+
+fn show_candidate_window_impl(items: &[String], selected: usize, caret: (i32, i32, i32)) {
+    debug_assert_current_thread_is_ui("show_candidate_window_impl");
     if let Ok(mut ui) = CANDIDATE_UI.lock() {
         ui.items = items.to_vec();
         ui.descriptions = Vec::new();
@@ -621,7 +810,7 @@ pub(crate) fn show_candidate_window(items: &[String], selected: usize) {
     let page_start = candidate_page_start(selected.min(total.saturating_sub(1)));
     let rows_on_page = (total - page_start).min(CANDIDATE_PAGE_SIZE);
     let indicator = if total > CANDIDATE_PAGE_SIZE { 1 } else { 0 };
-    place_popup(max_len, (rows_on_page + indicator) as i32);
+    place_popup(max_len, (rows_on_page + indicator) as i32, caret);
 }
 
 /// コマンドモードのコマンド候補をカーソル付近に表示する。
@@ -633,11 +822,29 @@ pub(crate) fn show_command_popup(items: &[String], descs: &[String], auto_runs: 
         return;
     }
     let sel = selected.min(items.len() - 1);
+    let caret = caret_screen_pos();
+    post_ui_command(UiCommand::ShowCommandPopup {
+        items: items.to_vec(),
+        descs: descs.to_vec(),
+        auto_runs: auto_runs.to_vec(),
+        selected: sel,
+        caret,
+    });
+}
+
+fn show_command_popup_impl(
+    items: &[String],
+    descs: &[String],
+    auto_runs: &[bool],
+    selected: usize,
+    caret: (i32, i32, i32),
+) {
+    debug_assert_current_thread_is_ui("show_command_popup_impl");
     if let Ok(mut ui) = CANDIDATE_UI.lock() {
         ui.items = items.to_vec();
         ui.descriptions = descs.to_vec();
         ui.auto_runs = auto_runs.to_vec();
-        ui.selected = sel;
+        ui.selected = selected;
         ui.visible = true;
         ui.status = false;
         ui.command_mode = true;
@@ -648,12 +855,18 @@ pub(crate) fn show_command_popup(items: &[String], descs: &[String], auto_runs: 
     let head_len = 36; // 見出し行の目安（Tab:補完 / Enter:挿入→編集 まで入る幅）
     let max_len = (cmd_len + desc_len + 4).max(head_len);
     // 見出し行 + 候補行
-    place_popup(max_len, items.len() as i32 + 1);
+    place_popup(max_len, items.len() as i32 + 1, caret);
 }
 
 /// モード切替時に、現在のモード名をカーソル付近へ一定時間フラッシュ表示する。
 /// 「モードが切り替わった」ことを明示するためのもの（自動で消える）。
 pub(crate) fn flash_mode_indicator(label: &str) {
+    let caret = caret_screen_pos();
+    post_ui_command(UiCommand::FlashModeIndicator { label: label.to_string(), caret });
+}
+
+fn flash_mode_indicator_impl(label: &str, caret: (i32, i32, i32)) {
+    debug_assert_current_thread_is_ui("flash_mode_indicator_impl");
     if let Ok(mut ui) = CANDIDATE_UI.lock() {
         ui.items = vec![label.to_string()];
         ui.descriptions = Vec::new();
@@ -663,7 +876,7 @@ pub(crate) fn flash_mode_indicator(label: &str) {
         ui.status = true;       // アクセント背景で目立たせる
         ui.command_mode = false;
     }
-    place_popup(label.chars().count() + 2, 1);
+    place_popup(label.chars().count() + 2, 1, caret);
     // 一定時間後に自動で消すタイマーを仕掛ける
     unsafe {
         if let Some(hwnd) = CANDIDATE_HWND {
@@ -687,14 +900,20 @@ pub(crate) fn show_prediction_popup(items: &[String], selected: usize) {
     show_candidate_window(items, sel);
 }
 
-/// ポップアップ（候補/ステータス）を組み立ててカーソル付近に配置・表示する
-pub(crate) fn place_popup(max_len_chars: usize, line_count: i32) {
+/// ポップアップ（候補/ステータス）を組み立ててカーソル付近に配置・表示する。
+/// `caret`はフックスレッドが打鍵の瞬間に`caret_screen_pos()`で取得した値を
+/// `UiCommand`に載せて渡したもの（`caret_screen_pos`自体は
+/// `GetGUIThreadInfo`＋キャッシュ参照のみでクロススレッドのブロックを
+/// 起こさないため、どちらのスレッドで呼んでも安全だが、打鍵の瞬間の
+/// 値を使う方が正確なためフックスレッド側で取得する）。
+pub(crate) fn place_popup(max_len_chars: usize, line_count: i32, caret: (i32, i32, i32)) {
+    debug_assert_current_thread_is_ui("place_popup");
     unsafe {
         let Some(hwnd) = ensure_candidate_window() else { return };
 
         let width = ((max_len_chars + 4) * 16 + 24).min(640) as i32;
         let mut height = 8 + line_count * CANDIDATE_LINE_HEIGHT;
-        let (mut x, caret_top, caret_bottom) = caret_screen_pos();
+        let (mut x, caret_top, caret_bottom) = caret;
 
         // 基点が乗っているモニターの作業領域を取得してクランプする
         // （SM_CXSCREEN は主モニターのみなので、マルチモニターだと
@@ -753,8 +972,14 @@ pub(crate) fn place_popup(max_len_chars: usize, line_count: i32) {
     }
 }
 
-/// 候補一覧ウィンドウを隠す
+/// 候補一覧ウィンドウを隠す（どのスレッドからも呼べる。実処理はUIスレッドへ
+/// 委ねる）。
 pub(crate) fn hide_candidate_window() {
+    post_ui_command(UiCommand::Hide);
+}
+
+fn hide_candidate_window_impl() {
+    debug_assert_current_thread_is_ui("hide_candidate_window_impl");
     unsafe {
         let was_visible = match CANDIDATE_UI.lock() {
             Ok(mut ui) => {
