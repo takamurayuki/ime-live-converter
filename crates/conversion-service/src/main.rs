@@ -196,18 +196,24 @@ fn already_running() -> bool {
 }
 
 fn main() -> Result<()> {
+    // --version: 版だけ表示して終わる（install.ps1 が更新前後の版を確認する）
+    if std::env::args().any(|a| a == "--version" || a == "-V") {
+        println!("{}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     // --debug: フック側のデバッグログ(IME_DEBUG_LOG)を確実に有効化する。
     //   DLL は同一プロセスの環境変数を読むので、ロード前にここで設定する。
     //   （VBS の環境変数設定が子へ伝わらないケースの回避）
     if std::env::args().any(|a| a == "--debug") {
         std::env::set_var("IME_DEBUG_LOG", "1");
-        println!("デバッグログ有効: C:\\Projects\\ime-live-converter\\hook_debug.log");
+        println!("デバッグログ有効: {}", common::paths::data_file("hook_debug.log").display());
     }
 
     // --background / -b: 標準入力を読まず、常駐（ログオン時自動起動向け）
     let background = std::env::args().any(|a| a == "--background" || a == "-b");
 
-    println!("IME Live Converter を起動しています...");
+    println!("IME Live Converter v{} を起動しています...", env!("CARGO_PKG_VERSION"));
     println!();
 
     // 二重起動を防ぐ（2つ動くとフックが2回入力を注入し、二重入力・文字化けになる）。
@@ -230,12 +236,11 @@ fn main() -> Result<()> {
         anyhow::bail!("キーボードフックのインストールに失敗しました");
     }
 
-    // 辞書を絶対パスで探してロード（フル辞書 system.dic を優先）
-    let exe_dir = std::env::current_dir()?;
-    let sample_paths = [
-        exe_dir.join("dictionaries/system.dic"),
-        exe_dir.join("dictionaries/sample.dic"),
-    ];
+    // 辞書を探してロード（exe の隣 → カレントディレクトリ、フル辞書 system.dic を優先）
+    let sample_paths: Vec<PathBuf> = ["dictionaries/system.dic", "dictionaries/sample.dic"]
+        .iter()
+        .filter_map(|p| common::paths::find_bundled(p))
+        .collect();
     
     let mut dict_loaded = false;
     for path in &sample_paths {

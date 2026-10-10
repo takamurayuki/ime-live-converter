@@ -14,3 +14,6 @@ dictionaries/judge_lm.bin
 dictionaries/judge_cooc.bin
 # フックの見張り番のログ（時刻と回数のみ）
 hook_watchdog.log
+
+# 配布物（scripts/package.ps1 の出力）
+dist/

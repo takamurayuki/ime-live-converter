@@ -704,6 +704,26 @@ impl ViterbiConverter {
         self.learned_assoc.retain(|(p, c), _| p != surface && c != surface);
     }
 
+    /// 学習ユニグラムを DB 上の頻度に合わせ直す（0 なら消す）。
+    /// 頻度を下げたとき（`LearningRepository::demote_commit`）に使う。
+    pub fn set_unigram_frequency(&mut self, reading: &str, surface: &str, freq: u32) {
+        if freq == 0 {
+            self.learned_unigram.remove(&(reading.to_string(), surface.to_string()));
+        } else {
+            self.learn_unigram(reading, surface, freq);
+        }
+    }
+
+    /// 学習バイグラムを DB 上の頻度に合わせ直す（0 なら消す）
+    pub fn set_bigram_frequency(&mut self, prev_surface: &str, surface: &str, freq: u32) {
+        if freq == 0 {
+            self.learned_bigram.remove(&(prev_surface.to_string(), surface.to_string()));
+            self.bigram_prev_surfaces = self.learned_bigram.keys().map(|(p, _)| p.clone()).collect();
+        } else {
+            self.learn_bigram(prev_surface, surface, freq);
+        }
+    }
+
     /// 誤字修正（誤字の読み→修正後の読み・表記）を学習する。
     ///
     /// 「もしかして」の先頭候補をユーザーが実際に確定したときに呼ぶ。

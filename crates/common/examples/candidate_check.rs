@@ -16,12 +16,15 @@ fn main() {
     let mut state = LiveConversionState::new();
     if std::env::var("IME_NO_LEARNING").is_err() {
         let copy = std::env::temp_dir().join(format!("candidate_check_{}.db", std::process::id()));
-        std::fs::copy("ime-learning.db", &copy).expect("学習DBのコピーに失敗");
-        // WAL モードのため、未チェックポイントの最近の学習は -wal 側にしか無い
+        // 実運用と同じ場所（common::paths）の学習DB。WAL モードのため、未チェック
+        // ポイントの最近の学習は -wal 側にしか無いので一緒にコピーする
+        let src = common::paths::learning_db_path();
+        std::fs::copy(&src, &copy).expect("学習DBのコピーに失敗");
         let wal = std::path::PathBuf::from(format!("{}-wal", copy.display()));
+        let src_wal = std::path::PathBuf::from(format!("{}-wal", src.display()));
         let _ = std::fs::remove_file(&wal);
-        if Path::new("ime-learning.db-wal").exists() {
-            std::fs::copy("ime-learning.db-wal", &wal).expect("学習DB(WAL)のコピーに失敗");
+        if src_wal.exists() {
+            std::fs::copy(&src_wal, &wal).expect("学習DB(WAL)のコピーに失敗");
         }
         state.learning = Some(LearningRepository::open(&copy).expect("学習DBオープン失敗"));
     }
@@ -54,19 +57,22 @@ fn main() {
         }
         state.hiragana_buffer = reading.to_string();
         let shown: String = state.convert_buffer(reading).iter().map(|e| e.surface.as_str()).collect();
+        let t = std::time::Instant::now();
         let (cands, seg_reading, seg_surfaces, prefix, _, suffix, _) = state.build_candidates();
+        let build_ms = t.elapsed().as_secs_f64() * 1000.0;
         let shown_seg = shown
             .strip_prefix(prefix.as_str())
             .and_then(|s| s.strip_suffix(suffix.as_str()))
             .unwrap_or("");
         let rank = seg_surfaces.iter().position(|s| s == shown_seg);
         println!(
-            "{} → 表示「{}」 対象[{}]=「{}」 候補内の順位: {}",
+            "{} → 表示「{}」 対象[{}]=「{}」 候補内の順位: {}（一覧の作成 {:.1}ms）",
             reading,
             shown,
             seg_reading,
             shown_seg,
-            rank.map_or("なし".to_string(), |r| format!("{}位", r + 1))
+            rank.map_or("なし".to_string(), |r| format!("{}位", r + 1)),
+            build_ms
         );
         println!("    候補: {}", seg_surfaces.iter().take(8).cloned().collect::<Vec<_>>().join(" / "));
         let _ = cands;

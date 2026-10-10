@@ -37,15 +37,9 @@ pub(crate) fn vowel_combos(k: usize) -> Vec<Vec<char>> {
 
 /// dictionaries/commands.csv から定番コマンドと説明を読み込み、DBへseedする。
 /// 形式: `コマンド<TAB>説明`（TAB区切り、説明は省略可、# 行はコメント）。
-/// 実行ディレクトリ直下と exe 隣接の両方を探す。
+/// exe の隣とカレントディレクトリを探す（`common::paths::find_bundled`）。
 pub(crate) fn seed_commands_from_csv(learning: &LearningRepository) {
-    let candidates = [
-        std::path::PathBuf::from("dictionaries/commands.csv"),
-        std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|d| d.join("dictionaries/commands.csv")))
-            .unwrap_or_default(),
-    ];
+    let candidates = [common::paths::find_bundled("dictionaries/commands.csv").unwrap_or_default()];
     for path in candidates.iter() {
         if path.as_os_str().is_empty() || !path.exists() {
             continue;

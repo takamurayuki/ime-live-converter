@@ -32,6 +32,114 @@ fn vowel_combos(k: usize) -> Vec<Vec<char>> {
 /// 画面に収まる分だけスクロール表示するので、多めに集めても破綻しない。
 pub const MAX_CONVERSION_CANDIDATES: usize = 50;
 
+/// 候補一覧で「区切り方の違う2語の並び」を探す読みの最大文字数
+/// （直前の文節＋対象文節。長いと無関係な組み合わせばかりになる）
+const RESEGMENT_MAX_READING_CHARS: usize = 8;
+/// 区切り方の違う2語の並びのうち、候補一覧に加える数
+const RESEGMENT_MAX_ALTERNATIVES: usize = 3;
+/// 区切り方の違う2語の並びを探すとき、分け目ごとに左右それぞれ試す語の数
+const RESEGMENT_WORDS_PER_SIDE: usize = 6;
+/// 区切り方の違う並びを候補に出すのは、文全体の点が表示中の変換からこの差以内の
+/// ときだけ（判断層の点、自然対数）。どの読みにも1文字漢字＋3文字語のような
+/// 分け方はたいてい見つかるため、もっともらしいものに限らないと、ほぼ常に
+/// 候補一覧の対象が直前の文節まで広がってしまう
+const RESEGMENT_JUDGE_MARGIN: f32 = 6.0;
+/// 判断層が無いときの同じしきい値（辞書コスト）
+const RESEGMENT_COST_MARGIN: i32 = 6000;
+
+/// 語の並び `ws` を `prev` と `next` の間に置いたときの簡易コスト（実効語コスト＋
+/// 各接続コスト）。1語なら `context_connection_cost` と同じ（形容詞＋に の補正込み）
+fn span_cost(
+    converter: &ViterbiConverter,
+    prev: Option<&crate::WordEntry>,
+    ws: &[crate::WordEntry],
+    next: Option<&crate::WordEntry>,
+) -> i32 {
+    let mut cost = 0i32;
+    for w in ws {
+        cost = cost.saturating_add(converter.effective_word_cost(w));
+    }
+    if let [w] = ws {
+        return cost.saturating_add(converter.context_connection_cost(prev, w, next));
+    }
+    let edge = |a: Option<&crate::WordEntry>, b_left: crate::PosId, b_surface: &str| -> i32 {
+        let right = a.map(|e| e.right_id).unwrap_or(converter.dictionary.bos_id);
+        converter.base_connection_cost(right, a.map(|e| e.surface.as_str()), b_left, b_surface).0
+    };
+    let mut p = prev;
+    for w in ws {
+        cost = cost.saturating_add(edge(p, w.left_id, &w.surface));
+        p = Some(w);
+    }
+    let (next_left, next_surface) = next
+        .map(|n| (n.left_id, n.surface.as_str()))
+        .unwrap_or((converter.dictionary.eos_id, ""));
+    cost.saturating_add(edge(p, next_left, next_surface))
+}
+
+/// 読みを辞書の2語に分け直した並びのうち、もっともらしいものを返す
+/// （`current` と同じ並びは除く）。判断層があればその点で、無ければ
+/// 2語の実効コスト＋その間の接続コストで選ぶ。固有名詞・記号は使わない
+/// （人名・地名の組み合わせは候補一覧を埋めるだけで役に立たない）。
+fn two_word_alternatives(
+    converter: &ViterbiConverter,
+    reading: &str,
+    current: &[crate::WordEntry],
+) -> Vec<Vec<crate::WordEntry>> {
+    let chars: Vec<char> = reading.chars().collect();
+    let current_surface: String = current.iter().map(|e| e.surface.as_str()).collect();
+    // 表示中と同じ分け目（同音語の差し替えで済むもの）は対象外
+    let current_split = current.first().map(|e| e.reading.chars().count()).unwrap_or(0);
+    let top_words = |r: &str| -> Vec<crate::WordEntry> {
+        let Some(words) = converter.merged_lookup(r) else { return Vec::new() };
+        let mut ws: Vec<crate::WordEntry> = words
+            .iter()
+            .filter(|w| !w.pos.starts_with("記号") && !w.pos.contains("固有名詞"))
+            .cloned()
+            .collect();
+        ws.sort_by_key(|w| converter.effective_word_cost(w));
+        ws.truncate(RESEGMENT_WORDS_PER_SIDE);
+        ws
+    };
+    // (並び, 点: 大きいほど良い)
+    let mut scored: Vec<(Vec<crate::WordEntry>, f32)> = Vec::new();
+    for k in 1..chars.len() {
+        if k == current_split {
+            continue;
+        }
+        let left: String = chars[..k].iter().collect();
+        let right: String = chars[k..].iter().collect();
+        let (lw, rw) = (top_words(&left), top_words(&right));
+        for a in &lw {
+            for b in &rw {
+                let surface = format!("{}{}", a.surface, b.surface);
+                if surface == current_surface || surface == reading {
+                    continue;
+                }
+                let pair = vec![a.clone(), b.clone()];
+                let score = match converter.judge_path_score(&pair) {
+                    Some(s) => s,
+                    None => {
+                        let conn = converter
+                            .base_connection_cost(a.right_id, Some(&a.surface), b.left_id, &b.surface)
+                            .0;
+                        -((converter.effective_word_cost(a) + converter.effective_word_cost(b) + conn) as f32)
+                    }
+                };
+                scored.push((pair, score));
+            }
+        }
+    }
+    scored.sort_by(|x, y| y.1.partial_cmp(&x.1).unwrap_or(std::cmp::Ordering::Equal));
+    let mut seen = std::collections::HashSet::new();
+    scored
+        .into_iter()
+        .filter(|(p, _)| seen.insert(p.iter().map(|e| e.surface.as_str()).collect::<String>()))
+        .take(RESEGMENT_MAX_ALTERNATIVES)
+        .map(|(p, _)| p)
+        .collect()
+}
+
 /// ユーザー登録単語の品詞（名詞-一般）と接続ID・既定コスト。
 /// extend_from_csv（補助辞書）と同じ扱いにして、単独でも文中でも変換に出るようにする。
 pub const USER_WORD_POS: &str = "名詞-一般-*-*";
@@ -104,6 +212,10 @@ pub struct LiveConversionState {
     pub cand_seg_reading: String,
     /// 候補一覧の各項目に対応する対象文節の表記（candidates と並行）
     pub cand_seg_surfaces: Vec<String>,
+    /// 候補一覧の各項目が対象文節に置く語の並び（candidates と並行）。確定時の学習を
+    /// 辞書の語の単位（読み・表記・品詞）で記録するために使う。カタカナ・ひらがなの
+    /// まま等、辞書の語に対応しない候補は空。先頭（index 0）は表示中の変換。
+    pub cand_seg_entries: Vec<Vec<crate::WordEntry>>,
     /// 対象文節より前（確定扱いにしない、変えない部分）の変換済み表記
     pub cand_prefix_surface: String,
     /// 対象文節より前の読み（学習時に前半を再分解するために保持）
@@ -146,6 +258,8 @@ pub struct LiveConversionState {
     /// `pending_learning`（文節列）とは形が異なる（前接語とのバイグラム・
     /// 誤字修正の学習を含む）ため別キューに分けている。
     pub pending_prediction_learning: Vec<PredictionLearning>,
+    /// 遅延させた「候補で直された変換の学習を弱める」処理（`CorrectionDemotion`）
+    pub pending_demotions: Vec<CorrectionDemotion>,
     /// 閉じ括弧の自動対応に使う確定済みテキスト（末尾数百文字）。
     /// `recent_context` より長く保持し、セリフのように長い括弧内でも
     /// 対応する開き括弧（「『【（ 等）の種類を見つけられるようにする。
@@ -388,6 +502,7 @@ impl LiveConversionState {
             candidate_index: 0,
             cand_seg_reading: String::new(),
             cand_seg_surfaces: Vec::new(),
+            cand_seg_entries: Vec::new(),
             cand_prefix_surface: String::new(),
             cand_prefix_reading: String::new(),
             cand_suffix_surface: String::new(),
@@ -399,6 +514,7 @@ impl LiveConversionState {
             request_deferred_learning: None,
             pending_learning: Vec::new(),
             pending_prediction_learning: Vec::new(),
+            pending_demotions: Vec::new(),
             pinned: Vec::new(),
             predictions: Vec::new(),
             prediction_top_is_fuzzy: false,
@@ -1237,6 +1353,7 @@ impl LiveConversionState {
         self.candidate_index = 0;
         self.cand_seg_reading.clear();
         self.cand_seg_surfaces.clear();
+        self.cand_seg_entries.clear();
         self.cand_prefix_surface.clear();
         self.cand_prefix_reading.clear();
         self.cand_suffix_surface.clear();
@@ -1260,9 +1377,22 @@ impl LiveConversionState {
             for e in self.convert_buffer(&self.cand_prefix_reading) {
                 out.push((e.reading.clone(), e.surface.clone(), e.pos.clone()));
             }
-            let seg_surface = self.cand_seg_surfaces[self.candidate_index].clone();
-            // 候補選択した語は内容語とみなす（品詞は名詞相当を既定に）
-            out.push((self.cand_seg_reading.clone(), seg_surface, "名詞-一般".to_string()));
+            match self.cand_seg_entries.get(self.candidate_index).filter(|ws| !ws.is_empty()) {
+                // 辞書の語の並びが分かっている候補は、その語の単位で学習する
+                // （「導火線」= 導火＋線 を選んだら 導火・導火→線 を学習する。
+                //  1件の「どうかせん→導火線」として記録すると、辞書の語と
+                //  読み・表記が一致せず次の変換に効かない）
+                Some(words) => {
+                    for w in words {
+                        out.push((w.reading.clone(), w.surface.clone(), w.pos.clone()));
+                    }
+                }
+                None => {
+                    let seg_surface = self.cand_seg_surfaces[self.candidate_index].clone();
+                    // 候補選択した語は内容語とみなす（品詞は名詞相当を既定に）
+                    out.push((self.cand_seg_reading.clone(), seg_surface, "名詞-一般".to_string()));
+                }
+            }
             for e in self.convert_buffer(&self.cand_suffix_reading) {
                 out.push((e.reading.clone(), e.surface.clone(), e.pos.clone()));
             }
@@ -1611,6 +1741,76 @@ impl LiveConversionState {
     /// 確定1回分の学習を、遅延が有効なら溜めてフックの外で処理し、
     /// そうでなければその場で行う。遅延先（候補ウィンドウのメッセージ
     /// ループ）へ通知できなければ同期に戻す（学習を落とさない）。
+    /// 候補一覧で表示中（index 0）以外の候補を選んでいれば、直された側の
+    /// 語・語のつながりのうち、選んだ候補に含まれないものを返す
+    fn correction_demotion(&self) -> Option<CorrectionDemotion> {
+        if self.candidates.is_empty() || self.candidate_index == 0 {
+            return None;
+        }
+        let shown = self.cand_seg_entries.first().filter(|ws| !ws.is_empty())?;
+        let chosen = self.cand_seg_entries.get(self.candidate_index).cloned().unwrap_or_default();
+        let key = |w: &crate::WordEntry| (w.reading.clone(), w.surface.clone());
+        let chosen_words: std::collections::HashSet<(String, String)> = chosen.iter().map(key).collect();
+        let chosen_pairs: std::collections::HashSet<(String, String)> =
+            chosen.windows(2).map(|p| (p[0].surface.clone(), p[1].surface.clone())).collect();
+        let words: Vec<(String, String)> = shown
+            .iter()
+            .filter(|w| w.surface != w.reading)
+            .map(key)
+            .filter(|k| !chosen_words.contains(k))
+            .collect();
+        let bigrams: Vec<(String, String)> = shown
+            .windows(2)
+            .map(|p| (p[0].surface.clone(), p[1].surface.clone()))
+            .filter(|k| !chosen_pairs.contains(k))
+            .collect();
+        if words.is_empty() && bigrams.is_empty() {
+            return None;
+        }
+        Some(CorrectionDemotion { words, bigrams })
+    }
+
+    /// `apply_demotion` を、遅延が有効ならフックの外で、そうでなければその場で行う
+    fn demote_or_defer(&mut self, demotion: CorrectionDemotion) {
+        if self.defer_learning {
+            self.pending_demotions.push(demotion);
+            let notified = self.request_deferred_learning.map(|f| f()).unwrap_or(false);
+            if notified {
+                return;
+            }
+            let Some(demotion) = self.pending_demotions.pop() else { return };
+            self.apply_demotion(&demotion);
+            return;
+        }
+        self.apply_demotion(&demotion);
+    }
+
+    /// 直された変換の学習を1回分弱める（DB とメモリの両方）
+    fn apply_demotion(&mut self, demotion: &CorrectionDemotion) {
+        let Some(learning) = self.learning.as_ref() else { return };
+        let mut unigrams = Vec::new();
+        let mut bigrams = Vec::new();
+        for (reading, surface) in &demotion.words {
+            if let Ok(freq) = learning.demote_commit(reading, surface) {
+                unigrams.push((reading.clone(), surface.clone(), freq));
+            }
+        }
+        for (prev, surface) in &demotion.bigrams {
+            if let Ok(freq) = learning.demote_bigram(prev, surface) {
+                bigrams.push((prev.clone(), surface.clone(), freq));
+            }
+        }
+        if let Some(conv) = self.converter.as_mut() {
+            for (r, s, f) in unigrams {
+                conv.set_unigram_frequency(&r, &s, f);
+            }
+            for (p, s, f) in bigrams {
+                conv.set_bigram_frequency(&p, &s, f);
+            }
+        }
+        debug_log!("候補で直された変換の学習を弱めた: 語={:?} つながり={:?}", demotion.words, demotion.bigrams);
+    }
+
     fn learn_segments_or_defer(&mut self, segments: &[(String, String, String)]) {
         if self.defer_learning {
             self.pending_learning.push(segments.to_vec());
@@ -1625,6 +1825,9 @@ impl LiveConversionState {
 
     /// 溜めておいた確定分の学習をまとめて処理する（メッセージループ側から呼ぶ）
     pub fn flush_pending_learning(&mut self) {
+        for demotion in std::mem::take(&mut self.pending_demotions) {
+            self.apply_demotion(&demotion);
+        }
         let pending = std::mem::take(&mut self.pending_learning);
         for segments in pending {
             self.learn_from_segments(&segments);
@@ -1866,13 +2069,15 @@ impl LiveConversionState {
                 prefix_reading,
                 suffix_surface,
                 suffix_reading,
-            ) = self.build_candidates();
+                seg_entries,
+            ) = self.build_candidates_full();
             if candidates.len() < 2 {
                 return None; // 切り替える候補がない
             }
             self.candidates = candidates;
             self.cand_seg_reading = seg_reading;
             self.cand_seg_surfaces = seg_surfaces;
+            self.cand_seg_entries = seg_entries;
             self.cand_prefix_surface = prefix_surface;
             self.cand_prefix_reading = prefix_reading;
             self.cand_suffix_surface = suffix_surface;
@@ -1906,15 +2111,43 @@ impl LiveConversionState {
         if reading.is_empty() || surface.is_empty() {
             return None;
         }
+        // 消す (読み, 表記)。候補が辞書の語の並び（直前の文節＋同音語、区切り直した
+        // 2語）なら、候補一覧で動かない直前の文節（全候補に共通の語）と接尾辞を除いた
+        // 語ごとに消す（「同河川」なら 河川 と、それが絡むつながり 同→河川）。
+        let words = self.cand_seg_entries.get(idx).cloned().unwrap_or_default();
+        let targets: Vec<(String, String)> = if words.len() >= 2 {
+            // 直前の文節＝表示中の並び（index 0）の最後の語より前。候補がそれで
+            // 始まる（直前の文節＋同音語）なら、その部分は消さない
+            let key = |w: &crate::WordEntry| (w.reading.clone(), w.surface.clone());
+            let shown = self.cand_seg_entries.first().cloned().unwrap_or_default();
+            let head_len = shown.len().saturating_sub(1);
+            let skip = if head_len > 0
+                && words.len() > head_len
+                && words[..head_len].iter().map(key).eq(shown[..head_len].iter().map(key))
+            {
+                head_len
+            } else {
+                0
+            };
+            words[skip..]
+                .iter()
+                .filter(|w| w.surface != w.reading && !w.pos.contains("接尾"))
+                .map(key)
+                .collect()
+        } else {
+            vec![(reading.clone(), surface.clone())]
+        };
 
         // DB（確定履歴＋バイグラム）とメモリ（ユニグラム等）の両方から消す。
-        if let Some(learning) = self.learning.as_ref() {
-            let _ = learning.forget_commit(&reading, &surface);
+        for (r, s) in &targets {
+            if let Some(learning) = self.learning.as_ref() {
+                let _ = learning.forget_commit(r, s);
+            }
+            if let Some(conv) = self.converter.as_mut() {
+                conv.forget_unigram(r, s);
+            }
+            debug_log!("誤学習リセット: 読み='{}' 表記='{}'", r, s);
         }
-        if let Some(conv) = self.converter.as_mut() {
-            conv.forget_unigram(&reading, &surface);
-        }
-        debug_log!("誤学習リセット: 読み='{}' 表記='{}'", reading, surface);
 
         // 学習が変わったので候補を作り直す（並び順が更新される）。
         let (
@@ -1925,7 +2158,8 @@ impl LiveConversionState {
             prefix_reading,
             suffix_surface,
             suffix_reading,
-        ) = self.build_candidates();
+            seg_entries,
+        ) = self.build_candidates_full();
         if candidates.is_empty() {
             self.candidates.clear();
             return None;
@@ -1933,6 +2167,7 @@ impl LiveConversionState {
         self.candidates = candidates;
         self.cand_seg_reading = seg_reading;
         self.cand_seg_surfaces = seg_surfaces;
+        self.cand_seg_entries = seg_entries;
         self.cand_prefix_surface = prefix_surface;
         self.cand_prefix_reading = prefix_reading;
         self.cand_suffix_surface = suffix_surface;
@@ -1987,6 +2222,16 @@ impl LiveConversionState {
     pub fn build_candidates(
         &self,
     ) -> (Vec<String>, String, Vec<String>, String, String, String, String) {
+        let (c, r, s, ps, pr, ss, sr, _) = self.build_candidates_full();
+        (c, r, s, ps, pr, ss, sr)
+    }
+
+    /// `build_candidates` に、各候補が対象文節に置く語の並び（`cand_seg_entries`）を
+    /// 加えたもの
+    #[allow(clippy::type_complexity)]
+    pub fn build_candidates_full(
+        &self,
+    ) -> (Vec<String>, String, Vec<String>, String, String, String, String, Vec<Vec<crate::WordEntry>>) {
         let empty = || {
             (
                 Vec::new(),
@@ -1996,6 +2241,7 @@ impl LiveConversionState {
                 String::new(),
                 String::new(),
                 String::new(),
+                Vec::new(),
             )
         };
         let Some(converter) = self.converter.as_ref() else {
@@ -2026,6 +2272,7 @@ impl LiveConversionState {
                 .iter()
                 .map(|s| format!("{}{}", prefix_surface, s))
                 .collect();
+            let no_entries = vec![Vec::new(); seg_surfaces.len()];
             return (
                 candidates,
                 current.to_string(),
@@ -2034,6 +2281,7 @@ impl LiveConversionState {
                 prefix_reading,
                 String::new(),
                 String::new(),
+                no_entries,
             );
         }
 
@@ -2077,6 +2325,45 @@ impl LiveConversionState {
                 break;
             }
         }
+        // 区切り方そのものが違う変換も候補に出す。直前の変換済み文節と対象文節を
+        // 合わせた読みを辞書の2語に分け直した並び（どうかせん: 表示「同＋河川」に
+        // 対して「導火＋線」）。候補一覧が対象文節の同音語だけだと、区切りを誤った
+        // 変換は選び直しようがなく、確定するたびに誤りが学習されて固定化する
+        // （2026-10-10、同河川）。対象を直前の文節まで広げ、同音語の候補は
+        // 「直前の文節（そのまま）＋同音語」になる。
+        let mut fixed_head: Vec<crate::WordEntry> = Vec::new();
+        let mut resegmented: Vec<Vec<crate::WordEntry>> = Vec::new();
+        if start == end && end >= 1 {
+            let left = &entries[end - 1];
+            let combined: String = format!("{}{}", left.reading, entries[end].reading);
+            if left.surface != left.reading
+                && !left.pos.starts_with("記号")
+                && combined.chars().count() <= RESEGMENT_MAX_READING_CHARS
+            {
+                // 文全体の点が表示中の変換に近い（もっともらしい）ものだけ残す
+                let before = &entries[..end - 1];
+                let after = &entries[end + 1..];
+                let full = |ws: &[crate::WordEntry]| -> Vec<crate::WordEntry> {
+                    let mut p = before.to_vec();
+                    p.extend_from_slice(ws);
+                    p.extend_from_slice(after);
+                    p
+                };
+                let shown_judge = converter.judge_path_score(&entries);
+                let shown_cost = span_cost(converter, before.last(), &entries[end - 1..=end], after.first());
+                resegmented = two_word_alternatives(converter, &combined, &entries[end - 1..=end])
+                    .into_iter()
+                    .filter(|ws| match (shown_judge, converter.judge_path_score(&full(ws))) {
+                        (Some(shown), Some(alt)) => alt >= shown - RESEGMENT_JUDGE_MARGIN,
+                        _ => span_cost(converter, before.last(), ws, after.first()) <= shown_cost + RESEGMENT_COST_MARGIN,
+                    })
+                    .collect();
+                if !resegmented.is_empty() {
+                    start = end - 1;
+                    fixed_head = entries[start..end].to_vec();
+                }
+            }
+        }
         // 対象span [start..=end] の結合読み
         let seg_reading: String =
             entries[start..=end].iter().map(|e| e.reading.as_str()).collect();
@@ -2114,41 +2401,63 @@ impl LiveConversionState {
             eff_cost: i32,
             /// 判断層の総合スコア（判断層が無ければ None。大きいほど良い）
             judge_score: Option<f32>,
+            /// 対象文節に置く語の並び（辞書の語に対応しない候補は空）
+            words: Vec<crate::WordEntry>,
         }
         let prev_entry = if start > 0 { entries.get(start - 1) } else { None };
         let next_entry = entries.get(end + 1);
-        let path_with = |w: &crate::WordEntry| -> Vec<crate::WordEntry> {
+        let path_with = |ws: &[crate::WordEntry]| -> Vec<crate::WordEntry> {
             let mut path: Vec<crate::WordEntry> = entries[..start].to_vec();
-            path.push(w.clone());
+            path.extend_from_slice(ws);
             path.extend_from_slice(&entries[end + 1..]);
             path
         };
+        // 語の並びを対象文節に置いたときの (簡易コスト, 判断層の点)
+        let score_words = |ws: &[crate::WordEntry], penalty: i32| -> (i32, Option<f32>) {
+            let cost = span_cost(converter, prev_entry, ws, next_entry).saturating_add(penalty);
+            let judge = converter.judge_path_score(&path_with(ws)).map(|s| s - penalty as f32 / 1000.0);
+            (cost, judge)
+        };
         let mut segs: Vec<Seg> = Vec::new();
-        if let Some(words) = converter.merged_lookup(&seg_reading) {
+        let lookup_reading: String = if fixed_head.is_empty() {
+            seg_reading.clone()
+        } else {
+            entries[end].reading.clone()
+        };
+        let head_surface: String = fixed_head.iter().map(|e| e.surface.as_str()).collect();
+        if let Some(words) = converter.merged_lookup(&lookup_reading) {
             for w in words.iter() {
                 // 記号品詞（ギリシャ文字等）は辞書コストが低くても実用語より
                 // 優先させない（scoring.rsの`symbol_penalty`はASCII/全角記号
                 // だけを対象にしており、χ等の記号POS全般はカバーしないため
                 // ここで別途ペナルティを科す）。
                 let penalty = symbol_entry_penalty(&w.pos);
-                let own_cost = converter.effective_word_cost(w).saturating_add(penalty);
-                let ctx_cost = converter.context_connection_cost(prev_entry, w, next_entry);
-                let judge_score = converter
-                    .judge_path_score(&path_with(w))
-                    .map(|s| s - penalty as f32 / 1000.0);
+                let mut ws = fixed_head.clone();
+                ws.push(w.clone());
+                let (eff_cost, judge_score) = score_words(&ws, penalty);
                 segs.push(Seg {
-                    surface: w.surface.clone(),
-                    eff_cost: own_cost.saturating_add(ctx_cost),
+                    surface: format!("{}{}", head_surface, w.surface),
+                    eff_cost,
                     judge_score,
+                    words: ws,
                 });
             }
+        }
+        for ws in resegmented {
+            let (eff_cost, judge_score) = score_words(&ws, 0);
+            segs.push(Seg {
+                surface: ws.iter().map(|e| e.surface.as_str()).collect(),
+                eff_cost,
+                judge_score,
+                words: ws,
+            });
         }
         // カタカナ・ひらがな表記も候補に含める（末尾寄り）
         let katakana = crate::hiragana_to_katakana(&seg_reading);
         if katakana != seg_reading {
-            segs.push(Seg { surface: katakana, eff_cost: 50000, judge_score: None });
+            segs.push(Seg { surface: katakana, eff_cost: 50000, judge_score: None, words: Vec::new() });
         }
-        segs.push(Seg { surface: seg_reading.clone(), eff_cost: 52000, judge_score: None });
+        segs.push(Seg { surface: seg_reading.clone(), eff_cost: 52000, judge_score: None, words: Vec::new() });
 
         if converter.judge.is_some() {
             // 判断層の点が付いた語を点の高い順に、付かないもの（カタカナ・
@@ -2166,25 +2475,32 @@ impl LiveConversionState {
         // いま自動変換で表示している対象文節の表記を必ず1位にする。
         // 一覧の1位＝表示中の語、という対応を並べ方の式の違い（判断層の
         // 有無、自動変換側だけにある手調整ガード等）に依らず保証する。
-        let shown_seg: String = entries[start..=end].iter().map(|e| e.surface.as_str()).collect();
+        // 語の並びは表示中のもの（`correction_demotion` が直された側として使う）。
+        let shown_words: Vec<crate::WordEntry> = entries[start..=end].to_vec();
+        let shown_seg: String = shown_words.iter().map(|e| e.surface.as_str()).collect();
         match segs.iter().position(|s| s.surface == shown_seg) {
-            Some(0) => {}
             Some(i) => {
-                let s = segs.remove(i);
+                let mut s = segs.remove(i);
+                s.words = shown_words;
                 segs.insert(0, s);
             }
-            None => segs.insert(0, Seg { surface: shown_seg, eff_cost: i32::MIN, judge_score: None }),
+            None => segs.insert(
+                0,
+                Seg { surface: shown_seg, eff_cost: i32::MIN, judge_score: None, words: shown_words },
+            ),
         }
 
         // 前半（固定）+ 対象文節表記 + 後半（固定）で候補文字列を作る
         let mut seen = std::collections::HashSet::new();
         let mut candidates: Vec<String> = Vec::new();
         let mut seg_surfaces: Vec<String> = Vec::new();
+        let mut seg_entries: Vec<Vec<crate::WordEntry>> = Vec::new();
         for seg in segs {
             let cand = format!("{}{}{}", prefix_surface, seg.surface, suffix_surface);
             if seen.insert(cand.clone()) {
                 candidates.push(cand);
                 seg_surfaces.push(seg.surface);
+                seg_entries.push(seg.words);
             }
             // 同音異義語は読みによっては20語以上あり（「けん」「こう」等）、
             // 9件では目的の字まで辿り着けないことが多い。多めに集めておき、
@@ -2201,6 +2517,7 @@ impl LiveConversionState {
             prefix_reading,
             suffix_surface,
             suffix_reading,
+            seg_entries,
         )
     }
 
@@ -2332,6 +2649,12 @@ impl LiveConversionState {
         // 記録する。→ で部分確定済みの文節も連結して1文として学習する。
         // これによりライブ変換自体が使うほど賢くなり、語のつながり
         // （文全体の整合性）も学習される。
+        // 表示されていた変換を候補一覧で別の候補に直して確定したなら、直された側の
+        // 学習を1回分弱める（下の学習より先に。誤変換をうっかり確定した学習が
+        // 確定のたびに強まって居座るのを防ぐ）
+        if let Some(demotion) = self.correction_demotion() {
+            self.demote_or_defer(demotion);
+        }
         let mut segments = std::mem::take(&mut self.committed_segments);
         segments.extend(self.segment_remaining());
         // 確定した名詞を次の入力の共起の文脈として覚える（判断層の共起モデル）
@@ -2457,6 +2780,14 @@ pub struct ConversionAction {
 }
 
 /// 単語エントリが「1文字の漢字」か（隣接漢字の結合判定に使う）
+/// 候補一覧で直された（表示されていた）変換のうち、学習を1回分弱める語
+/// （読み, 表記）と語のつながり（前の表記, 表記）
+#[derive(Debug, Clone, PartialEq)]
+pub struct CorrectionDemotion {
+    pub words: Vec<(String, String)>,
+    pub bigrams: Vec<(String, String)>,
+}
+
 pub fn is_single_kanji_entry(e: &crate::WordEntry) -> bool {
     let mut chars = e.surface.chars();
     match (chars.next(), chars.next()) {
@@ -4115,5 +4446,141 @@ mod load_dictionary_ordering_tests {
             "word_priority.tsvの「はたち→二十歳」ボーナスがload_dictionary後に消えている\
              （reload_learning_into_converterがload_word_priority_fileより後に呼ばれているか確認）"
         );
+    }
+}
+
+#[cfg(test)]
+mod resegment_candidate_tests {
+    use super::*;
+
+    /// どうかせん: 自動変換は「同（接頭詞）＋河川」、正しくは「導火＋線」（2語）
+    fn state_with_doukasen_dict() -> LiveConversionState {
+        let mut dict = Dictionary::new();
+        dict.matrix = crate::ConnectionMatrix::new(10, 10);
+        for i in 0..10 {
+            for j in 0..10 {
+                dict.matrix.set(i, j, 200);
+            }
+        }
+        let w = |surface: &str, reading: &str, id: u16, cost: i16, pos: &str| crate::WordEntry {
+            surface: surface.to_string(),
+            reading: reading.to_string(),
+            left_id: id,
+            right_id: id,
+            cost,
+            pos: pos.to_string(),
+        };
+        dict.add_word(w("同", "どう", 1, 3000, "接頭詞-名詞接続-*-*"));
+        dict.add_word(w("河川", "かせん", 2, 3000, "名詞-一般-*-*"));
+        dict.add_word(w("架線", "かせん", 2, 3500, "名詞-一般-*-*"));
+        dict.add_word(w("導火", "どうか", 3, 4500, "名詞-一般-*-*"));
+        dict.add_word(w("線", "せん", 4, 4000, "名詞-接尾-一般-*"));
+        let mut state = LiveConversionState::new();
+        state.converter = Some(ViterbiConverter::new(dict));
+        state.learning = Some(LearningRepository::in_memory().unwrap());
+        state.hiragana_buffer = "どうかせん".to_string();
+        let _ = state.update_conversion();
+        state
+    }
+
+    fn shown(state: &LiveConversionState) -> String {
+        state.convert_buffer(&state.hiragana_buffer).iter().map(|e| e.surface.as_str()).collect()
+    }
+
+    #[test]
+    fn resegmented_alternative_is_offered_with_its_words() {
+        let state = state_with_doukasen_dict();
+        assert_eq!(shown(&state), "同河川");
+        let (cands, reading, surfaces, prefix, _, _, _, entries) = state.build_candidates_full();
+        assert_eq!(reading, "どうかせん");
+        assert_eq!(prefix, "");
+        assert_eq!(cands[0], "同河川", "表示中の変換が1位");
+        // 区切りを変えた「導火＋線」と、直前の文節＋同音語の「同架線」が並ぶ
+        let i = cands.iter().position(|c| c == "導火線").expect("導火線が候補に無い");
+        assert_eq!(
+            entries[i].iter().map(|e| e.surface.as_str()).collect::<Vec<_>>(),
+            vec!["導火", "線"]
+        );
+        assert!(surfaces.contains(&"同架線".to_string()));
+        assert_eq!(
+            entries[0].iter().map(|e| e.surface.as_str()).collect::<Vec<_>>(),
+            vec!["同", "河川"]
+        );
+    }
+
+    #[test]
+    fn choosing_another_candidate_learns_its_words_and_weakens_the_corrected_one() {
+        let mut state = state_with_doukasen_dict();
+        // うっかり「同河川」を2回確定した学習がある状態
+        {
+            let l = state.learning.as_ref().unwrap();
+            for _ in 0..2 {
+                l.record_commit("かせん", "河川", None).unwrap();
+                l.record_commit("どう", "同", None).unwrap();
+                l.record_bigram("同", "河川").unwrap();
+            }
+        }
+        let _ = state.cycle_candidate(false);
+        let i = state.candidates.iter().position(|c| c == "導火線").unwrap();
+        let _ = state.select_candidate(i);
+        let _ = state.commit();
+        let l = state.learning.as_ref().unwrap();
+        // 選んだ候補は辞書の語の単位で学習される（接尾辞の「線」は単独では学習しない）
+        assert_eq!(l.find_frequency("どうか", "導火").unwrap(), 1);
+        assert_eq!(l.find_bigram_frequency("導火", "線").unwrap(), 1);
+        assert_eq!(l.find_frequency("どうかせん", "導火線").unwrap(), 0);
+        // 直された側（同・河川・同→河川）は1回分弱まる
+        assert_eq!(l.find_frequency("かせん", "河川").unwrap(), 1);
+        assert_eq!(l.find_frequency("どう", "同").unwrap(), 1);
+        assert_eq!(l.find_bigram_frequency("同", "河川").unwrap(), 1);
+    }
+
+    #[test]
+    fn weakening_is_deferred_out_of_the_hook_like_learning() {
+        // 実運用（フック内の確定）では DB 書き込みをメッセージループ側へ遅らせる
+        let mut state = state_with_doukasen_dict();
+        state.defer_learning = true;
+        state.request_deferred_learning = Some(|| true);
+        state.learning.as_ref().unwrap().record_commit("かせん", "河川", None).unwrap();
+        let _ = state.cycle_candidate(false);
+        let i = state.candidates.iter().position(|c| c == "導火線").unwrap();
+        let _ = state.select_candidate(i);
+        let _ = state.commit();
+        assert_eq!(state.pending_demotions.len(), 1);
+        assert_eq!(state.learning.as_ref().unwrap().find_frequency("かせん", "河川").unwrap(), 1);
+        state.flush_pending_learning();
+        assert!(state.pending_demotions.is_empty());
+        let l = state.learning.as_ref().unwrap();
+        assert_eq!(l.find_frequency("かせん", "河川").unwrap(), 0);
+        assert_eq!(l.find_frequency("どうか", "導火").unwrap(), 1);
+    }
+
+    #[test]
+    fn keeping_the_shown_candidate_does_not_weaken_anything() {
+        let mut state = state_with_doukasen_dict();
+        state.learning.as_ref().unwrap().record_commit("かせん", "河川", None).unwrap();
+        let _ = state.cycle_candidate(false); // 1位（表示中）が選択状態
+        let _ = state.commit();
+        assert_eq!(state.learning.as_ref().unwrap().find_frequency("かせん", "河川").unwrap(), 2);
+    }
+
+    #[test]
+    fn delete_on_multiword_candidate_forgets_only_the_changing_word() {
+        let mut state = state_with_doukasen_dict();
+        {
+            let l = state.learning.as_ref().unwrap();
+            l.record_commit("かせん", "河川", None).unwrap();
+            l.record_commit("どう", "同", None).unwrap();
+            l.record_bigram("同", "河川").unwrap();
+            l.record_bigram("同", "社").unwrap();
+        }
+        let _ = state.cycle_candidate(false); // 「同河川」を選択
+        let _ = state.reset_learning_for_selected();
+        let l = state.learning.as_ref().unwrap();
+        assert_eq!(l.find_frequency("かせん", "河川").unwrap(), 0);
+        assert_eq!(l.find_bigram_frequency("同", "河川").unwrap(), 0);
+        // 直前の文節「同」（同社 等の正しい学習）は残る
+        assert_eq!(l.find_frequency("どう", "同").unwrap(), 1);
+        assert_eq!(l.find_bigram_frequency("同", "社").unwrap(), 1);
     }
 }

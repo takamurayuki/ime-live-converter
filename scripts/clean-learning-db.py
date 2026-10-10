@@ -6,7 +6,7 @@
 ガードが入っているが、ガード導入前に溜まった汚染はこれで一括除去できる。
 
 使い方:
-    python scripts/clean-learning-db.py            # プロジェクト直下の ime-learning.db
+    python scripts/clean-learning-db.py            # %LOCALAPPDATA%/IMELiveConverter/ime-learning.db
     python scripts/clean-learning-db.py path/to.db # パス指定
     python scripts/clean-learning-db.py --dry-run  # 削除せず内容だけ表示
 
@@ -15,6 +15,7 @@
   - ユニグラム: 短い読み(≤3)→そのカタカナ化（かん→カン 等）
   - バイグラム/連想: 短い全カタカナ(≤3)の断片を含む行
 """
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -55,7 +56,9 @@ def main() -> int:
     args = [a for a in sys.argv[1:]]
     dry = "--dry-run" in args
     args = [a for a in args if a != "--dry-run"]
-    db_path = Path(args[0]) if args else Path("ime-learning.db")
+    # 既定は実運用の学習DB（1.0.0 以降は %LOCALAPPDATA%\IMELiveConverter、IME_DATA_DIR で上書き可）
+    default_dir = os.environ.get("IME_DATA_DIR") or os.path.join(os.environ.get("LOCALAPPDATA", "."), "IMELiveConverter")
+    db_path = Path(args[0]) if args else Path(default_dir) / "ime-learning.db"
     if not db_path.exists():
         print(f"DBが見つかりません: {db_path}")
         return 1

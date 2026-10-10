@@ -1,0 +1,65 @@
+# タグ vX.Y.Z の push で、テスト → ビルド → パッケージ作成 → GitHub Release 公開。
+# 方針と理由は docs/release-and-versioning.md を参照。
+# モデル（辞書・判断層、約370MB）はここでは作らず・配らない。本体パッケージの
+# MODELS_VERSION_REQUIRED が指すモデルのリリースから install.ps1 が取得する。
+name: release
+
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check that the tag matches Cargo.toml
+        shell: pwsh
+        run: |
+          $cargo = Get-Content Cargo.toml -Raw
+          if ($cargo -notmatch '(?s)\[workspace\.package\].*?\r?\nversion\s*=\s*"([^"]+)"') { throw "version not found" }
+          $version = $Matches[1]
+          $tag = "${{ github.ref_name }}"
+          if ($tag -ne "v$version") { throw "Tag $tag does not match Cargo.toml version $version (bump [workspace.package] version first)" }
+
+      - name: Check that the models release exists and download system.dic
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $models = (Get-Content packaging/models-version.txt -Raw).Trim()
+          gh release view $models
+          if ($LASTEXITCODE -ne 0) { throw "Models release $models not found (run scripts/publish-models.ps1 first)" }
+          gh release download $models --pattern system.dic --dir dictionaries
+
+      - name: Test
+        shell: pwsh
+        run: ./scripts/run-tests.ps1
+
+      - name: Package
+        shell: pwsh
+        run: ./scripts/package.ps1 -TargetDir target
+
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $models = (Get-Content packaging/models-version.txt -Raw).Trim()
+          $notes = @"
+          ## インストール / 更新
+          1. ``IMELiveConverter-$($tag.TrimStart('v'))-x64.zip`` をダウンロードして展開
+          2. 展開したフォルダで ``powershell -ExecutionPolicy Bypass -File install.ps1``
+
+          辞書・判断層モデル（[$models](https://github.com/${{ github.repository }}/releases/tag/$models)）は、
+          未インストールまたは更新が必要なときだけ install.ps1 が自動で取得します。
+          学習データ（%LOCALAPPDATA%\IMELiveConverter）は更新しても残ります。
+          "@
+          gh release create $tag (Get-ChildItem dist/*.zip).FullName --title "IME Live Converter $tag" --notes $notes --generate-notes

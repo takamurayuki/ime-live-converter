@@ -205,7 +205,7 @@ dependencies = [
 
 [[package]]
 name = "common"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "bincode 1.3.3",
@@ -231,7 +231,7 @@ dependencies = [
 
 [[package]]
 name = "conversion-service"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "common",
@@ -316,7 +316,7 @@ checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 
 [[package]]
 name = "dict-builder"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "bincode 1.3.3",
@@ -509,7 +509,7 @@ checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
 
 [[package]]
 name = "hook-dll"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "common",
  "serial_test",
@@ -544,7 +544,7 @@ dependencies = [
 
 [[package]]
 name = "ime-cli"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "common",

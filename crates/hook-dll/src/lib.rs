@@ -100,12 +100,16 @@ pub extern "C" fn install_hook() -> bool {
         // `common`crateはWin32非依存のため、遅延通知の実手段（PostMessageW）を
         // 持たない。実運用（フック配送）ではここで注入する。
         state.request_deferred_learning = Some(popup::request_deferred_learning);
-        // 学習DBをオープン（CLIと共有。失敗しても変換は継続できる）
-        match LearningRepository::open("ime-learning.db") {
-            Ok(learning) => {
+        // 学習DBをオープン（%LOCALAPPDATA%\IMELiveConverter、無ければ旧置き場所から
+        // 移行する。失敗しても変換は継続できる）
+        match LearningRepository::open_default() {
+            Ok((learning, path, migrated_from)) => {
                 seed_commands_from_csv(&learning);
                 state.learning = Some(learning);
-                println!("学習DBをオープン: ime-learning.db");
+                if let Some(from) = migrated_from {
+                    println!("学習DBを移行: {} → {}", from.display(), path.display());
+                }
+                println!("学習DBをオープン: {}", path.display());
             }
             Err(e) => {
                 eprintln!("学習DBのオープンに失敗（学習なしで継続）: {}", e);

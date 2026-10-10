@@ -40,7 +40,8 @@ fn main() {
         }
     }
     if std::env::var("IME_NO_LEARNING").is_err() {
-        let learning = LearningRepository::open("ime-learning.db").expect("学習DBオープン失敗");
+        // 実運用と同じ場所（common::paths）の学習DB
+        let learning = LearningRepository::open(common::paths::learning_db_path()).expect("学習DBオープン失敗");
         for (r, s, f) in learning.all_unigrams().unwrap_or_default() {
             conv.learn_unigram(&r, &s, f);
         }

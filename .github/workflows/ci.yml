@@ -1,0 +1,27 @@
+# master への push と PR でテストを回す。
+# テストは実辞書（system.dic）を使うため、packaging/models-version.txt が指す
+# モデルのリリースから system.dic だけ取得する（判断層モデルは取得しない）。
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Download system.dic
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $models = (Get-Content packaging/models-version.txt -Raw).Trim()
+          gh release download $models --pattern system.dic --dir dictionaries
+      - name: Test
+        shell: pwsh
+        run: ./scripts/run-tests.ps1

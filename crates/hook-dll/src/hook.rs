@@ -791,7 +791,7 @@ pub(crate) mod hook_latency {
 
     fn write_handler_sample(sample: &HandlerSample) {
         use std::io::Write;
-        let path = "C:\\Projects\\ime-live-converter\\hook_latency.log";
+        let path = common::paths::data_file("hook_latency.log");
         let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) else {
             return;
         };
@@ -811,7 +811,7 @@ pub(crate) mod hook_latency {
 
     fn write_snapshot(stats: &Snapshot) {
         use std::io::Write;
-        let path = "C:\\Projects\\ime-live-converter\\hook_latency.log";
+        let path = common::paths::data_file("hook_latency.log");
         let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) else {
             return;
         };

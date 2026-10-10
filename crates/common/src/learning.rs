@@ -4,7 +4,14 @@
 
 use anyhow::Result;
 use rusqlite::{Connection, params};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// 学習DBのスキーマの版（`PRAGMA user_version` に記録する）。
+///
+/// テーブル・列の構造を変えたら 1 上げ、`migrate` にその版への変換を足すこと
+/// （docs/release-and-versioning.md「6. 学習DBにスキーマの版を持たせる」）。
+/// 版の記録が無い（0 の）DB は 1.0.0 より前に作られたもの。
+pub const SCHEMA_VERSION: i32 = 1;
 
 /// ユーザー辞書エントリ
 #[derive(Debug, Clone)]
@@ -63,6 +70,19 @@ impl LearningRepository {
         let repo = Self { conn };
         repo.initialize()?;
         Ok(repo)
+    }
+
+    /// 既定の場所（`paths::learning_db_path`、`%LOCALAPPDATA%\IMELiveConverter`）の
+    /// 学習DBを開く。まだ無ければ、1.0.0 より前の置き場所（起動フォルダ）の学習DBを
+    /// 一度だけ移行（コピー）してから開く。開いたパスと、移行元があればそのパスを返す。
+    pub fn open_default() -> Result<(Self, PathBuf, Option<PathBuf>)> {
+        let path = crate::paths::learning_db_path();
+        let migrated_from = if path.exists() {
+            None
+        } else {
+            migrate_legacy_db(&path, &crate::paths::legacy_learning_db_candidates())
+        };
+        Ok((Self::open(&path)?, path, migrated_from))
     }
 
     /// 複数の記録を1トランザクションにまとめる（`end_batch` と対で使う）。
@@ -196,17 +216,6 @@ impl LearningRepository {
             )",
             [],
         )?;
-        // 既存DBへの列追加（無ければ足す。あればエラーを無視）
-        let _ = self.conn.execute(
-            "ALTER TABLE command_alias ADD COLUMN auto_run INTEGER NOT NULL DEFAULT 1",
-            [],
-        );
-        // ユーザーが手で登録したか（manual）、隣接する漢字複合語の反復使用から
-        // 自動登録したか（auto）を区別する。既存行は既定で manual 扱いになる。
-        let _ = self.conn.execute(
-            "ALTER TABLE user_dictionary ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'",
-            [],
-        );
 
         // インデックス作成
         self.conn.execute(
@@ -226,6 +235,39 @@ impl LearningRepository {
             [],
         )?;
 
+        self.migrate()
+    }
+
+    /// 記録されたスキーマの版から `SCHEMA_VERSION` まで順に変換する。
+    /// このプログラムより新しい版の DB は壊さないよう開かない（古い版へ
+    /// 戻したとき。学習なしで変換は続けられる）。
+    fn migrate(&self) -> Result<()> {
+        let version: i32 = self.conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version > SCHEMA_VERSION {
+            anyhow::bail!(
+                "学習DBの版({})がこのプログラムの対応版({})より新しいため開きません",
+                version,
+                SCHEMA_VERSION
+            );
+        }
+        if version < 1 {
+            // 版の記録が無かった頃（1.0.0 より前）に後から足した列。古い DB には
+            // 無いことがあるので足す（既にあればエラーになるが無視する）。
+            let _ = self.conn.execute(
+                "ALTER TABLE command_alias ADD COLUMN auto_run INTEGER NOT NULL DEFAULT 1",
+                [],
+            );
+            // ユーザーが手で登録したか（manual）、隣接する漢字複合語の反復使用から
+            // 自動登録したか（auto）を区別する。既存行は既定で manual 扱いになる。
+            let _ = self.conn.execute(
+                "ALTER TABLE user_dictionary ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'",
+                [],
+            );
+        }
+        // ここに `if version < 2 { ... }` のように次の版への変換を足していく
+        if version != SCHEMA_VERSION {
+            self.conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        }
         Ok(())
     }
 
@@ -376,6 +418,39 @@ impl LearningRepository {
         );
 
         Ok(result.unwrap_or(0))
+    }
+
+    /// 確定履歴の頻度を1回分下げる（0 になった行は消す）。下げた後の合計頻度を返す。
+    ///
+    /// 自動変換の結果を候補一覧で別の候補に直して確定したとき、直された側の
+    /// 学習を弱めるために使う（誤変換をうっかり確定した学習が、確定のたびに
+    /// 強まって居座るのを防ぐ。`forget_commit` と違い1回分だけ）。
+    pub fn demote_commit(&self, reading: &str, surface: &str) -> Result<u32> {
+        self.conn.execute(
+            "UPDATE conversion_history SET frequency = frequency - 1
+             WHERE id = (SELECT id FROM conversion_history
+                         WHERE reading = ?1 AND surface = ?2
+                         ORDER BY frequency DESC LIMIT 1)",
+            params![reading, surface],
+        )?;
+        self.conn.execute(
+            "DELETE FROM conversion_history WHERE reading = ?1 AND surface = ?2 AND frequency <= 0",
+            params![reading, surface],
+        )?;
+        self.find_frequency(reading, surface)
+    }
+
+    /// バイグラムの頻度を1回分下げる（0 になれば消す）。下げた後の頻度を返す。
+    pub fn demote_bigram(&self, prev_surface: &str, surface: &str) -> Result<u32> {
+        self.conn.execute(
+            "UPDATE word_bigram SET frequency = frequency - 1 WHERE prev_surface = ?1 AND surface = ?2",
+            params![prev_surface, surface],
+        )?;
+        self.conn.execute(
+            "DELETE FROM word_bigram WHERE prev_surface = ?1 AND surface = ?2 AND frequency <= 0",
+            params![prev_surface, surface],
+        )?;
+        self.find_bigram_frequency(prev_surface, surface)
     }
 
     /// 誤学習をリセットする: 指定した (reading, surface) の確定履歴を削除する。
@@ -1012,12 +1087,81 @@ impl LearningRepository {
     }
 }
 
+/// 1.0.0 より前の置き場所にある学習DBを `dest` へコピーする（最初に見つかった1つ）。
+/// WAL にしか無い最近の書き込みも含めるため、ファイルコピーではなく
+/// `VACUUM INTO` で書き出す。移行元は消さない（元に戻せるように）。
+fn migrate_legacy_db(dest: &Path, candidates: &[PathBuf]) -> Option<PathBuf> {
+    // 移行先そのもの（同じフォルダ）は移行元にしない
+    let dest_dir = dest.parent().and_then(|d| d.canonicalize().ok());
+    for src in candidates {
+        if !src.exists() {
+            continue;
+        }
+        let src_dir = src.parent().and_then(|d| d.canonicalize().ok());
+        if src_dir.is_some() && src_dir == dest_dir {
+            continue;
+        }
+        let Ok(conn) = Connection::open(src) else { continue };
+        let dest_str = dest.to_string_lossy().to_string();
+        if conn.execute("VACUUM INTO ?1", params![dest_str]).is_ok() {
+            return Some(src.clone());
+        }
+        // 途中で失敗した書き出しは残さない
+        let _ = std::fs::remove_file(dest);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// ファイルDBを開くと WAL モードになる（フック内の確定でDB書き込みが
     /// 300ms上限を超えないための前提）
+    #[test]
+    fn schema_version_is_recorded_and_newer_db_is_refused() {
+        let dir = std::env::temp_dir().join(format!("ime_test_schema_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.db");
+        {
+            let repo = LearningRepository::open(&path).unwrap();
+            let v: i32 = repo.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+            assert_eq!(v, SCHEMA_VERSION);
+            // 新しい版のプログラムが書いた DB を模擬
+            repo.conn.pragma_update(None, "user_version", SCHEMA_VERSION + 1).unwrap();
+        }
+        assert!(LearningRepository::open(&path).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_db_is_copied_including_wal_contents() {
+        // 1.0.0 より前の学習DB（起動フォルダ、WAL に未反映の書き込みあり）を
+        // 新しい場所へ移行できる。移行元は残る。
+        let dir = std::env::temp_dir().join(format!("ime_test_migrate_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("old")).unwrap();
+        std::fs::create_dir_all(dir.join("new")).unwrap();
+        let old = dir.join("old").join(LEARNING_DB_FILE_FOR_TEST);
+        let new = dir.join("new").join(LEARNING_DB_FILE_FOR_TEST);
+        let old_repo = LearningRepository::open(&old).unwrap();
+        old_repo.record_commit("いったん", "一旦", None).unwrap();
+        // old_repo を開いたまま（チェックポイント前）で移行する
+        let from = migrate_legacy_db(&new, &[dir.join("missing.db"), old.clone()]);
+        assert_eq!(from, Some(old.clone()));
+        let new_repo = LearningRepository::open(&new).unwrap();
+        assert_eq!(new_repo.find_frequency("いったん", "一旦").unwrap(), 1);
+        assert!(old.exists());
+        // 移行先と同じフォルダのものは移行元にしない
+        assert_eq!(migrate_legacy_db(&dir.join("new").join("other.db"), &[new.clone()]), None);
+        drop(old_repo);
+        drop(new_repo);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const LEARNING_DB_FILE_FOR_TEST: &str = crate::paths::LEARNING_DB_FILE;
+
     #[test]
     fn open_enables_wal_journal_mode() {
         let path = std::env::temp_dir().join(format!("ime_test_wal_{}.db", std::process::id()));

@@ -11,6 +11,7 @@ pub mod judge;
 pub mod judge_cooc;
 pub mod brackets;
 pub mod conversion;
+pub mod paths;
 
 pub use dictionary::{Dictionary, WordEntry, TrieNode, ConnectionMatrix, CharCategory, PosId};
 pub use corpus_lm::CorpusLm;
@@ -53,12 +54,12 @@ macro_rules! debug_log {
     ($($arg:tt)*) => {
         if $crate::debug_log_enabled() {
             use std::io::Write;
-            let path = "C:\\Projects\\ime-live-converter\\hook_debug.log";
-            let needs_bom = !std::path::Path::new(path).exists();
+            let path = $crate::paths::data_file("hook_debug.log");
+            let needs_bom = !path.exists();
             if let Ok(mut file) = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(path)
+                .open(&path)
             {
                 if needs_bom {
                     let _ = file.write_all(&[0xEF, 0xBB, 0xBF]);

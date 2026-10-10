@@ -1,0 +1,5 @@
+# C ランタイムを静的リンクする（Visual C++ 再頒布可能パッケージの無い PC でも
+# 動くように。docs/release-and-versioning.md「8. リリースは GitHub Actions で
+# タグから自動作成」）。開発時も同じ設定にして、配布物と同じものを試す。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

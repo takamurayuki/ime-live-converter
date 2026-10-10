@@ -1,0 +1,14 @@
+IME Live Converter - third-party notices
+
+1. IPA dictionary (mecab-ipadic 2.7.0-20070801)
+   dictionaries\system.dic is built from the IPA dictionary.
+   Copyright 2000, 2001, 2002, 2003 Nara Institute of Science and Technology.
+   See IPADIC-COPYING.txt for the full license terms.
+
+2. Japanese Wikipedia
+   dictionaries\judge_lm.bin and dictionaries\judge_cooc.bin are statistical
+   models (word n-gram counts and co-occurrence statistics) learned from the
+   text of Japanese Wikipedia (https://ja.wikipedia.org/).
+   Wikipedia text is available under the Creative Commons Attribution-ShareAlike
+   4.0 License (https://creativecommons.org/licenses/by-sa/4.0/).
+   The models contain no article text, only aggregated statistics.

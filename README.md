@@ -36,7 +36,7 @@ Windows向けのmacOSライブ変換風IME（日本語入力システム）で�
 - **ひらがな→漢字変換（ライブ変換）**: ひらがなを入力中に自動で漢字に変換
 - **Viterbi アルゴリズム**: 最適な変換パスを探索して自然な変換結果を生成
 - **キーボードフック**: 低レベル WH_KEYBOARD_LL + SendInput で全アプリに対応
-- **学習**: 確定した変換を SQLite（`ime-learning.db`）に記録し、使うほど賢くなる
+- **学習**: 確定した変換を SQLite（`%LOCALAPPDATA%\IMELiveConverter\ime-learning.db`）に記録し、使うほど賢くなる
 - **もしかして（誤字補正）**: **自動変換に失敗した時だけ**、意味の通る候補を提案。2段構え:
   - **ローマ字取り残し**: 英字が残って変換できないケース（例: `gmennasai`→`ごめんなさい`、`saynara`→`さよなら`、`nippon`→`にっぽん`）。母音抜け・打ちすぎ・転置・末尾nをカバー。
   - **かなレベル補正**: ローマ字は全部かなになったが実在語に変換できていない（未知語のまま／カタカナ化）ケースを、辞書のあいまい検索（Trie上のLevenshtein）＋変換コストで「意味の通る語」に寄せる（例: `きづついて`→`傷ついて`、`がっこ`→`学校`、拗音の打ち間違い `きよう`→`きょう`）。
@@ -82,7 +82,22 @@ graph TD
     C --> commonlib
 ```
 
+## インストール（配布版、Rust 不要）
 
+1. [Releases](https://github.com/takamurayuki/ime-live-converter/releases) から
+   `IMELiveConverter-<版>-x64.zip` をダウンロードして展開
+2. 展開したフォルダで次を実行（管理者権限の確認が出たら「はい」）
+
+```powershell
+powershell -ExecutionPolicy Bypass -File install.ps1
+```
+
+- 更新も同じ手順です（学習データは残ります）。辞書・判断層モデル（約370MB）は
+  初回とモデル更新時だけ自動でダウンロードされます。
+- プログラム: `%LOCALAPPDATA%\Programs\IMELiveConverter`、
+  学習データ・ログ: `%LOCALAPPDATA%\IMELiveConverter`
+- アンインストール: `%LOCALAPPDATA%\Programs\IMELiveConverter\uninstall.ps1`
+- 版の付け方・配布の仕組みとその判断理由: [docs/release-and-versioning.md](docs/release-and-versioning.md)
 
 ## ビルド
 
@@ -169,7 +184,7 @@ cargo run --release -p dict-builder -- judge-cooc   ipadic-mecab-2_7_0/system.di
 cargo run --release -p ime-cli
 ```
 
-起動すると辞書と学習DB（`ime-learning.db`、自動作成）がロードされます。
+起動すると辞書がロードされます（学習DBは既定で一時DB。実運用の学習DBを使うには `--learning` で指定）。
 
 ### ライブ変換モード（おすすめ）
 

@@ -958,7 +958,12 @@ pub(crate) unsafe fn open_settings_window_impl() {
         ..Default::default()
     };
     RegisterClassW(&wc);
-    let title = w!("コマンド設定");
+    // 版を表示する（不具合報告で「どの版か」が分かるように）
+    let title_w: Vec<u16> = format!("コマンド設定 - IME Live Converter v{}", env!("CARGO_PKG_VERSION"))
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let title = windows::core::PCWSTR(title_w.as_ptr());
     // TOPMOST にする（コマンド予測ポップアップ=TOPMOST より前面に出すため）。
     // ホバー説明はカーソル付近のツールチップ(INFOTIP)、参照ダイアログはモーダルで
     // 前面に出るので、TOPMOST でも隠れない。

@@ -577,19 +577,20 @@ fn run() -> Result<()> {
     }
 
     // 学習DBが未指定なら、既定で一時DB（インメモリ）を使う。本番の
-    // ime-learning.db（conversion-serviceが実際に使うファイル）へは
+    // 学習DB（conversion-serviceが実際に使うファイル、common::paths）へは
     // 決して自動で触らない。危険な方（本番ファイル）をデフォルトにすると、
     // 動作確認のつもりの:commit/:user addが本番の学習データを書き換えて
     // しまう（実際にこの事故が起きた）。本番DBを使いたい場合は
-    // `--learning ime-learning.db`（または`:learning ime-learning.db`）で
+    // `--learning <パス>`（または`:learning <パス>`）で
     // 明示すること。
     if cli.learning_db_path.is_none() {
         match LearningRepository::in_memory() {
             Ok(learning) => {
                 cli.converter.learning = Some(learning);
                 println!(
-                    "学習DB: 一時DB（インメモリ）を使用中。本番ime-learning.dbには触れません。\
-                     本番DBを使うには --learning ime-learning.db (または :learning ime-learning.db) を指定してください。"
+                    "学習DB: 一時DB（インメモリ）を使用中。本番の学習DBには触れません。\
+                     本番DBを使うには --learning \"{}\" (または :learning) を指定してください。",
+                    common::paths::learning_db_path().display()
                 );
             }
             Err(e) => eprintln!("一時学習DBの作成に失敗: {}", e),

@@ -81,8 +81,12 @@ MAJOR を「データを引き継げない」に限定したのは、利用者�
 ### 5. 配布物は「本体」と「モデル」を分ける
 
 - 本体パッケージ（数 MB）: exe / DLL / 小さな同梱データ / インストールスクリプト
-- モデルパッケージ（約 370MB）: `system.dic` / `judge_lm.bin` / `judge_cooc.bin`。
-  モデルには独自のバージョン（例: `models-2026.10`）を付け、本体の版とは独立させる
+- モデル（約 370MB）: `system.dic` / `judge_lm.bin` / `judge_cooc.bin`。
+  モデルには独自のバージョン（`packaging/models-version.txt`、例: `models-2026.10.10`）を付け、
+  本体の版とは独立させる。同名の GitHub Release に**ファイルを個別に**
+  （ZIP にまとめずに）`SHA256SUMS.txt` と一緒に置く。個別にしたのは、CI のテストが
+  `system.dic`（5.5MB）だけを取得すれば済むようにするため。モデルのリリースは
+  一度公開したら差し替えない（中身を変えるときは版を上げる）
 
 **理由**: ほとんどの改修（誤変換修正など）はプログラムだけの変更で、モデルは
 変わらない。毎回 370MB を配り直すと更新が重くなり、「更新が面倒だから古い版の
@@ -91,6 +95,13 @@ MAJOR を「データを引き継げない」に限定したのは、利用者�
 ものを GitHub Release の添付ファイル（1 ファイル 2GB まで可）として置き、
 CI はそれを取り込む。Git LFS も検討したが、無料枠（容量・帯域）がモデルの
 大きさに対して小さく、更新のたびに枠を消費するため採らない。
+
+`system.dic` は小さいので本体側に入れる（CI で IPA 辞書から作る）ことも検討したが、
+実装時（2026-10-10）に試したところ、**今の dict-builder で作り直した辞書は手元の
+`system.dic` と一致しなかった**（カタカナ語のコスト補正値が違い、手元の方が 213 語多い。
+過去の作り方の履歴が残っていない）。作り直した辞書に替えると、ゴールデンテストで
+調整してきた変換結果が変わるため、`system.dic` も手元のものをモデルとして配る。
+`extra.csv` を変えて辞書を作り直したときは、モデルの版を上げて配り直す。
 
 ### 6. 学習 DB にスキーマの版を持たせる
 
@@ -126,6 +137,48 @@ GitHub Release に公開、を行う。バイナリは C ランタイムを静�
 **理由**: 手作業のリリースは手順漏れ（テスト未実行・ファイルの入れ忘れ）が
 起きる。タグを起点にすれば「タグ = テスト済みの配布物」が保証される。
 
+## 実装（2026-10-10）
+
+| 方針 | 実装 |
+|---|---|
+| 1, 3 版の付け方・正本 | `Cargo.toml` の `[workspace.package] version`（各 crate は `version.workspace = true`）。`conversion-service.exe --version`、起動ログ、コマンド設定画面のタイトルに表示 |
+| 4 置き場所 | `crates/common/src/paths.rs`。学習DBは `LearningRepository::open_default()`（無ければ起動フォルダ・exe の隣の旧DBを `VACUUM INTO` で移行。移行元は消さない）。`IME_DATA_DIR` で上書き可 |
+| 5 本体とモデル | `scripts/package.ps1`（`-Models` でモデルも）、`scripts/publish-models.ps1`、`packaging/models-version.txt` |
+| 6 スキーマの版 | `learning.rs` の `SCHEMA_VERSION` と `migrate()`。新しい版の DB は開かない |
+| 7 インストール・更新 | `packaging/install.ps1` / `uninstall.ps1` / `run-hidden.vbs`（配布物の直下に入る） |
+| 8 CI | `.github/workflows/release.yml`（タグ）、`ci.yml`（master への push・PR）。C ランタイムの静的リンクは `.cargo/config.toml` |
+
+### リリース手順
+
+**通常の改修（本体だけ）**
+1. 改修をコミットし、`scripts/run-tests.ps1` が通ることを確認する
+2. `Cargo.toml` の `[workspace.package] version` を上げる（上の表に従う）
+3. `git tag vX.Y.Z` → `git push origin master vX.Y.Z`
+4. CI が テスト → パッケージ作成 → GitHub Release 公開 まで行う
+5. 利用者は新しい ZIP を展開して `install.ps1` を実行する（学習は残る）
+
+**モデルを変えたとき（辞書の作り直し・判断層の再学習）**
+1. `packaging/models-version.txt` を新しい版（例: `models-2026.11.01`）にする
+2. `scripts/package.ps1 -Models` → `scripts/publish-models.ps1`
+3. 本体の版を上げてリリースする（上の手順）。`install.ps1` は必要なモデルの版が
+   入っていなければ自動で取得する
+
+### 開発環境から移るとき
+
+開発用のビルド（`scripts/rebuild-and-run.ps1`、リポジトリ直下で起動）も
+1.0.0 以降は `%LOCALAPPDATA%\IMELiveConverter` の学習DB・ログを使う。初回起動時に
+リポジトリ直下の `ime-learning.db` が自動で移行される（元のファイルは残る）。
+インストール版を先に入れる場合は `install.ps1 -ImportLearningDb <リポジトリ>\ime-learning.db`
+で取り込める。
+
+### 手元で確認済み / 未確認
+
+- 確認済み: パッケージ作成、静的リンク（`VCRUNTIME140.dll` への依存が消えた）、
+  作業用フォルダへのインストール・更新（版の検出、モデルの再取得をしない）・
+  チェックサム不一致の検出・アンインストール、インストール先の辞書・DLL を読んで常駐すること
+- 未確認: 管理者権限への昇格と自動起動タスクの登録、GitHub からのモデル取得、
+  CI（モデルのリリースを公開するまで動かない）、Rust の無いまっさらな PC での動作
+
 ## 決定時点で認識しているリスク・未決事項
 
 - **ウイルス対策ソフト・SmartScreen**: 全キー入力を拾うキーボードフックは
@@ -140,3 +193,5 @@ GitHub Release に公開、を行う。バイナリは C ランタイムを静�
 ## 変更履歴
 
 - 2026-10-10: 初版。
+- 2026-10-10: 実装を反映。`system.dic` が再現できないためモデル側で配ることにした理由、
+  モデルを ZIP でなく個別ファイルで置く理由、リリース手順を追記。
