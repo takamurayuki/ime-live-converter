@@ -141,12 +141,21 @@ impl ViterbiConverter {
     /// 1語の (辞書側の実効コスト, 個人学習のボーナス)。`effective_word_cost` から
     /// 学習ユニグラムのボーナスだけを切り出したもの（判断層では個人学習を
     /// 辞書コストと別の尺度で効かせるため。辞書側は学習を入れずに求める）。
+    ///
+    /// 接頭詞には学習ユニグラムを効かせない。接頭詞の学習（同社・同年 等の「同」）は
+    /// 「どう」の漢字の選び分けにしか意味が無いのに、1語ごとに数nats乗るため
+    /// 「接頭詞＋何でも」の分割をまとめて後押ししてしまう（どうかせん→同河川、
+    /// 2026-10-09。従来エンジンの再摘果 [[bonused-prefix-stacking-conversion-bug]] と
+    /// 同じ形）。接頭詞の漢字は LM が後続語との並びで選ぶ。
     pub(crate) fn judge_word_cost(&self, e: &WordEntry) -> (i32, i32) {
-        let learned = self
-            .learned_unigram
-            .get(&(e.reading.clone(), e.surface.clone()))
-            .copied()
-            .unwrap_or(0);
+        let learned = if e.pos.starts_with("接頭詞") {
+            0
+        } else {
+            self.learned_unigram
+                .get(&(e.reading.clone(), e.surface.clone()))
+                .copied()
+                .unwrap_or(0)
+        };
         (self.word_cost_with_learned(e, 0), learned)
     }
 

@@ -2646,6 +2646,23 @@ fn test_judge_word_cost_dictionary_part_does_not_depend_on_learning() {
 }
 
 #[test]
+fn test_judge_word_cost_ignores_learning_on_prefix() {
+    // 接頭詞「同」の学習（同社・同年 等）が判断層で「同＋何でも」の分割を
+    // 後押しし、どうかせん→同河川 になっていた（2026-10-09）。同じ (読み,表記) の
+    // 名詞の「同」には学習が効く。
+    let mut dict = flat_matrix_dict();
+    let prefix = word("同", "どう", 1, 4691, "接頭詞-名詞接続-*-*");
+    let noun = word("同", "どう", 2, 8224, "名詞-一般-*-*");
+    dict.add_word(prefix.clone());
+    dict.add_word(noun.clone());
+    let mut converter = ViterbiConverter::new(dict);
+    converter.learn_unigram("どう", "同", 2);
+    // 辞書側のコスト（1文字漢字ペナルティ込み）は学習の有無で変わらない
+    assert_eq!(converter.judge_word_cost(&prefix), (converter.word_cost_with_learned(&prefix, 0), 0));
+    assert_eq!(converter.judge_word_cost(&noun), (converter.word_cost_with_learned(&noun, 0), 3000));
+}
+
+#[test]
 fn test_trusted_phrase_bonus_does_not_override_longer_word() {
     // 「水曜」の固定ボーナス（0未満まで割り引ける）が、同じ読みで始まる
     // より長い語「水溶液」を「水曜駅」に割っていた（2026-10-09）。

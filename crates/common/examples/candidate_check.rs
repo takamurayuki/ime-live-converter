@@ -6,6 +6,8 @@
 //!
 //! 使い方: printf 'かいの\n' | cargo run --release -p common --example candidate_check
 //! 環境変数: IME_NO_LEARNING=1 で学習DBを付けない / IME_JUDGE=0 で判断層なし
+//! IME_TYPE=1 なら各行をローマ字として1文字ずつ `add_char` に流し（実際のキー入力と同じ、
+//! 先頭文節の固定も効く）、打鍵ごとの表示と `commit` 後の確定結果を出す。
 use common::{LearningRepository, LiveConversionState};
 use std::io::BufRead;
 use std::path::Path;
@@ -15,6 +17,12 @@ fn main() {
     if std::env::var("IME_NO_LEARNING").is_err() {
         let copy = std::env::temp_dir().join(format!("candidate_check_{}.db", std::process::id()));
         std::fs::copy("ime-learning.db", &copy).expect("学習DBのコピーに失敗");
+        // WAL モードのため、未チェックポイントの最近の学習は -wal 側にしか無い
+        let wal = std::path::PathBuf::from(format!("{}-wal", copy.display()));
+        let _ = std::fs::remove_file(&wal);
+        if Path::new("ime-learning.db-wal").exists() {
+            std::fs::copy("ime-learning.db-wal", &wal).expect("学習DB(WAL)のコピーに失敗");
+        }
         state.learning = Some(LearningRepository::open(&copy).expect("学習DBオープン失敗"));
     }
     assert!(state.load_dictionary(Path::new("dictionaries/system.dic")), "辞書ロード失敗");
@@ -24,6 +32,24 @@ fn main() {
     for line in std::io::stdin().lock().lines().map_while(Result::ok) {
         let reading = line.trim();
         if reading.is_empty() {
+            continue;
+        }
+        if std::env::var("IME_TYPE").is_ok() {
+            let apply = |sim: &mut String, action: Option<common::ConversionAction>| {
+                let Some(a) = action else { return };
+                let keep = sim.chars().count().saturating_sub(a.delete_count);
+                *sim = sim.chars().take(keep).collect();
+                sim.push_str(&a.insert_text);
+            };
+            let mut sim = String::new();
+            for ch in reading.chars() {
+                let action = state.add_char(ch);
+                apply(&mut sim, action);
+                println!("  {ch} → {sim}");
+            }
+            let action = state.commit();
+            apply(&mut sim, action);
+            println!("{reading} ⇒ 確定「{sim}」");
             continue;
         }
         state.hiragana_buffer = reading.to_string();
