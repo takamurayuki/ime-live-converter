@@ -303,6 +303,9 @@ python scripts\clean-learning-db.py --dry-run  # 何が消えるか確認だけ
 
 ## 開発
 
+配布・バージョン管理の方針（版の上げ方、ファイルの置き場所、リリース手順）と
+その判断理由は [docs/release-and-versioning.md](docs/release-and-versioning.md) を参照。
+
 ### プロジェクト構造
 
 ```
