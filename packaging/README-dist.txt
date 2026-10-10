@@ -29,5 +29,5 @@ Rust などの開発環境は不要です。
 ■ ライセンス
   本体: MIT License
   辞書: IPA 辞書（licenses\IPADIC-COPYING.txt）
-  判断層モデル: 日本語 Wikipedia の本文から統計的に学習したもの（CC BY-SA 4.0 の
-  Wikipedia 本文に由来。licenses\NOTICE.txt）
+  判断層モデル: 日本語 Wikipedia（執筆者: Wikipedia の寄稿者）の本文から統計的に
+  学習したもの。モデル自体を CC BY-SA 4.0 で配布（licenses\NOTICE.txt）

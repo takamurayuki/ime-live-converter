@@ -353,7 +353,12 @@ cargo test
 
 ## ライセンス
 
-MIT License
+- プログラム本体: MIT License
+- 辞書 `system.dic`: IPA 辞書由来（[packaging/licenses/IPADIC-COPYING.txt](packaging/licenses/IPADIC-COPYING.txt)）
+- 判断層モデル `judge_lm.bin` / `judge_cooc.bin`: 日本語 Wikipedia（Wikipedia の寄稿者）の
+  本文から作った統計データで、[CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/) で配布
+  （[packaging/licenses/NOTICE.txt](packaging/licenses/NOTICE.txt)）。継承（SA）の条件は
+  モデルのファイルにだけかかり、それを読むプログラム本体には及びません
 
 ## 参考
 

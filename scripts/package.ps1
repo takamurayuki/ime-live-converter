@@ -7,7 +7,8 @@
 #                                            upload as the GitHub Release
 #                                            <models-version>: system.dic,
 #                                            judge_lm.bin, judge_cooc.bin,
-#                                            SHA256SUMS.txt
+#                                            SHA256SUMS.txt, NOTICE.txt,
+#                                            IPADIC-COPYING.txt
 #
 # <version> comes from [workspace.package] in Cargo.toml and <models-version>
 # from packaging\models-version.txt (see docs/release-and-versioning.md).
@@ -92,6 +93,9 @@ if ($Models) {
         $lines += "$hash  $f"
     }
     Set-Content -Path (Join-Path $mstage "SHA256SUMS.txt") -Value $lines -Encoding ASCII
+    # The models are published on their own, so they carry their license notices.
+    Copy-Item (Join-Path $root "packaging\licenses\NOTICE.txt") $mstage
+    Copy-Item (Join-Path $root "packaging\licenses\IPADIC-COPYING.txt") $mstage
     Write-Host "Models folder:   $mstage"
     Write-Host "Publish it with: powershell -ExecutionPolicy Bypass -File scripts\publish-models.ps1"
 }
