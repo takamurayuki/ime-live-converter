@@ -85,3 +85,16 @@ madowotooshite	窓を通して
 ittei	一定
 itteinokijunn	一定の基準
 ittetsu	一徹
+
+# 2026-10-17: 外来語の長音なし表記が辞書に無く「ブラ+宇座」「ドライ+馬」のような
+# カタカナ断片+漢字断片に割れていた。辞書読み込み時に長音なし表記を補う
+# （Dictionary::add_long_vowel_variants）。普通の日本語（作家・天気）を乗っ取らないことも確認する。
+burauza	ブラウザ
+burauzawohiraku	ブラウザを開く
+doraibawoireru	ドライバを入れる
+forudawotukuru	フォルダを作る
+sakka	作家
+tennkigaii	天気がいい
+# 辞書に無い外来語が断片に割れる(暗い案と)。extra.csv に追加＋判断層の語彙外罰を頭打ちに
+kuraianntogaiu	クライアントが言う
+kuraianntonosettei	クライアントの設定

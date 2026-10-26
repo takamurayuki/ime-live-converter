@@ -64,7 +64,7 @@ Copy-Item (Join-Path $root "packaging\install.ps1") $stage
 Copy-Item (Join-Path $root "packaging\uninstall.ps1") $stage
 Copy-Item (Join-Path $root "packaging\README-dist.txt") (Join-Path $stage "README.txt")
 Copy-Item (Join-Path $root "packaging\licenses\*") (Join-Path $stage "licenses")
-foreach ($f in @("commands.csv", "word_priority.tsv", "word_assoc.tsv", "sample.dic")) {
+foreach ($f in @("commands.csv", "word_priority.tsv", "word_assoc.tsv", "english_words.tsv", "english_tech.txt", "sample.dic")) {
     Copy-Item (Join-Path $root "dictionaries\$f") (Join-Path $stage "dictionaries")
 }
 Set-Content -Path (Join-Path $stage "VERSION") -Value $version -Encoding ASCII

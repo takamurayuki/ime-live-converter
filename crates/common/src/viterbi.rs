@@ -152,6 +152,15 @@ pub struct ViterbiConverter {
     /// 直前に確定した文の名詞（新しい順に最大 `CONTEXT_NOUNS_MAX` 個）。共起モデルの
     /// 文脈として、句読点で確定した後の続きの入力にも前の文の話題を効かせる。
     pub context_nouns: Vec<String>,
+    /// 英単語の自動判定の頻度表（`crate::english`）。`judge` と両方あるときだけ、
+    /// 判断層のラティスに英単語の候補を足す。
+    pub english: Option<Arc<crate::english::EnglishLexicon>>,
+    /// 今の入力の読みが、どの打鍵から来たか（`set_romaji_hint`）。英単語の候補は
+    /// 打鍵どおりの英字で作るため、読み（かな）だけでは作れない。
+    romaji_hint: Option<Vec<crate::english::RomajiPiece>>,
+    /// 今の入力の直前に Shift で直接入力した大文字（Docker の D）。英単語の
+    /// 候補で、入力の先頭をその語の続きとして読むのに使う（`set_romaji_hint`）。
+    romaji_capital: String,
 }
 
 impl ViterbiConverter {
@@ -217,6 +226,9 @@ impl ViterbiConverter {
             judge: None,
             cooc: None,
             context_nouns: Vec::new(),
+            english: None,
+            romaji_hint: None,
+            romaji_capital: String::new(),
         };
         conv.seed_common_words();
         conv

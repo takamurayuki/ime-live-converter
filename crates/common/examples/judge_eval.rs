@@ -14,7 +14,7 @@
 //! `--write` を付けると決めたパラメータを judge_lm.bin に書き戻す。
 //! 環境変数 JUDGE_SCALE（dict_scale）/ JUDGE_UNK（語彙外1文字あたりの罰）/ JUDGE_SEED
 //! （コロケーション1組あたりの加点）/ JUDGE_LEARN / JUDGE_START_MIX / JUDGE_COOC_W
-//! （共起の重み）/ JUDGE_COOC_CAP で採用値を固定できる。
+//! （共起の重み）/ JUDGE_COOC_CAP で採用値を固定できる。JUDGE_DUMP=<path> で全件の判断層の出力を書き出す。
 //! 学習DBは読まない（誰の環境でも同じ結果になるように）。
 use common::judge::{softmax, JudgeLm, JudgeParams};
 use common::judge_cooc::JudgeCooc;
@@ -263,6 +263,15 @@ fn main() {
     show("改善", &|c| c.baseline != c.gold && pick(c, w) == c.gold);
     show("悪化", &|c| c.baseline == c.gold && pick(c, w) != c.gold);
 
+    // JUDGE_DUMP=<path> で全件の判断層の出力を書き出す（辞書や判断層を変えた前後の差分を取るため）
+    if let Ok(path) = std::env::var("JUDGE_DUMP") {
+        let lines: Vec<String> =
+            cases.iter().map(|c| format!("{}	{}	{}", c.reading, c.gold, pick(c, w))).collect();
+        std::fs::write(&path, lines.join("
+") + "
+").expect("JUDGE_DUMP の書き出しに失敗");
+    }
+
     if write {
         let p = judge.params();
         judge.set_params(JudgeParams {
@@ -275,6 +284,7 @@ fn main() {
             start_mix: env_f32("JUDGE_START_MIX").unwrap_or(p.start_mix),
             cooc_weight: w.cooc,
             cooc_cap: env_f32("JUDGE_COOC_CAP").unwrap_or(p.cooc_cap),
+            english_bias: p.english_bias,
         });
         JudgeLm::save_data(judge.data(), lm_path).expect("保存失敗");
         println!("パラメータを書き戻しました: {}", lm_path.display());

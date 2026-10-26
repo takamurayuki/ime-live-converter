@@ -181,6 +181,11 @@ unsafe extern "system" fn focus_change_win_event_proc(
 ) {
     FOCUSED_PASSWORD_STATE.store(FocusSafety::Unknown);
     FOCUSED_ELEVATED_STATE.store(FocusSafety::Unknown);
+    // 前の入力欄の文章は新しい入力欄の文脈ではないので捨て、読み直してもらう
+    if let Ok(mut t) = FIELD_TEXT.try_lock() {
+        *t = None;
+    }
+    request_field_text();
     // フォーカス変更は確定後の復元用リングバッファの無効化条件
     // （[[commit-ring-buffer]]）。`try_lock`で非ブロッキングにする
     // （このコールバックはUIスレッドのメッセージポンプ経由で呼ばれる
@@ -194,13 +199,68 @@ unsafe extern "system" fn focus_change_win_event_proc(
         let _ = tx.try_send(());
     }
 }
+/// 入力欄の既存の文章（カーソルより前）を読み直してほしいか。フォーカス移動・
+/// クリック・入力中でないときのキャレット移動で立て、UIAポーラーが読んだら下ろす。
+/// 起動直後の最初の入力欄にも効くよう初期値は true。
+static FIELD_TEXT_WANTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+/// `FIELD_TEXT_WANTED`を立てた時刻（GetTickCount64、ms）。クリック直後は
+/// アプリがまだキャレットを動かしていないので、少し待ってから読む。
+static FIELD_TEXT_REQUESTED_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// 読み直しの依頼からこの時間（ms）は読まない（アプリ側の反映待ち）
+const FIELD_TEXT_SETTLE_MS: u64 = 80;
+/// UIAポーラーが読んだ入力欄の文章。フックが次の変換の始まりに取り出す
+/// （`take_field_text`）。フォーカスが変わったら古い入力欄の文章は捨てる。
+static FIELD_TEXT: Mutex<Option<String>> = Mutex::new(None);
+
+/// 入力欄の文章の読み直しを依頼する（フックから呼んでよい。軽い操作のみ）
+pub(crate) fn request_field_text() {
+    use windows::Win32::System::SystemInformation::GetTickCount64;
+    FIELD_TEXT_REQUESTED_AT.store(unsafe { GetTickCount64() }, std::sync::atomic::Ordering::Relaxed);
+    FIELD_TEXT_WANTED.store(true, std::sync::atomic::Ordering::Release);
+    if let Some(tx) = FOCUS_WAKE_TX.get() {
+        let _ = tx.try_send(());
+    }
+}
+
+/// 読んでおいた入力欄の文章を取り出す（フックから呼ぶ。待たない）
+pub(crate) fn take_field_text() -> Option<String> {
+    FIELD_TEXT.try_lock().ok()?.take()
+}
+
+/// フォーカス中の入力欄の、カーソルより前の文章（最大`FIELD_TEXT_MAX_CHARS`文字）。
+/// TextPattern の選択範囲の先頭から前へ範囲を広げて読む。
+unsafe fn uia_text_before_caret(auto: &windows::Win32::UI::Accessibility::IUIAutomation) -> Option<String> {
+    use windows::Win32::UI::Accessibility::{
+        IUIAutomationTextPattern, TextPatternRangeEndpoint_End, TextPatternRangeEndpoint_Start,
+        TextUnit_Character, UIA_TextPatternId,
+    };
+    let max = common::viterbi::FIELD_TEXT_MAX_CHARS as i32;
+    let elem = auto.GetFocusedElement().ok()?;
+    let pattern: IUIAutomationTextPattern = elem.GetCurrentPatternAs(UIA_TextPatternId).ok()?;
+    let selection = pattern.GetSelection().ok()?;
+    if selection.Length().ok()? < 1 {
+        return None;
+    }
+    let caret = selection.GetElement(0).ok()?;
+    let range = caret.Clone().ok()?;
+    range
+        .MoveEndpointByRange(TextPatternRangeEndpoint_End, &caret, TextPatternRangeEndpoint_Start)
+        .ok()?;
+    range.MoveEndpointByUnit(TextPatternRangeEndpoint_Start, TextUnit_Character, -max).ok()?;
+    let text = range.GetText(max * 2).ok()?.to_string();
+    (!text.trim().is_empty()).then_some(text)
+}
+
 /// この Space 押下で既に LLM 変換を発火したか（オートリピートの二重発火防止）
 
 /// この回数だけ連続して位置が変化しなかったら「安定」とみなし、
 /// ポーリング間隔を`POSITION_STABLE_INTERVAL_MS`まで落とす。
 const POSITION_STABLE_THRESHOLD: u32 = 3;
 /// 位置が安定している間のポーリング間隔（ミリ秒）。通常の150msより長くし、
-/// AttachConsole/UIA呼び出しの頻度を下げてカーソル点滅への影響を減らす。
+/// 対象アプリへのクロスプロセス呼び出し（AttachConsole/UIA）の頻度を下げる。
+/// 当初は「カーソル点滅が乱れる」対策として入れたが、Windows Terminalでは
+/// 30ms間隔で叩いても点滅周期は変わらないことを実測済み（2026-10-18）。
+/// 現在は単に無駄な呼び出しを減らす目的で残している。
 const POSITION_STABLE_INTERVAL_MS: u64 = 500;
 
 /// UI Automation で取得したフォーカス入力欄の位置キャッシュ (x, y)
@@ -236,13 +296,13 @@ pub(crate) fn start_uia_poller() {
         // カーソル（フォーカス）がターミナルへ「戻った」瞬間の検出用
         let mut was_terminal = false;
         let mut last_terminal_hwnd: isize = 0;
-        // 位置が連続して変化していない回数（作文中の点滅対策用、下記参照）
+        // 位置が連続して変化していない回数（呼び出し頻度を下げる用、下記参照）
         let mut stable_count: u32 = 0;
         let mut last_pos: Option<(i32, i32, i32)> = None;
         loop {
             // 軽量: フォーカス要素のクラス名から「統合ターミナル(xterm 等)」かを判定。
             // 窓クラスで判別できない VSCode 等の端末をコマンドモード対象にするため、
-            // アイドル時でも実施する（キャレット/テキスト範囲は触らないのでチラつかない）。
+            // アイドル時でも実施する（キャレット/テキスト範囲は触らない軽い呼び出しのみ）。
             // 対象はアプリ本体と同じ窓クラスになりがちな Electron 系(Chrome_WidgetWin_1)に絞る。
             let fg_class = foreground_class_name();
             let is_term = if is_terminal_class(&fg_class) {
@@ -286,6 +346,42 @@ pub(crate) fn start_uia_poller() {
                 last_terminal_hwnd = fg_now;
             }
 
+            // MS-IME の見張り: 変換が有効な間は MS-IME を常に閉じておく。
+            // フック側は文字注入の直前・モード切替・環境切替でしか閉じないため、
+            // その合間に外部要因で開いた MS-IME がひらがな入力を始めて競合する
+            // のを、ここで最大1周期（250ms）以内に閉じ直す。
+            // - 自前UI（単語登録の読み欄は意図的に MS-IME を開く）は対象外。
+            // - フックがまだ同期していない環境（fg != LAST_FG_HWND）は対象外。
+            //   未知の環境の初期モードは最初の打鍵時に MS-IME の状態から
+            //   決めるため、その前に閉じると常に英数モードで始まってしまう。
+            if IS_ENABLED && fg_now == LAST_FG_HWND && !foreground_is_ours() {
+                if close_ms_ime_if_open_for_foreground() {
+                    debug_log!("MS-IME が開いていたため閉じました (fg class='{}')", fg_class);
+                }
+            }
+
+            // 入力欄の既存の文章（判断層の文脈）を読む。日本語入力中の環境で、
+            // 依頼があり、反映待ちの時間が過ぎ、パスワード欄・昇格プロセス・
+            // ターミナルでないときだけ（判定が付くまでの Unknown でも読まない）。
+            let field_text_due = FIELD_TEXT_WANTED.load(std::sync::atomic::Ordering::Acquire)
+                && windows::Win32::System::SystemInformation::GetTickCount64()
+                    .saturating_sub(FIELD_TEXT_REQUESTED_AT.load(std::sync::atomic::Ordering::Relaxed))
+                    >= FIELD_TEXT_SETTLE_MS;
+            if field_text_due
+                && IS_ENABLED
+                && OUR_ACTIVE
+                && !terminal_now
+                && !is_pw
+                && !is_elevated_fg
+            {
+                FIELD_TEXT_WANTED.store(false, std::sync::atomic::Ordering::Release);
+                let text = uia_text_before_caret(&auto);
+                debug_log!("入力欄の文章: {} 文字", text.as_ref().map(|t| t.chars().count()).unwrap_or(0));
+                if let Ok(mut t) = FIELD_TEXT.lock() {
+                    *t = text;
+                }
+            }
+
             // コマンド候補モーダルを表示中、それを出した張本人のターミナル窓が
             // （Xボタン・Alt+F4・taskkill 等で）閉じられていないか確認する。
             // 閉じられていたら、次の打鍵を待たずにモーダルを閉じる（そうしないと
@@ -316,22 +412,31 @@ pub(crate) fn start_uia_poller() {
 
             // 入力欄の位置が必要なのは「変換中(OUR_ACTIVE)」か「候補/コマンドの
             // ポップアップ表示中」、または「コマンド行を打ち始めていて、
-            // これから初回表示しようとしている」とき。アイドル時に
-            // UIA(キャレット) や AttachConsole を毎回叩くと、対象アプリの
-            // カーソル点滅が乱れるため、不要時は休む。
+            // これから初回表示しようとしている」とき。不要時に
+            // UIA(キャレット) や AttachConsole を毎回叩くのは無駄なクロス
+            // プロセス呼び出しになるため休む。（以前は「対象アプリのカーソル
+            // 点滅が乱れる」ためと書いていたが、Windows Terminalでは影響が
+            // 無いことを実測済み（2026-10-18）。conhostのAttachConsoleは未検証。）
             // 最後の条件（打ち始め）が無いと、ポップアップがまだ一度も
             // 表示されていない最初の打鍵の時点では need_pos が立たず、
             // UIA_ANCHOR が空のまま初回表示だけフォールバック位置（画面/窓の
             // 最下部）になってしまう（次の打鍵で正しい位置へ飛んで見える
             // 原因だった）。COMMAND_LINE の空チェックだけなら軽量なミューテックス
-            // ロックのみでカーソル点滅への影響は無いため、アイドル時でも見て良い。
+            // ロックのみで対象アプリへの呼び出しは発生しないため、アイドル時でも見て良い。
             let command_line_pending = COMMAND_LINE.lock().map(|b| !b.is_empty()).unwrap_or(false);
             let need_pos = OUR_ACTIVE || candidate_window_visible() || command_line_pending;
             if !need_pos {
                 // 通常は250ms待つが、`focus_change_win_event_proc`が起床通知を
                 // 送ってきたら即座に戻ってパスワード欄/昇格プロセス判定を
                 // やり直す（`Unknown`のフェイルセーフ窓を最小化するため）。
-                let _ = wake_rx.recv_timeout(std::time::Duration::from_millis(250));
+                // 入力欄の文章の読み直し待ちなら、反映待ちの時間だけで戻る
+                // （英数モードでは読まないので、待ち続けて空回りしないよう対象外）
+                let idle_ms = if OUR_ACTIVE && FIELD_TEXT_WANTED.load(std::sync::atomic::Ordering::Relaxed) {
+                    FIELD_TEXT_SETTLE_MS + 20
+                } else {
+                    250
+                };
+                let _ = wake_rx.recv_timeout(std::time::Duration::from_millis(idle_ms));
                 continue;
             }
             // command_line_pending だけで need_pos になった（＝コマンド候補が
@@ -368,13 +473,14 @@ pub(crate) fn start_uia_poller() {
                 *c = pos;
             }
             // 位置が変わっていなければ安定カウンタを進め、しばらく安定して
-            // いたらポーリング間隔を落とす。UIA/AttachConsoleの呼び出し自体
-            // （このループの上のuia_focused_anchor/console_caret_screen_pos）
-            // は対象アプリのカーソル点滅を乱すことがコード上分かっている
-            // （106行目付近のコメント参照）ため、位置がまだ動く可能性が高い
+            // いたらポーリング間隔を落とす。位置がまだ動く可能性が高い
             // 打ち始め・移動直後は素早く追従しつつ、ポップアップの位置が
-            // 落ち着いている間はAttachConsole等の呼び出し頻度自体を下げて
-            // 点滅への影響を減らす。
+            // 落ち着いている間はUIA/AttachConsoleの呼び出し頻度を下げる。
+            // ※ 当初は「これらの呼び出しが対象アプリのカーソル点滅を乱す」
+            // 対策として入れたが、Windows Terminalでは30ms間隔でも点滅周期に
+            // 影響しないことを画素計測で確認済み（2026-10-18）。ターミナルで
+            // 点滅が不規則に見える現象は、Claude Code等のアプリ自身が作業中に
+            // 行う再描画が原因だった。
             if pos == last_pos {
                 stable_count = stable_count.saturating_add(1);
             } else {

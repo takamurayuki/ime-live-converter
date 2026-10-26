@@ -253,6 +253,158 @@ fn golden_regressions_must_all_pass() {
     );
 }
 
+/// 英単語の自動判定（`english_word_on_commit`）を実辞書・実際の打鍵経路
+/// （毎打鍵`update_predictions`）で確認する。
+/// - よく打つ英単語は「もしかして」に邪魔されず英字のまま確定できる
+/// - ゴールデンコーパスの日本語入力は1件も英字扱いにならない（誤爆の検査）
+#[test]
+fn english_word_detection_on_real_dictionary() {
+    let dict = load_shared_dictionary();
+    let typed_state = |input: &str| {
+        let mut state = build_state(&dict);
+        for ch in input.chars() {
+            state.add_char(ch);
+            state.update_predictions();
+        }
+        state
+    };
+    let mut missed = Vec::new();
+    for word in ["docker", "test", "python", "github", "react", "kubectl", "commit", "branch", "build", "debug"] {
+        let state = typed_state(word);
+        if state.english_word_on_commit().as_deref() != Some(word) {
+            missed.push(format!("{word}: 表示={} もしかして={}", state.conversion_result, state.prediction_top_is_fuzzy));
+        }
+    }
+    let mut false_positive = Vec::new();
+    for tsv in [REGRESSIONS_TSV, GENERAL_TSV, CORRECTIONS_TSV] {
+        for case in parse_corpus(tsv) {
+            if let Some(w) = typed_state(&case.input).english_word_on_commit() {
+                false_positive.push(format!("{} → {w}", case.input));
+            }
+        }
+    }
+    assert!(missed.is_empty() && false_positive.is_empty(), "取りこぼし: {missed:?}\n誤爆: {false_positive:?}");
+}
+
+/// 英単語の自動判定（判断層が英単語の候補を日本語の候補と比べる方式、
+/// `common::english`）。判断層が要るので `IME_JUDGE_LM` を指定したときだけ検査する
+/// （他の判断層つきの検査と同じ。未指定なら何もせず通る）。
+/// - `golden/english.tsv` の例文が期待どおり（英単語の混ざる文・日本語のままの文）
+/// - ゴールデンコーパスの日本語入力が、英単語の候補を足しても1件も変わらない（誤判定の検査）
+///
+/// 実行: `IME_JUDGE_LM=dictionaries/judge_lm.bin cargo test --release -p hook-dll english_detection_with_judge`
+#[test]
+fn english_detection_with_judge() {
+    if shared_judge().is_none() {
+        eprintln!("IME_JUDGE_LM が未指定のため英単語の自動判定の検査を省略");
+        return;
+    }
+    let dir = real_dictionary_path().parent().unwrap().to_path_buf();
+    let english = std::sync::Arc::new(common::english::EnglishLexicon::load_dir(&dir).expect("英単語の頻度表"));
+    let dict = load_shared_dictionary();
+    let run = |input: &str, with_english: bool| {
+        let mut state = build_state(&dict);
+        if with_english {
+            state.converter.as_mut().unwrap().set_english(Some(std::sync::Arc::clone(&english)));
+        }
+        run_case(&mut state, input)
+    };
+    let mut failures = Vec::new();
+    for case in parse_corpus(include_str!("golden/english.tsv")) {
+        let got = run(&case.input, true);
+        if got != case.expected {
+            failures.push(format!("{} → 「{got}」（期待「{}」）", case.input, case.expected));
+        }
+    }
+    // Shift で直接入力した大文字に続く入力は、その大文字で始まる英単語の続きとして読む
+    // （Docker = D ＋ ocker。D はアプリへ直接入るので、確定結果は続きの部分から）
+    // （G の後ろは用語リストの正しい表記 GitHub から取る）
+    for (capital, input, expected) in [('D', "ockerwotukau", "ockerを使う"), ('G', "ithubnipush", "itHubにpush")] {
+        let mut state = build_state(&dict);
+        state.converter.as_mut().unwrap().set_english(Some(std::sync::Arc::clone(&english)));
+        state.note_direct_capital(capital);
+        let got = run_case(&mut state, input);
+        if got != expected {
+            failures.push(format!("{capital}+{input} → 「{got}」（期待「{expected}」）"));
+        }
+    }
+    // 文頭（入力欄の直前の文章が空・。で終わる）から英単語だけを打ったら頭文字を大文字に。
+    // 日本語が混ざる入力・用語リストの語・文の途中はそのまま
+    for (before, input, expected) in [
+        ("", "hello", "Hello"),
+        ("終わりました。", "hello", "Hello"),
+        ("今日は", "hello", "hello"),
+        ("", "meetinghaowari", "meetingは終わり"),
+        ("", "kubectl", "kubectl"),
+    ] {
+        let mut state = build_state(&dict);
+        state.converter.as_mut().unwrap().set_english(Some(std::sync::Arc::clone(&english)));
+        state.offer_field_text(before.to_string());
+        let got = run_case(&mut state, input);
+        if got != expected {
+            failures.push(format!("「{before}」の後に {input} → 「{got}」（期待「{expected}」）"));
+        }
+    }
+    for tsv in [REGRESSIONS_TSV, GENERAL_TSV, CORRECTIONS_TSV, COLLOCATIONS_TSV] {
+        for case in parse_corpus(tsv) {
+            let (with, without) = (run(&case.input, true), run(&case.input, false));
+            if with != without {
+                failures.push(format!("誤判定 {} → 「{with}」（英単語なしなら「{without}」）", case.input));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}件:\n{}", failures.len(), failures.join("\n"));
+}
+
+/// 実機で記録した誤変換レポート（`common::report`）のトリアージ。
+/// レポートの各読みを今のエンジン（学習なし、regressions と同じ条件）で
+/// 変換し直し、まだ誤変換するかを表示する。正しい表記が分かっている
+/// ものは regressions.tsv にそのまま貼れる行も出す。
+///
+/// 実行: `cargo test -p hook-dll triage_misconversion_reports -- --ignored --nocapture`
+/// 既定は `%LOCALAPPDATA%\IMELiveConverter\misconversion_reports.tsv`。
+/// `IME_REPORT_FILE=<path>` で別のファイルを指定できる。
+#[test]
+#[ignore = "実機のレポートファイルを読む手動トリアージ用"]
+fn triage_misconversion_reports() {
+    let path = std::env::var_os("IME_REPORT_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| common::paths::data_file(common::report::REPORT_FILE));
+    let tsv = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("レポートを読めません（{}）: {e}", path.display()));
+    let dict = load_shared_dictionary();
+    let mut seen = std::collections::HashSet::new();
+    let mut paste = Vec::new();
+    println!("状態\tローマ字\t誤\t正\t今の変換");
+    // 新しい報告ほど正しい表記の情報が新しいので、後ろから見て読みごとに1件にする
+    for r in common::report::parse_reports(&tsv).into_iter().rev() {
+        if !seen.insert(r.romaji.clone()) {
+            continue;
+        }
+        let mut state = build_state(&dict);
+        let now = run_case(&mut state, &r.romaji);
+        let status = if !r.corrected.is_empty() && now == r.corrected {
+            "直った"
+        } else if now == r.wrong {
+            "未解決"
+        } else if r.corrected.is_empty() {
+            "変化(要確認)"
+        } else {
+            "別の誤り"
+        };
+        println!("{status}\t{}\t{}\t{}\t{now}", r.romaji, r.wrong, r.corrected);
+        if !r.corrected.is_empty() {
+            paste.push(format!("# 実機レポート({}): {} → {}\n{}\t{}", r.kind, r.wrong, r.corrected, r.romaji, r.corrected));
+        }
+    }
+    if !paste.is_empty() {
+        println!("\n--- regressions.tsv 用（直ってから追加すること） ---");
+        for p in paste {
+            println!("{p}");
+        }
+    }
+}
+
 #[test]
 fn golden_general_accuracy_meets_baseline() {
     let dict = load_shared_dictionary();

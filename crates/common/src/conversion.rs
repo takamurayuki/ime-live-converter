@@ -171,6 +171,16 @@ pub fn judge_enabled() -> bool {
     std::env::var("IME_JUDGE").map(|v| v != "0").unwrap_or(true)
 }
 
+/// 英単語の自動判定を使うか。環境変数 `IME_ENGLISH=0` で無効化できる
+/// （無効なら従来の「ローマ字にならない打鍵だけ英字のまま確定」に戻る）。
+pub fn english_enabled() -> bool {
+    std::env::var("IME_ENGLISH").map(|v| v != "0").unwrap_or(true)
+}
+
+/// 誤変換の修正として覚える読みの最大文字数。長い文全体の読みは同じ形で
+/// 再び打たれることがまず無く、学習DBを無駄に膨らませるだけなので覚えない。
+const MISCONVERSION_FIX_MAX_READING: usize = 24;
+
 /// `commit_prediction` で予測（誤字修正・履歴補完）を確定した1回分の学習データ。
 /// フックの外へ遅延させて処理できるよう、DB/コンバータへの参照を持たない
 /// 素のデータとして保持する。
@@ -216,6 +226,9 @@ pub struct LiveConversionState {
     /// 辞書の語の単位（読み・表記・品詞）で記録するために使う。カタカナ・ひらがなの
     /// まま等、辞書の語に対応しない候補は空。先頭（index 0）は表示中の変換。
     pub cand_seg_entries: Vec<Vec<crate::WordEntry>>,
+    /// 候補一覧を開く直前に表示していた変換（合成全体）。候補1と一致しない
+    /// ことがあるため別に控え、候補で直したかの判定（`candidate_fix`）に使う。
+    pub cand_shown: String,
     /// 対象文節より前（確定扱いにしない、変えない部分）の変換済み表記
     pub cand_prefix_surface: String,
     /// 対象文節より前の読み（学習時に前半を再分解するために保持）
@@ -252,6 +265,11 @@ pub struct LiveConversionState {
     /// CLI・ゴールデンテストでは`defer_learning`自体を`false`のまま使うため
     /// （`new()`の既定値）、この関数ポインタが参照されることはない。
     pub request_deferred_learning: Option<fn() -> bool>,
+    /// 候補一覧で誤変換を直して確定したときに (読み, 誤った表記, 正しい表記)
+    /// を知らせるコールバック。hook-dll が誤変換レポートへ書き出すために使う
+    /// （`request_deferred_learning`と同じく Win32 側の手段を注入する）。
+    /// 呼ばれるのはフック内なので、受け側は I/O をせずにすぐ戻ること。
+    pub correction_reporter: Option<fn(&str, &str, &str)>,
     /// 遅延させた学習の文節列（確定1回分ごと）
     pub pending_learning: Vec<Vec<(String, String, String)>>,
     /// 遅延させた予測確定（`commit_prediction`）1回分ごとの学習データ。
@@ -304,6 +322,30 @@ pub struct LiveConversionState {
     /// `commit_ring`自体は書き換えず、ここに候補一覧だけを用意する
     /// （選んで確定するまでは何も変更しない。誤発火してもEscで無傷）。
     pub restore_selection: Option<RestoreSelection>,
+    /// 次の変換の始まりに共起の文脈へ入れる、入力欄の既存の文章（`offer_field_text`）
+    pending_field_text: Option<String>,
+    /// この入力で実際に打った文字（F10・英単語の自動判定で打鍵どおりに戻す用。
+    /// Backspace 後などかなと食い違ったら `raw_letters` が読みから組み立て直す）
+    raw_input: String,
+    /// `hiragana_buffer` の各文字と、それを作った打鍵（英単語の自動判定用、
+    /// `romaji_pieces`）。「きょ」のように2文字以上のかなになった打鍵は先頭の
+    /// 文字に打鍵を、続く文字に空文字列を持つ。かなと食い違ったら使わない。
+    kana_raw: Vec<(char, String)>,
+    /// Shift で直接入力した大文字（`note_direct_capital`）。次の入力が始まったら
+    /// `composition_capital` へ移す。確定・取消・カーソル移動等で捨てる。
+    direct_capitals: String,
+    /// 今の入力の直前に直接入力した大文字（Docker の D）。英単語の自動判定で、
+    /// 入力の先頭をその語の続き（ocker）として読むのに使う。
+    composition_capital: String,
+    /// カーソルの直前が文の区切り（入力欄の先頭・。！？・改行の直後）か。`None` は
+    /// 分からない（カーソル移動・クリック後に入力欄の文章をまだ読めていない）。
+    /// 英単語の自動判定で、文頭の英単語の頭文字を大文字にするのに使う。
+    at_sentence_start: Option<bool>,
+    /// 今の入力が文頭から始まったか（入力の始まりの `at_sentence_start`）
+    composition_at_sentence_start: bool,
+    /// `commit_ring` に積んだ回数（`commit_with_punctuation` が、直前の確定が
+    /// リングに積まれたかを知るため）
+    commit_ring_pushes: u64,
 }
 
 /// `commit_ring`の1エントリ（確定1回分）。
@@ -507,11 +549,13 @@ impl LiveConversionState {
             cand_prefix_reading: String::new(),
             cand_suffix_surface: String::new(),
             cand_suffix_reading: String::new(),
+            cand_shown: String::new(),
             committed_segments: Vec::new(),
             recent_context: String::new(),
             bracket_context: String::new(),
             defer_learning: false,
             request_deferred_learning: None,
+            correction_reporter: None,
             pending_learning: Vec::new(),
             pending_prediction_learning: Vec::new(),
             pending_demotions: Vec::new(),
@@ -527,7 +571,23 @@ impl LiveConversionState {
             enabled: true,
             commit_ring: std::collections::VecDeque::new(),
             restore_selection: None,
+            pending_field_text: None,
+            raw_input: String::new(),
+            kana_raw: Vec::new(),
+            direct_capitals: String::new(),
+            composition_capital: String::new(),
+            at_sentence_start: None,
+            composition_at_sentence_start: false,
+            commit_ring_pushes: 0,
         }
+    }
+
+    /// 入力欄に既にある文章（カーソルより前）を渡す。次の変換を始めた瞬間に
+    /// 判断層の共起の文脈へ入る（`ViterbiConverter::note_field_text`）。
+    /// 文章の取得（UIA）はフック外のスレッドで行い、ここには結果だけを渡す。
+    pub fn offer_field_text(&mut self, text: String) {
+        self.at_sentence_start = Some(ends_sentence(&text));
+        self.pending_field_text = Some(text);
     }
 
     /// バックグラウンドで読み込み終わった判断層があれば変換エンジンに取り付ける
@@ -549,6 +609,31 @@ impl LiveConversionState {
         }
     }
 
+    /// Shift＋英字で大文字をアプリへ直接入力した（かな変換しない）ことを知らせる。
+    /// 呼び出し側は、その前に入力中の内容を確定し `invalidate_commit_ring` を
+    /// 呼んでおくこと（この大文字は確定とは別の経路で入るため）。続けて打つ
+    /// 小文字の入力の先頭は、この大文字で始まる英単語の続きとして読まれうる
+    /// （Docker = D ＋ ocker）。
+    pub fn note_direct_capital(&mut self, c: char) {
+        self.direct_capitals.push(c);
+    }
+
+    /// 直接入力した大文字の記録を捨てる（英字以外のキーを挟んだとき。呼び出し側が判断する）
+    pub fn forget_direct_capitals(&mut self) {
+        self.direct_capitals.clear();
+    }
+
+    /// 入力中でないときに改行（Enter）をアプリへ素通しした。次の入力は文頭から始まる
+    pub fn note_line_break(&mut self) {
+        self.at_sentence_start = Some(true);
+    }
+
+    /// 入力中でないときに、確定を経由しない文字（数字・記号等）をアプリへ素通しした。
+    /// 次の入力が文頭かは分からなくなる
+    pub fn forget_sentence_start(&mut self) {
+        self.at_sentence_start = None;
+    }
+
     /// 確定後の復元用リングバッファを無効化する（丸ごと破棄）。
     ///
     /// フォーカス変更・マウスクリック・方向キー/Home/End/Page/Delete/
@@ -558,6 +643,10 @@ impl LiveConversionState {
     /// 再変換すると無関係な文章を破壊するため、該当するかどうか迷ったら
     /// 呼ぶ（保守的に倒す）。
     pub fn invalidate_commit_ring(&mut self) {
+        self.direct_capitals.clear();
+        // キャレットが動いた・確定以外の文字が入った可能性があるので、文頭かは
+        // 入力欄の文章を読み直すまで分からない
+        self.at_sentence_start = None;
         self.commit_ring.clear();
         self.restore_selection = None;
         // 同じ理由（カーソル位置や入力先が変わった）で、共起の文脈にしている
@@ -620,10 +709,19 @@ impl LiveConversionState {
     pub fn confirm_restore(&mut self) -> Option<ConversionAction> {
         let sel = self.restore_selection.take()?;
         let new_surface = sel.candidates.get(sel.selected)?.clone();
+        let mut fix = None;
         if let Some(entry) = self.commit_ring.back_mut() {
+            fix = Some((entry.reading.clone(), entry.surface.clone()));
             entry.surface = new_surface.clone();
             entry.char_count = new_surface.chars().count();
         }
+        // 確定後に選び直した＝元の確定は誤変換。次に同じ読みを打って同じ
+        // 誤変換が出たら「もしかして」で正しい表記を出せるよう覚える
+        // （レポートへの書き出しは hook 側の`report_restore_choice`が行う）。
+        if let Some((reading, wrong)) = fix {
+            self.learn_misconversion_fix(&reading, &wrong, &new_surface);
+        }
+        self.at_sentence_start = Some(ends_sentence(&new_surface));
         Some(ConversionAction {
             delete_count: sel.char_count,
             insert_text: new_surface,
@@ -1255,9 +1353,12 @@ impl LiveConversionState {
             self.recent_context = chars[chars.len() - 60..].iter().collect();
         }
         self.push_bracket_context(&surface);
+        self.at_sentence_start = Some(ends_sentence(&surface));
         self.last_committed = surface;
         self.romaji_buffer.clear();
         self.hiragana_buffer.clear();
+        self.raw_input.clear();
+        self.direct_capitals.clear();
         self.conversion_result.clear();
         self.last_sent_length = 0;
         self.committed_segments.clear();
@@ -1354,6 +1455,7 @@ impl LiveConversionState {
         self.cand_seg_reading.clear();
         self.cand_seg_surfaces.clear();
         self.cand_seg_entries.clear();
+        self.cand_shown.clear();
         self.cand_prefix_surface.clear();
         self.cand_prefix_reading.clear();
         self.cand_suffix_surface.clear();
@@ -1611,6 +1713,21 @@ impl LiveConversionState {
                             debug_log!("コロケーションシードの読み込みをスキップ: {}", e);
                         }
                     }
+                    // 英単語の自動判定（`crate::english`）。判断層があるときだけ使われる。
+                    // 無効化は環境変数 IME_ENGLISH=0 か english_words.tsv を消す。
+                    if english_enabled() {
+                        if let Some(dir) = path.parent() {
+                            match crate::english::EnglishLexicon::load_dir(dir) {
+                                Ok(lex) => {
+                                    debug_log!("英単語の頻度表を読み込みました: {}語", lex.len());
+                                    conv.set_english(Some(std::sync::Arc::new(lex)));
+                                }
+                                Err(e) => {
+                                    debug_log!("英単語の頻度表の読み込みをスキップ: {}", e);
+                                }
+                            }
+                        }
+                    }
                 }
                 // 判断層（judge-lm、[[jev-style-judge-direction]]）。辞書と同じ
                 // ディレクトリの judge_lm.bin があれば読み込む。無効化は
@@ -1695,6 +1812,22 @@ impl LiveConversionState {
         self.clear_candidates();
         self.generation = self.generation.wrapping_add(1);
 
+        // 新しい変換の始まりに、入力欄の既存の文章を共起の文脈へ入れる
+        if !self.is_composing() {
+            if let (Some(text), Some(conv)) = (self.pending_field_text.take(), self.converter.as_mut()) {
+                conv.note_field_text(&text);
+            }
+        }
+
+        if !self.is_composing() {
+            self.raw_input.clear();
+            self.kana_raw.clear();
+            self.composition_capital = std::mem::take(&mut self.direct_capitals);
+            // 直接入力した大文字の続きなら、その大文字が文頭の文字
+            self.composition_at_sentence_start =
+                self.at_sentence_start == Some(true) && self.composition_capital.is_empty();
+        }
+        self.raw_input.push(ch);
         self.romaji_buffer.push(ch);
         debug_log!("入力: '{}' → ローマ字バッファ: '{}'", ch, self.romaji_buffer);
 
@@ -1706,6 +1839,7 @@ impl LiveConversionState {
             // 閉じ括弧 `]`（→」）は、直前の未対応の開き括弧の種類に合わせる
             // （『 を選んでいれば 』、【 なら 】。開き括弧が無ければ 」のまま）
             let settled = self.match_closing_brackets(&settled);
+            self.record_kana_raw(&settled);
             self.hiragana_buffer.push_str(&settled);
             self.romaji_buffer = pending;
         }
@@ -1770,6 +1904,49 @@ impl LiveConversionState {
         Some(CorrectionDemotion { words, bigrams })
     }
 
+    /// 候補一覧で一覧を開く前の表示と違う候補を選んでいれば、合成全体の
+    /// (読み, 表示されていた誤変換, 選んだ正しい表記) を返す。→ で部分確定
+    /// した文節がある・Esc でかなに戻した末尾がある・ローマ字が残っている
+    /// 場合は、読みと表記の対応が合成全体と一致しないので対象外。
+    /// 末尾の未確定 'n' は確定時に「ん」になるので両方の表記に足す。
+    fn candidate_fix(&self) -> Option<(String, String, String)> {
+        if self.candidates.is_empty()
+            || self.cand_shown.is_empty()
+            || !self.committed_segments.is_empty()
+            || self.kana_tail_len != 0
+            || !(self.romaji_buffer.is_empty() || self.romaji_buffer == "n")
+        {
+            return None;
+        }
+        let tail = if self.romaji_buffer == "n" { "ん" } else { "" };
+        let wrong = format!("{}{tail}", self.cand_shown);
+        let correct = format!("{}{tail}", self.candidates.get(self.candidate_index)?);
+        Some((format!("{}{tail}", self.hiragana_buffer), wrong, correct))
+    }
+
+    /// 誤変換→正しい表記の組を、同じ読みに対する「学習済みの修正」として
+    /// 覚える（`typo_correction`の誤字の読み＝正しい読みとして記録する）。
+    /// 次回その読み全体を打って表示が `wrong` のままなら、
+    /// `LearnedTypoCorrector` が「もしかして: 正しい表記」を出す。
+    /// 表示を勝手に書き換えるのではなく提示に留めるので、同じ読みを文脈に
+    /// よって書き分ける語（記者/汽車）でも害が無い。覚えたら true。
+    fn learn_misconversion_fix(&mut self, reading: &str, wrong: &str, correct: &str) -> bool {
+        if reading.is_empty()
+            || wrong == correct
+            || reading.chars().count() > MISCONVERSION_FIX_MAX_READING
+            || !is_learnable_pair(reading, correct)
+        {
+            return false;
+        }
+        debug_log!("誤変換の修正を記録: '{}' {} → {}", reading, wrong, correct);
+        self.learn_prediction_or_defer(PredictionLearning {
+            unigram: None,
+            bigram: None,
+            typo_correction: Some((reading.to_string(), reading.to_string(), correct.to_string())),
+        });
+        true
+    }
+
     /// `apply_demotion` を、遅延が有効ならフックの外で、そうでなければその場で行う
     fn demote_or_defer(&mut self, demotion: CorrectionDemotion) {
         if self.defer_learning {
@@ -1812,6 +1989,31 @@ impl LiveConversionState {
     }
 
     fn learn_segments_or_defer(&mut self, segments: &[(String, String, String)]) {
+        // 続けた英単語の間の空白（`space_between_english_words`）は表示のためのもの。
+        // 学習は語そのもの（request）で覚える（空白つきだと次の変換の英単語の
+        // 候補と一致せず効かない）。直接入力した大文字の続き（Docker の ocker）は
+        // 語の一部でしかないので学習しない
+        let normalized: Vec<(String, String, String)>;
+        let english = self.converter.as_ref().and_then(|c| c.english.clone());
+        let segments = if segments.iter().any(|(_, _, p)| crate::english::is_english_pos(p)) {
+            normalized = segments
+                .iter()
+                .filter(|(_, _, p)| p != crate::english::ENGLISH_CONTINUATION_POS)
+                .map(|(r, s, p)| {
+                    // 文頭の大文字化（Thank）も表示のためのもの。英単語の候補と同じ表記
+                    // （`display_form`: 小文字か、用語リストの正しい表記）で覚える
+                    let s = match (p == crate::english::ENGLISH_POS, english.as_ref()) {
+                        (true, Some(en)) => en.display_form(&s.trim_start().to_ascii_lowercase()),
+                        (true, None) => s.trim_start().to_string(),
+                        _ => s.clone(),
+                    };
+                    (r.clone(), s, p.clone())
+                })
+                .collect();
+            &normalized[..]
+        } else {
+            segments
+        };
         if self.defer_learning {
             self.pending_learning.push(segments.to_vec());
             let notified = self.request_deferred_learning.map(|f| f()).unwrap_or(false);
@@ -1926,6 +2128,7 @@ impl LiveConversionState {
             let total = self.hiragana_buffer.chars().count();
             let keep = total.saturating_sub(last_len);
             self.hiragana_buffer = self.hiragana_buffer.chars().take(keep).collect();
+            self.truncate_kana_raw(keep);
         } else {
             return None; // 削除するものがない
         }
@@ -1939,10 +2142,28 @@ impl LiveConversionState {
     /// `pinned` を反映。`reading` の先頭と一致しない固定文節は無視される）。
     /// 表示・候補一覧・Backspace・学習のすべてがこの分解を共有する。
     pub fn convert_buffer(&self, reading: &str) -> Vec<crate::WordEntry> {
-        match self.converter.as_ref() {
-            Some(c) => c.convert_context_aware_pinned(reading, &self.pinned),
-            None => Vec::new(),
+        let Some(c) = self.converter.as_ref() else {
+            return Vec::new();
+        };
+        let mut entries = c.convert_context_aware_pinned(reading, &self.pinned);
+        // 文頭から打った入力が英単語だけなら、英語の文として先頭の頭文字を大文字にする
+        // （thank you → Thank you。「meetingは」のように日本語が混ざる入力や、
+        // 用語リストの語（kubectl・GitHub）はそのまま）。読み全体を変換するときだけ
+        if self.composition_at_sentence_start
+            && reading == self.hiragana_buffer
+            && !entries.is_empty()
+            && entries.iter().all(|e| e.pos == crate::english::ENGLISH_POS)
+        {
+            if let Some(english) = c.english.as_ref() {
+                if english.capitalize_at_sentence_start(&entries[0].surface) {
+                    let first = &mut entries[0].surface;
+                    if let Some(f) = first.get(..1) {
+                        *first = format!("{}{}", f.to_ascii_uppercase(), &first[1..]);
+                    }
+                }
+            }
         }
+        entries
     }
 
     /// 固定した先頭文節を、現在の読みバッファの先頭と一致する範囲に切り詰める
@@ -1978,6 +2199,10 @@ impl LiveConversionState {
     /// 視覚的に「後の入力が前を上書きする」ように見える原因だった。
     pub fn update_conversion(&mut self) -> Option<ConversionAction> {
         self.attach_pending_judge();
+        let pieces = self.romaji_pieces();
+        if let Some(conv) = self.converter.as_mut() {
+            conv.set_romaji_hint(pieces, &self.composition_capital);
+        }
         // ひらがなバッファのみを漢字変換
         // ローマ字バッファはそのまま末尾に追加
         let converted_hiragana = if self.converter.is_none() {
@@ -2074,6 +2299,7 @@ impl LiveConversionState {
             if candidates.len() < 2 {
                 return None; // 切り替える候補がない
             }
+            self.cand_shown = self.conversion_result.clone();
             self.candidates = candidates;
             self.cand_seg_reading = seg_reading;
             self.cand_seg_surfaces = seg_surfaces;
@@ -2452,6 +2678,32 @@ impl LiveConversionState {
                 words: ws,
             });
         }
+        // 打鍵どおりの英字も候補に含める（英単語の自動判定が日本語を選んだが
+        // 英単語にしたい／その逆の、どちらも一覧で選び直せるように）
+        if let (Some(english), Some(raw)) = (
+            converter.english.as_ref().filter(|_| converter.judge.is_some()),
+            self.raw_letters_between(prefix_reading.chars().count(), prefix_reading.chars().count() + seg_reading.chars().count()),
+        ) {
+            if !segs.iter().any(|s| s.surface.trim_start() == raw) {
+                let raw = english.display_form(&raw.to_ascii_lowercase());
+                let span = crate::english::EnglishSpan {
+                    start: 0,
+                    end: 0,
+                    logp: english.score(&raw),
+                    word: raw.clone(),
+                    continuation: false,
+                };
+                let [w, _] = crate::english::english_entries(&span, &seg_reading);
+                let (eff_cost, judge_score) = score_words(std::slice::from_ref(&w), 0);
+                // 直前の文節も英単語なら間に空白を入れる（`space_between_english_words` と同じ）
+                let surface = if prev_entry.is_some_and(crate::english::is_english_entry) {
+                    format!(" {raw}")
+                } else {
+                    raw
+                };
+                segs.push(Seg { surface, eff_cost, judge_score, words: vec![w] });
+            }
+        }
         // カタカナ・ひらがな表記も候補に含める（末尾寄り）
         let katakana = crate::hiragana_to_katakana(&seg_reading);
         if katakana != seg_reading {
@@ -2603,6 +2855,11 @@ impl LiveConversionState {
             .to_string();
         self.last_sent_length = self.conversion_result.chars().count();
         self.hiragana_buffer = self.hiragana_buffer.chars().skip(reading_len).collect();
+        if self.kana_raw.get(reading_len).map_or(false, |(_, raw)| raw.is_empty()) {
+            self.kana_raw.clear();
+        } else {
+            self.kana_raw.drain(..reading_len.min(self.kana_raw.len()));
+        }
         self.pinned.clear();
         self.clear_candidates();
 
@@ -2622,6 +2879,38 @@ impl LiveConversionState {
         actions
     }
 
+    /// 句読点（, . ? !）を打った: 今の入力を表示のまま確定し、その後ろに句読点
+    /// （、。？！）を足す。句読点を読みに入れて変換し直すと、表示されていた正しい
+    /// 変換が句読点を打った瞬間に別の変換へ変わることがある（判断層は文全体で
+    /// 選び直すため）。句読点は変換に影響させず、見えていたものをそのまま確定する。
+    /// 入力中でなければ `None`（呼び出し側は従来どおり句読点だけを入力・確定する）。
+    pub fn commit_with_punctuation(&mut self, ch: char) -> Option<Vec<ConversionAction>> {
+        if !self.enabled || !self.is_composing() {
+            return None;
+        }
+        let pushes = self.commit_ring_pushes;
+        let mut actions: Vec<ConversionAction> = self.commit().into_iter().collect();
+        let punct = self.romaji.convert(&ch.to_string());
+        let punct = self.match_closing_brackets(&punct);
+        // 確定後の復元は「直前の確定がカーソルの直前にある」前提なので、句読点も
+        // 直前の確定の一部として積み直す（句読点込みで選び直せる、従来と同じ形）
+        if self.commit_ring_pushes != pushes {
+            if let Some(entry) = self.commit_ring.back_mut() {
+                entry.reading.push_str(&punct);
+                entry.surface.push_str(&punct);
+                entry.char_count += punct.chars().count();
+                for c in entry.candidates.iter_mut() {
+                    c.push_str(&punct);
+                }
+            }
+        }
+        self.recent_context.push_str(&punct);
+        self.push_bracket_context(&punct);
+        self.at_sentence_start = Some(ends_sentence(&punct));
+        actions.push(ConversionAction { delete_count: 0, insert_text: punct });
+        Some(actions)
+    }
+
     /// 確定（Enter・句読点）
     ///
     /// 未確定のローマ字 'n' が残っていれば「ん」として取り込んでから確定する。
@@ -2630,10 +2919,14 @@ impl LiveConversionState {
             return None;
         }
 
+        // 候補一覧で誤変換を直したか（下の「ん」補完・バッファのクリアより前に控える）
+        let fix = self.candidate_fix();
+
         // 末尾の未確定 'n' を「ん」に変換して表示を更新
         let action = if self.romaji_buffer == "n" {
             self.romaji_buffer.clear();
             self.hiragana_buffer.push('ん');
+            self.kana_raw.push(('ん', "n".to_string()));
             if !self.candidates.is_empty() {
                 // 候補選択中なら選択を維持したまま「ん」を足す
                 let new_result = format!("{}ん", self.candidates[self.candidate_index]);
@@ -2641,6 +2934,21 @@ impl LiveConversionState {
             } else {
                 self.update_conversion()
             }
+        } else if self.english_detection_active()
+            && !self.romaji_buffer.is_empty()
+            && self.candidates.is_empty()
+            && self.kana_tail_len == 0
+            && self.pending_letters_end_english_word()
+        {
+            // かなにならないまま残った打鍵（test の st、docker の r）も読みに入れて
+            // 変換し直す。英単語の候補（`crate::english`）が打鍵全体を英単語として
+            // 拾えるようにするため（表示は英字のままなので見た目は変わらない）。
+            let pending = std::mem::take(&mut self.romaji_buffer);
+            for c in pending.chars().map(|c| c.to_ascii_lowercase()) {
+                self.hiragana_buffer.push(c);
+                self.kana_raw.push((c, c.to_string()));
+            }
+            self.update_conversion()
         } else {
             None
         };
@@ -2654,6 +2962,13 @@ impl LiveConversionState {
         // 確定のたびに強まって居座るのを防ぐ）
         if let Some(demotion) = self.correction_demotion() {
             self.demote_or_defer(demotion);
+        }
+        if let Some((reading, wrong, correct)) = fix {
+            if self.learn_misconversion_fix(&reading, &wrong, &correct) {
+                if let Some(report) = self.correction_reporter {
+                    report(&reading, &wrong, &correct);
+                }
+            }
         }
         let mut segments = std::mem::take(&mut self.committed_segments);
         segments.extend(self.segment_remaining());
@@ -2710,6 +3025,7 @@ impl LiveConversionState {
             if self.commit_ring.len() >= COMMIT_RING_CAPACITY {
                 self.commit_ring.pop_front();
             }
+            self.commit_ring_pushes += 1;
             self.commit_ring.push_back(CommittedEntry {
                 char_count: committed.chars().count(),
                 reading,
@@ -2723,9 +3039,13 @@ impl LiveConversionState {
             self.last_committed = s.clone();
         }
 
+        // 確定した表示の末尾で、次の入力が文頭かが決まる
+        self.at_sentence_start = Some(ends_sentence(&self.conversion_result));
         // バッファをクリア（表示済みテキストはそのまま確定扱い）
         self.romaji_buffer.clear();
         self.hiragana_buffer.clear();
+        self.raw_input.clear();
+        self.direct_capitals.clear();
         self.conversion_result.clear();
         self.last_sent_length = 0;
         self.committed_segments.clear();
@@ -2749,6 +3069,8 @@ impl LiveConversionState {
 
         self.romaji_buffer.clear();
         self.hiragana_buffer.clear();
+        self.raw_input.clear();
+        self.direct_capitals.clear();
         self.conversion_result.clear();
         self.last_sent_length = 0;
         self.committed_segments.clear();
@@ -2770,6 +3092,253 @@ impl LiveConversionState {
     /// 変換が進行中かどうか
     pub fn is_composing(&self) -> bool {
         !self.romaji_buffer.is_empty() || !self.hiragana_buffer.is_empty()
+    }
+
+    /// 確定したかな `settled`（`romaji_buffer` の先頭側から作られた分）を、
+    /// 作った打鍵と組にして `kana_raw` に積む
+    fn record_kana_raw(&mut self, settled: &str) {
+        let buf: Vec<char> = self.romaji_buffer.chars().collect();
+        let mut settled_chars = settled.chars();
+        let mut at = 0;
+        for (n, kana) in self.romaji.convert_aligned(&self.romaji_buffer) {
+            let raw: String = buf[at..(at + n).min(buf.len())].iter().collect();
+            at += n;
+            for (k, _) in kana.chars().enumerate() {
+                // 閉じ括弧は `match_closing_brackets` で種類が変わりうるので、
+                // 文字は確定したかなの側を使う
+                let Some(c) = settled_chars.next() else { return };
+                self.kana_raw.push((c, if k == 0 { raw.clone() } else { String::new() }));
+            }
+        }
+    }
+
+    /// `kana_raw` を先頭 `keep` 文字に切り詰める。打鍵1回分のかな（「きょ」）の
+    /// 途中で切れたら打鍵との対応が崩れるので捨てる。
+    fn truncate_kana_raw(&mut self, keep: usize) {
+        let cut_inside = self.kana_raw.get(keep).map_or(false, |(_, raw)| raw.is_empty());
+        if cut_inside {
+            self.kana_raw.clear();
+        } else {
+            self.kana_raw.truncate(keep);
+        }
+    }
+
+    /// 今の読み（`hiragana_buffer`）を、それを作った打鍵の片の列にする
+    /// （英単語の自動判定用）。打鍵の記録がかなと食い違っていれば `None`。
+    fn romaji_pieces(&self) -> Option<Vec<crate::english::RomajiPiece>> {
+        if !self.committed_segments.is_empty() {
+            return None;
+        }
+        romaji_pieces_of(&self.kana_raw, &self.hiragana_buffer)
+    }
+
+    /// 読みの文字位置 [start, end) を作った打鍵の英字（候補一覧の英字の候補用）。
+    /// 範囲の端が打鍵の切れ目でない・英字以外を含む・3文字未満なら `None`。
+    fn raw_letters_between(&self, start: usize, end: usize) -> Option<String> {
+        let pieces = self.romaji_pieces()?;
+        let (mut pos, mut raw, mut inside) = (0usize, String::new(), false);
+        for p in &pieces {
+            if pos == start {
+                inside = true;
+            }
+            if pos == end {
+                break;
+            }
+            if inside {
+                raw.push_str(&p.raw);
+            }
+            pos += p.kana.chars().count();
+        }
+        (inside && pos == end && raw.len() >= 3 && raw.chars().all(|c| c.is_ascii_alphabetic())).then_some(raw)
+    }
+
+    /// かなにならないまま残った打鍵（`romaji_buffer`）を読みに入れて変換したとき、
+    /// 末尾が英単語になるか（test の st）。ならなければ確定時に読みへ入れない
+    /// （入れると英単語にならないのに日本語側の変換だけが変わる: seisakuk で
+    /// 「制作k」が「政策k」になった）。
+    fn pending_letters_end_english_word(&mut self) -> bool {
+        if !self.committed_segments.is_empty() {
+            return false;
+        }
+        let pending: Vec<char> = self.romaji_buffer.chars().map(|c| c.to_ascii_lowercase()).collect();
+        let reading: String = self.hiragana_buffer.chars().chain(pending.iter().copied()).collect();
+        let mut kana_raw = self.kana_raw.clone();
+        kana_raw.extend(pending.iter().map(|&c| (c, c.to_string())));
+        let pieces = romaji_pieces_of(&kana_raw, &reading);
+        let Some(conv) = self.converter.as_mut() else { return false };
+        conv.set_romaji_hint(pieces, &self.composition_capital);
+        let entries = conv.convert_context_aware_pinned(&reading, &self.pinned);
+        // 次の変換のために今の読みの打鍵へ戻しておく
+        let pieces = self.romaji_pieces();
+        if let Some(conv) = self.converter.as_mut() {
+            conv.set_romaji_hint(pieces, &self.composition_capital);
+        }
+        entries.last().is_some_and(crate::english::is_english_entry)
+    }
+
+    /// 英単語の自動判定（判断層が英単語の候補を比べる方式）が使えるか
+    fn english_detection_active(&self) -> bool {
+        self.converter.as_ref().map_or(false, |c| c.judge.is_some() && c.english.is_some())
+    }
+
+    /// 今の入力を、実際に打った英字のまま取り出す（F10・英単語の自動判定用）。
+    /// → で部分確定した後や入力中でないときは `None`。
+    ///
+    /// 打鍵の記録（`raw_input`）を1文字ずつ打ち直して今のかな＋保留ローマ字に
+    /// 一致すれば、それをそのまま使う（si/shi・ca/ka 等の綴りを保つため）。
+    /// Backspace 等で一致しなくなっていたら、読みからローマ字を組み立て直す。
+    pub fn raw_letters(&self) -> Option<String> {
+        if !self.committed_segments.is_empty() || !self.is_composing() {
+            return None;
+        }
+        if !self.raw_input.is_empty() {
+            let mut settled = String::new();
+            let mut buf = String::new();
+            for ch in self.raw_input.chars() {
+                buf.push(ch);
+                let (s, p) = self.romaji.split(&buf);
+                if !s.is_empty() {
+                    settled.push_str(&s);
+                    buf = p;
+                }
+            }
+            if settled == self.hiragana_buffer && buf == self.romaji_buffer {
+                return Some(self.raw_input.clone());
+            }
+        }
+        Some(format!("{}{}", crate::report::kana_to_romaji(&self.hiragana_buffer), self.romaji_buffer))
+    }
+
+    /// F6〜F10（MS-IME と同じ割り当て）で今の入力を文字種変換して確定する。
+    /// 対応しないキー・変換できない状態なら `None`（呼び出し側はキーを素通しする）。
+    pub fn commit_transformed(&mut self, key: TransformKey) -> Option<ConversionAction> {
+        if !self.committed_segments.is_empty() || !self.is_composing() {
+            return None;
+        }
+        let text = match key {
+            TransformKey::Hiragana => format!("{}{}", self.hiragana_buffer, self.romaji_buffer),
+            TransformKey::Katakana => {
+                format!("{}{}", crate::hiragana_to_katakana(&self.hiragana_buffer), self.romaji_buffer)
+            }
+            TransformKey::FullwidthAlnum => self.raw_letters()?.chars().map(to_fullwidth_ascii).collect(),
+            TransformKey::HalfwidthAlnum => self.raw_letters()?,
+        };
+        self.commit_literal(text)
+    }
+
+    /// 英単語の自動判定: Space/Enter で確定するとき、打鍵がローマ字として
+    /// 成り立っていなければ（かなに直せない英字が残る）、英字のまま確定する
+    /// 文字列を返す。日本語の打ち間違いを英字にしてしまわないよう、次の
+    /// すべてを満たすときだけ:
+    /// - 部分確定・候補選択をしていない、「もしかして」の補正候補が出ていない
+    /// - 打鍵が英字だけで3〜20文字
+    /// - かなに直せない英字（末尾の保留子音を含む。保留の n は除く）が
+    ///   先頭から2モーラ以内に現れる（docker→ど c け r、test→て s t）。
+    ///   「きょうはtest」のように日本語の後ろに続いた英字は対象外
+    ///   （どこからが英単語か分からないため。その場合は F10 を使う）。
+    ///
+    /// 判断層が英単語の候補を比べる方式（`english_detection_active`）が使えるときは
+    /// そちらに任せて `None`（文中の英単語も扱え、日本語に続く英字も拾えるため）。
+    pub fn english_word_on_commit(&self) -> Option<String> {
+        if !self.candidates.is_empty() || self.prediction_top_is_fuzzy || self.english_detection_active() {
+            return None;
+        }
+        let raw = self.raw_letters()?;
+        let len = raw.chars().count();
+        if !(3..=20).contains(&len) || !raw.chars().all(|c| c.is_ascii_alphabetic()) {
+            return None;
+        }
+        let mut morae_before = 0usize;
+        let mut found = false;
+        for c in self.hiragana_buffer.chars() {
+            if c.is_ascii_alphabetic() {
+                found = true;
+                break;
+            }
+            // 小書き文字と促音は前後の音と1モーラにまとめる（commit→こっみ t）
+            if !matches!(c, 'ゃ' | 'ゅ' | 'ょ' | 'ぁ' | 'ぃ' | 'ぅ' | 'ぇ' | 'ぉ' | 'っ') {
+                morae_before += 1;
+            }
+        }
+        if !found && !self.romaji_buffer.is_empty() && self.romaji_buffer != "n" {
+            found = true;
+        }
+        (found && morae_before <= 2).then_some(raw)
+    }
+
+    /// 今の入力の表示を `text` に置き換えて確定する（変換・学習はしない）。
+    /// 確定後の復元は「直前の確定がカーソルの直前にある」前提なので、
+    /// 確定履歴は捨てる（共起の文脈は話題が変わったわけではないので残す）。
+    pub fn commit_literal(&mut self, text: String) -> Option<ConversionAction> {
+        if !self.enabled || !self.is_composing() {
+            return None;
+        }
+        let delete_count = self.last_sent_length;
+        self.at_sentence_start = Some(ends_sentence(&text));
+        self.romaji_buffer.clear();
+        self.hiragana_buffer.clear();
+        self.raw_input.clear();
+        self.direct_capitals.clear();
+        self.conversion_result.clear();
+        self.last_sent_length = 0;
+        self.committed_segments.clear();
+        self.pinned.clear();
+        self.kana_tail_len = 0;
+        self.generation = self.generation.wrapping_add(1);
+        self.clear_candidates();
+        self.commit_ring.clear();
+        self.restore_selection = None;
+        self.predictions.clear();
+        self.prediction_top_is_fuzzy = false;
+        Some(ConversionAction { delete_count, insert_text: text })
+    }
+}
+
+
+/// `text` の末尾が文の区切りか（空・。．！？・改行。末尾の空白は見ない）。
+/// 次に打つ英単語を文頭として大文字にするかの判定に使う。
+fn ends_sentence(text: &str) -> bool {
+    match text.trim_end_matches([' ', '\u{3000}', '\t']).chars().last() {
+        None => true,
+        Some(c) => matches!(c, '。' | '．' | '.' | '！' | '!' | '？' | '?' | '\n' | '\r'),
+    }
+}
+
+/// `kana_raw`（読みの各文字と、それを作った打鍵）を打鍵の片の列にする。
+/// `kana_raw` が読み `reading` と食い違っていれば `None`。
+fn romaji_pieces_of(kana_raw: &[(char, String)], reading: &str) -> Option<Vec<crate::english::RomajiPiece>> {
+    if kana_raw.is_empty() || !kana_raw.iter().map(|(c, _)| *c).eq(reading.chars()) {
+        return None;
+    }
+    let mut pieces: Vec<crate::english::RomajiPiece> = Vec::new();
+    for (c, raw) in kana_raw {
+        match pieces.last_mut() {
+            Some(p) if raw.is_empty() => p.kana.push(*c),
+            _ if raw.is_empty() => return None,
+            _ => pieces.push(crate::english::RomajiPiece { kana: c.to_string(), raw: raw.clone() }),
+        }
+    }
+    Some(pieces)
+}
+
+/// F6〜F10 の文字種変換（MS-IME と同じ割り当て。F8 の半角カナは未対応）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransformKey {
+    /// F6: ひらがな
+    Hiragana,
+    /// F7: 全角カタカナ
+    Katakana,
+    /// F9: 全角英数（打った英字のまま全角に）
+    FullwidthAlnum,
+    /// F10: 半角英数（打った英字のまま）
+    HalfwidthAlnum,
+}
+
+/// 半角の英数記号を全角にする（それ以外はそのまま）
+fn to_fullwidth_ascii(c: char) -> char {
+    match c {
+        '!'..='~' => char::from_u32(c as u32 + 0xFEE0).unwrap_or(c),
+        _ => c,
     }
 }
 
@@ -3532,6 +4101,77 @@ mod state_machine_tests {
         assert_eq!(shown(&converter), "汽車");
         converter.clear_context();
         assert_eq!(shown(&converter), "記者");
+
+        // 入力欄に既にある文章（カーソルより前）の名詞も同じように効く。
+        // 熟語の一部の1文字（「駅前」の「駅」、語彙に無い熟語）は拾わない。
+        converter.note_field_text("駅前で待ち合わせ");
+        assert_eq!(shown(&converter), "記者");
+        converter.note_field_text("昨日は駅まで歩いた。");
+        assert_eq!(shown(&converter), "汽車");
+        converter.clear_context();
+
+        // 実際の経路: 入力欄の文章は次の変換を始めた瞬間に文脈へ入る
+        let mut state = LiveConversionState::new();
+        state.converter = Some(converter);
+        state.offer_field_text("駅で待つ".into());
+        for ch in "kisha".chars() {
+            state.add_char(ch);
+        }
+        assert_eq!(state.conversion_result, "汽車");
+    }
+
+    fn type_into(state: &mut LiveConversionState, screen: &mut String, romaji: &str) {
+        for ch in romaji.chars() {
+            let action = state.add_char(ch);
+            apply_to_screen(screen, action);
+        }
+    }
+
+    /// 英単語の自動判定: ローマ字として成り立たない打鍵（先頭付近に英字が残る）
+    /// だけを英字のまま確定する。日本語や、日本語の後ろに続いた英字は対象外。
+    #[test]
+    fn english_word_detected_only_for_unconvertible_romaji() {
+        let check = |romaji: &str| {
+            let mut state = LiveConversionState::new();
+            state.converter = Some(particle_test_converter());
+            let mut screen = String::new();
+            type_into(&mut state, &mut screen, romaji);
+            state.english_word_on_commit()
+        };
+        for word in ["docker", "test", "python", "github", "react", "kubectl"] {
+            assert_eq!(check(word).as_deref(), Some(word), "{word} は英単語として確定すべき");
+        }
+        for japanese in ["kyouha", "gakkou", "sushi", "kanji", "honn", "kyouhatest", "ka"] {
+            assert_eq!(check(japanese), None, "{japanese} を英字にしてはいけない");
+        }
+    }
+
+    /// F10 は打った綴りのまま（si/shi を書き換えない）、F7 はカタカナで確定し、
+    /// 画面の下書きをちょうど置き換える
+    #[test]
+    fn transform_keys_replace_composition_with_typed_letters_or_katakana() {
+        let mut state = LiveConversionState::new();
+        state.converter = Some(particle_test_converter());
+        let mut screen = String::from("前文");
+        type_into(&mut state, &mut screen, "sinbunn");
+        let action = state.commit_transformed(TransformKey::HalfwidthAlnum);
+        apply_to_screen(&mut screen, action);
+        assert_eq!(screen, "前文sinbunn");
+        assert!(!state.is_composing());
+
+        type_into(&mut state, &mut screen, "terebi");
+        let action = state.commit_transformed(TransformKey::Katakana);
+        apply_to_screen(&mut screen, action);
+        assert_eq!(screen, "前文sinbunnテレビ");
+
+        // Backspace で打鍵の記録とかながずれても、読みから組み立て直す
+        type_into(&mut state, &mut screen, "abcd");
+        let action = state.backspace();
+        apply_to_screen(&mut screen, action);
+        assert_eq!(state.raw_letters().as_deref(), Some("abc"));
+        let action = state.commit_transformed(TransformKey::FullwidthAlnum);
+        apply_to_screen(&mut screen, action);
+        assert_eq!(screen, "前文sinbunnテレビａｂｃ");
     }
 
     /// 画面上のテキストを模擬してアクションを適用する
@@ -4241,6 +4881,35 @@ mod state_machine_tests {
         assert_eq!(entry.char_count, entry.surface.chars().count());
     }
 
+    /// 句読点を打つと、読みに入れて変換し直さずに表示中の変換をそのまま確定し、
+    /// 後ろに句読点を足す。確定後の復元用リングには句読点込みで積まれる。
+    #[test]
+    fn punctuation_commits_shown_text_and_appends_mark() {
+        let mut state = state_with_two_segment_dict();
+        let mut sim = String::new();
+        for ch in "kyou".chars() {
+            apply_action_for_test(&mut sim, state.add_char(ch));
+        }
+        assert_eq!(sim, "今日");
+        let actions = state.commit_with_punctuation('.').expect("入力中なので句読点つきで確定する");
+        for a in actions {
+            apply_action_for_test(&mut sim, Some(a));
+        }
+        assert_eq!(sim, "今日。");
+        assert!(!state.is_composing());
+        let entry = state.commit_ring.back().unwrap();
+        assert_eq!((entry.surface.as_str(), entry.char_count), ("今日。", 3));
+        // 入力中でなければ何もしない（呼び出し側が句読点だけを入力する）
+        assert!(state.commit_with_punctuation(',').is_none());
+    }
+
+    fn apply_action_for_test(sim: &mut String, action: Option<ConversionAction>) {
+        let Some(a) = action else { return };
+        let keep = sim.chars().count().saturating_sub(a.delete_count);
+        *sim = sim.chars().take(keep).collect();
+        sim.push_str(&a.insert_text);
+    }
+
     /// リングバッファは最大8件で、超えたら最も古いものから捨てる。
     #[test]
     fn commit_ring_evicts_oldest_entry_beyond_capacity() {
@@ -4316,6 +4985,98 @@ mod state_machine_tests {
         assert_eq!(action.insert_text, chosen);
         assert!(!state.is_restoring(), "確定後は復元選択が終わっているはず");
         assert_eq!(state.commit_ring.back().unwrap().surface, chosen);
+    }
+
+    /// 変換中に候補一覧で別の候補を選んで確定すると、(読み, 誤った表記,
+    /// 正しい表記) がレポートへ渡され、同じ読みの「学習済みの修正」として
+    /// 学習DBとコンバータの両方に記録される。
+    #[test]
+    fn candidate_correction_is_recorded_as_misconversion_fix() {
+        use std::sync::Mutex;
+        static REPORTED: Mutex<Vec<(String, String, String)>> = Mutex::new(Vec::new());
+        fn reporter(r: &str, w: &str, c: &str) {
+            REPORTED.lock().unwrap().push((r.into(), w.into(), c.into()));
+        }
+        let mut state = state_with_two_segment_dict();
+        state.learning = Some(LearningRepository::in_memory().unwrap());
+        state.correction_reporter = Some(reporter);
+        type_str(&mut state, "kyou");
+        let wrong = state.conversion_result.clone();
+        let _ = state.cycle_candidate(false);
+        while state.candidates[state.candidate_index] == wrong {
+            let _ = state.cycle_candidate(false);
+        }
+        let correct = state.candidates[state.candidate_index].clone();
+        assert_ne!(correct, wrong, "表示中以外の候補が選ばれているはず");
+        state.commit();
+
+        assert_eq!(
+            REPORTED.lock().unwrap().as_slice(),
+            &[("きょう".to_string(), wrong.clone(), correct.clone())]
+        );
+        assert_eq!(
+            state.learning.as_ref().unwrap().find_typo_correction_frequency("きょう", "きょう", &correct).unwrap(),
+            1
+        );
+        let learned = state.converter.as_ref().unwrap().typo_corrections.get("きょう").cloned();
+        assert_eq!(learned.map(|(r, s, _)| (r, s)), Some(("きょう".to_string(), correct)));
+
+        // 表示中の候補のまま確定したときは何も記録しない
+        type_str(&mut state, "kyou");
+        state.commit();
+        assert_eq!(REPORTED.lock().unwrap().len(), 1);
+    }
+
+    /// 記録した修正は、同じ読みを打って表示が誤変換のままのとき
+    /// 「もしかして」の先頭に正しい表記として出る。表示が既に正しい表記
+    /// なら出さない。
+    #[test]
+    fn recorded_misconversion_fix_is_suggested_as_moshikashite() {
+        let mut state = state_with_two_segment_dict();
+        type_str(&mut state, "kyou");
+        let wrong = state.conversion_result.clone();
+        let _ = state.cycle_candidate(false);
+        while state.candidates[state.candidate_index] == wrong {
+            let _ = state.cycle_candidate(false);
+        }
+        let correct = state.candidates[state.candidate_index].clone();
+        state.cancel();
+
+        state.converter.as_mut().unwrap().learn_typo_correction("きょう", "きょう", &correct, 1);
+        type_str(&mut state, "kyou");
+        state.update_predictions();
+        assert_eq!(state.conversion_result, wrong);
+        assert!(state.prediction_top_is_fuzzy);
+        assert!(state.prediction_top_is_learned_typo);
+        assert_eq!(state.predictions[0], ("きょう".to_string(), correct.clone()));
+        assert!(state.prediction_display()[0].starts_with("もしかして"));
+
+        // もしかしてを選ぶと正しい表記で確定する
+        let action = state.commit_prediction(0).unwrap();
+        assert_eq!(action.insert_text, correct);
+
+        // 表示が既に正しい表記なら出さない
+        state.converter.as_mut().unwrap().learn_typo_correction("きょう", "きょう", &wrong, 1);
+        type_str(&mut state, "kyou");
+        state.update_predictions();
+        assert!(!state.prediction_top_is_fuzzy);
+    }
+
+    /// 確定後の復元で別の候補を選び直したときも、修正として記録する
+    #[test]
+    fn restore_choice_is_recorded_as_misconversion_fix() {
+        let mut state = state_with_two_segment_dict();
+        state.learning = Some(LearningRepository::in_memory().unwrap());
+        type_str(&mut state, "kyou");
+        state.commit();
+        let (candidates, selected) = state.press_restore_hotkey().unwrap();
+        let chosen = candidates[selected].clone();
+        state.confirm_restore().unwrap();
+
+        assert_eq!(
+            state.learning.as_ref().unwrap().find_typo_correction_frequency("きょう", "きょう", &chosen).unwrap(),
+            1
+        );
     }
 
     /// 復元選択のキャンセルは選択状態だけを消し、`commit_ring`には触れない

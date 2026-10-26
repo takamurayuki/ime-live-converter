@@ -74,6 +74,11 @@ pub struct JudgeParams {
     pub cooc_weight: f32,
     /// 対象語1つあたりの PMI の上限（極端に珍しい組の過大評価を抑える）
     pub cooc_cap: f32,
+    /// 英単語の候補（`english`）の対数確率に足す値（負の値）。英単語は LM の
+    /// 語彙に無いので「名詞の未知語」の確率 × 英単語の出現頻度で採点し、
+    /// 日本語の文に英単語が混ざること自体の珍しさをこの値で表す。
+    /// 小さく（負に大きく）するほど日本語の読みが優先される。
+    pub english_bias: f32,
 }
 
 impl Default for JudgeParams {
@@ -88,6 +93,7 @@ impl Default for JudgeParams {
             start_mix: 0.5,
             cooc_weight: 1.0,
             cooc_cap: 5.0,
+            english_bias: DEFAULT_ENGLISH_BIAS,
         }
     }
 }
@@ -459,6 +465,19 @@ impl JudgeLm {
     /// 1語（IME 辞書のエントリ）を LM の単位に写す
     pub fn unit(&self, e: &WordEntry) -> LmUnit {
         let (left, right) = (e.left_id as u16, e.right_id as u16);
+        // 英単語の候補は LM の語彙に無い。前後のつながりは名詞のクラスで採点し、
+        // どの語かは「そのクラスの未知の語」の確率（語彙外の名詞1つ分で、
+        // 極端に小さい）の代わりに英単語の出現頻度で採点する（`logp` が足す
+        // 未知語の確率をここで差し引いて置き換える）
+        if crate::english::is_english_entry(e) {
+            return LmUnit {
+                first: None,
+                first_class: left,
+                last: LmCtx { word: None, class: right },
+                internal: crate::english::english_logp(e) + self.params.english_bias - self.unk_emit(left),
+                unk_chars: 0,
+            };
+        }
         if let Some(id) = self.word_id(&e.surface, &e.reading, left) {
             return LmUnit {
                 first: Some(id),
@@ -478,6 +497,25 @@ impl JudgeLm {
                 unk_chars: 0,
             };
         }
+        // 外来語の長音なし表記（ブラウザ。`Dictionary::add_long_vowel_variants` が補う）は
+        // 学習コーパスの分かち書きに語として現れないため、長音つきの同じ語
+        // （ブラウザー）の統計で採点する。語彙外のままだと文字数罰で
+        // 「ドライ＋馬」のような語彙内の断片に負ける。長音なし表記は長音つきより
+        // 使われにくいので `LONG_VOWEL_VARIANT_LOGP` だけ減点する（「はんた→班田」の
+        // ような希な語をハンター由来の頻度で乗っ取らないように）。
+        if is_katakana_surface(&e.surface) && !e.surface.ends_with('ー') {
+            let long = (format!("{}ー", e.surface), format!("{}ー", e.reading));
+            if let Some(id) = self.word_id_any_class(&long.0, &long.1) {
+                let class = self.data.word_class[id as usize];
+                return LmUnit {
+                    first: Some(id),
+                    first_class: class,
+                    last: LmCtx { word: Some(id), class },
+                    internal: LONG_VOWEL_VARIANT_LOGP,
+                    unk_chars: 0,
+                };
+            }
+        }
         if let Some(ids) = self.segment_ids(&e.surface, &e.reading) {
             let internal = ids
                 .windows(2)
@@ -492,12 +530,33 @@ impl JudgeLm {
                 unk_chars: 0,
             };
         }
+        // 辞書に実在するカタカナ語（extra.csv の外来語等）が語彙外なのは、学習時の
+        // 分かち書き（IPADic）に無い語がコーパスで未知語になったためで、
+        // 「辞書にない読みの塊を飲み込んだ」カタカナ・フォールバック（pos=カタカナ）とは
+        // 違う。読みの長さに比例して罰すると長い外来語ほど不利になり
+        // 「くらいあんと→暗い案と」のように断片に負けるので、罰を頭打ちにする。
+        let mut unk_chars = e.reading.chars().count() as u32;
+        if e.pos != "カタカナ" && is_katakana_surface(&e.surface) {
+            unk_chars = unk_chars.min(KATAKANA_DICT_WORD_UNK_CAP);
+        }
         LmUnit {
             first: None,
             first_class: left,
             last: LmCtx { word: None, class: right },
             internal: 0.0,
-            unk_chars: e.reading.chars().count() as u32,
+            unk_chars,
+        }
+    }
+
+    /// 英単語の直後に続く英単語への加点（`english_bias` の取り消し）。`english_bias` は
+    /// 日本語の文に英単語が混ざる珍しさを表すもので、英単語の直後なら英語が続くのは
+    /// 自然（pull request・test code）なので、2語目以降には掛けない。
+    pub fn english_continuation(&self, prev: Option<&WordEntry>, cur: &WordEntry) -> f32 {
+        match prev {
+            Some(p) if crate::english::is_english_entry(p) && crate::english::is_english_entry(cur) => {
+                -self.params.english_bias
+            }
+            _ => 0.0,
         }
     }
 
@@ -524,9 +583,11 @@ impl JudgeLm {
         let mut prev2: Option<u32> = None;
         let mut total = 0.0f32;
         let mut unk_chars = 0u32;
+        let mut prev_entry = left;
         for e in words {
             let u = self.unit(e);
-            total += self.edge_logp(prev2, prev, &u);
+            total += self.edge_logp(prev2, prev, &u) + self.english_continuation(prev_entry, e);
+            prev_entry = Some(e);
             unk_chars += u.unk_chars;
             prev2 = prev.word;
             prev = u.last;
@@ -551,6 +612,22 @@ impl JudgeLm {
 }
 
 /// log(exp(a) + exp(b))
+/// 外来語の長音なし表記を長音つきの語として採点するときの減点（自然対数）
+const LONG_VOWEL_VARIANT_LOGP: f32 = -2.0;
+
+/// `JudgeParams::english_bias` の既定値。2026-10-26 の計測（`english_eval`）:
+/// Wikipedia の 4000 文をローマ字で打って英字に化けた文は -4・-3 とも 0 件、
+/// 英単語の例文 54 件の一致は -4 で 51 件・-3 で 52 件（-2 以上では機能語の
+/// 取り違え「よう→you」が出始めた）。
+pub const DEFAULT_ENGLISH_BIAS: f32 = -3.0;
+
+/// 辞書に実在する語彙外のカタカナ語の、語彙外文字数罰の上限（文字数）
+const KATAKANA_DICT_WORD_UNK_CAP: u32 = 2;
+
+fn is_katakana_surface(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| ('ァ'..='ヶ').contains(&c) || c == 'ー')
+}
+
 fn log_add(a: f32, b: f32) -> f32 {
     let m = a.max(b);
     m + ((a - m).exp() + (b - m).exp()).ln()
@@ -722,6 +799,31 @@ mod tests {
         // 読みが合わない分解は採らない
         assert!(lm.segment_ids("今日晴れ", "こんにちはれ").is_none());
         assert_eq!(lm.unit(&w("今日晴れ", "こんにちはれ", N)).unk_chars, 6);
+    }
+
+    #[test]
+    fn long_vowel_variant_is_scored_as_the_long_form() {
+        // 語彙の「晴れ」を「ブラウザー」に差し替えたモデル
+        let mut data = std::mem::take(&mut tiny().data);
+        data.vocab[5] = vocab_key("ブラウザー", "ぶらうざー", N);
+        let lm = JudgeLm::from_data(data);
+        // 長音なしの「ブラウザ」は語彙外ではなく「ブラウザー」として、少し減点して採点する
+        let u = lm.unit(&w("ブラウザ", "ぶらうざ", N));
+        assert_eq!((u.first, u.last.word, u.unk_chars), (Some(5), Some(5), 0));
+        assert_eq!(u.internal, LONG_VOWEL_VARIANT_LOGP);
+        // 長音つきの語が語彙に無いカタカナ語は従来どおり語彙外（辞書の実在語なので罰は頭打ち）
+        assert_eq!(lm.unit(&w("ドライバ", "どらいば", N)).unk_chars, KATAKANA_DICT_WORD_UNK_CAP);
+    }
+
+    #[test]
+    fn unknown_dictionary_katakana_word_has_capped_penalty() {
+        let lm = tiny();
+        // 辞書の外来語（くらいあんと→クライアント）は長くても罰が頭打ち
+        assert_eq!(lm.unit(&w("クライアント", "くらいあんと", N)).unk_chars, KATAKANA_DICT_WORD_UNK_CAP);
+        // カタカナ・フォールバック（ぐんぐんすすむ→グングンススム）は従来どおり読みの長さで罰する
+        let mut fallback = w("グングンススム", "ぐんぐんすすむ", N);
+        fallback.pos = "カタカナ".to_string();
+        assert_eq!(lm.unit(&fallback).unk_chars, 7);
     }
 
     #[test]

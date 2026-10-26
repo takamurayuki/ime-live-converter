@@ -1,0 +1,39 @@
+# 英単語の自動判定の例文: 「ローマ字の打鍵<TAB>期待する確定結果」
+# 打鍵は1回の入力（Space/Enter で確定するまで）。英単語は打鍵どおりの英字になる。
+#
+# --- 英単語が混ざる文 ---
+konocodewosyuuseisuru	このcodeを修正する
+testwojikkousuru	testを実行する
+dockerwotukau	Dockerを使う
+kubectlwojikkou	kubectlを実行
+datawohozonsuru	dataを保存する
+filewohiraku	fileを開く
+serverniaccesssuru	serverにaccessする
+githubnipushsuru	GitHubにpushする
+branchwokirikaeru	branchを切り替える
+commitwotorikesu	commitを取り消す
+kyouhameetingganaidesu	今日はmeetingがないです
+pythondekaku	Pythonで書く
+errorgadeta	errorが出た
+logwomiru	logを見る
+configwokousinsuru	configを更新する
+apinokeywosettei	APIのkeyを設定
+browserdehiraku	browserで開く
+# --- 英単語だけ ---
+test	test
+docker	Docker
+# code だけを打つと「個で」（日本語として成り立つ短い読みは日本語を優先する。英字にするなら F10）
+code	個で
+github	GitHub
+# --- 英単語に見えるが日本語のまま（ローマ字としても自然な日本語） ---
+toukyoumadeiku	東京まで行く
+kitekudasai	来てください
+tamenisuru	ためにする
+damedesu	ダメです
+takewokiru	竹を切る
+osakewonomu	お酒を飲む
+sushiwotaberu	寿司を食べる
+kaminokewokiru	髪の毛を切る
+namaewokaku	名前を書く
+sorehamonndaidesu	それは問題です
+konnnichiha	こんにちは

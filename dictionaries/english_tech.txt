@@ -1,0 +1,45 @@
+# 英単語の自動判定に足す IT・開発用語（english_words.tsv の映画字幕コーパスに
+# 無い・少ない語）。空白区切り。# 行はコメント。
+# 大文字を含めて書いた語（GitHub・macOS・JSON）は、文中のどこでもその表記にする。
+# 小文字で書いた語（kubectl・npm）は小文字のまま（文頭の大文字化もしない）。
+API apis app apps async await auth backend backup bash binary bit bits blob bool boolean
+branch branches browser buffer bug bugs build builds byte bytes cache cargo cast cd chat
+checkout Chrome ci class classes CLI client clients clone cloud cluster cmd code codes
+Codex column columns command commands commit commits compile compiler component components
+config configs console const container containers context cookie cookies core CPU crate
+crates crash CSS CSV cursor daemon dashboard data database databases dataset debug debugger
+default delete deploy deployment dev diff dir directory disk DNS Docker document docs domain
+download driver dump edge editor email emoji endpoint enum env error errors event events
+exception export extension feature fetch field fields file files filter Firebase firewall
+fix flag flags folder font fork format frame framework frontend function functions gateway
+gcc Gemini git GitHub GitLab Google GPU graph grep hash header headers heap helper host
+hosting hotfix HTML HTTP HTTPS hub icon ID IDE image images import index input install
+instance interface iOS issue issues item items Java JavaScript jest job jobs JSON JWT kernel
+key keys Kotlin kubectl Kubernetes label lambda laptop layer layout lib library license lint
+linter Linux list LLM load local localhost lock log login logout logs loop mac macOS main
+mainline make makefile manager map markdown master memory menu merge message method methods
+metrics middleware migration mock model models module modules MongoDB monitor MySQL
+namespace network next Nginx node npm null object objects offline online OpenAI option
+options oracle output package packages page pages panel parser password patch path payload
+PDF performance PHP pipeline plugin plugins pod pods pointer policy port post Postgres
+PowerShell preview print process production profile project projects prompt props proxy
+pull push Python query queue rails React readme rebase Redis refactor regex release
+releases remote render repo repos repository request requests reset response rest review
+root route router ruby runtime Rust Safari sandbox Scala schema scope screen script scripts
+SDK search server servers service services session setting settings setup shell signal
+Slack snapshot socket software source spec SQL SSH SSL stack staging state status storage
+stream string struct style sudo Swift switch sync syntax system tab table tables tag tags
+task tasks template terminal test tests text thread threads timeout timestamp token tokens
+tool tools trace tree trigger tuple type types TypeScript Ubuntu UI unicode unit update
+upload URL user users UTF UUID UX value values variable vector version view vim virtual
+VSCode web webhook widget wifi window Windows word worker workflow wrapper XML YAML zip
+Zoom Claude Anthropic ChatGPT Copilot cursor Vercel Netlify AWS Azure GCP Terraform
+Ansible Jenkins Jira Notion Figma Zapier Discord teams Outlook Excel word PowerPoint
+# ローマ字としても打てる綴りで頻度表の上位5000語に入らない語（english.rs の
+# CONVERTIBLE_MAX_RANK で落ちるため、ここで明示的に残す）
+generate execute validate initiate locate sequence queue mongo Vue Vite nano tile
+mode parse note update create operate iterate migrate allocate deprecate duplicate native
+# かなに直せない英字が1つしか残らず、未知語としては拾えない語
+axios Deno Vite tauri Nuxt Svelte Figma Obsidian pnpm eslint webpack zustand vitest Prisma Supabase
+# 固有名詞・略語（正しい表記で使う）
+Android Firefox PostgreSQL

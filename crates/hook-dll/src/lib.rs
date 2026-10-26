@@ -71,6 +71,7 @@ mod command_mode;
 mod hook;
 mod hook_thread;
 mod hook_watchdog;
+mod misreport;
 mod popup;
 mod settings_ui;
 mod uia;
@@ -100,6 +101,8 @@ pub extern "C" fn install_hook() -> bool {
         // `common`crateはWin32非依存のため、遅延通知の実手段（PostMessageW）を
         // 持たない。実運用（フック配送）ではここで注入する。
         state.request_deferred_learning = Some(popup::request_deferred_learning);
+        // 候補一覧で誤変換を直した確定は誤変換レポートへ自動で記録する
+        state.correction_reporter = Some(misreport::submit_candidate_fix);
         // 学習DBをオープン（%LOCALAPPDATA%\IMELiveConverter、無ければ旧置き場所から
         // 移行する。失敗しても変換は継続できる）
         match LearningRepository::open_default() {

@@ -29,3 +29,20 @@ licenses; they are distributed as a separate GitHub Release (models-*).
 
    The ShareAlike condition applies to the model files only; it does not apply
    to the program, which merely reads them.
+
+3. English word frequencies (English word detection)
+   dictionaries\english_words.tsv lists English words with their frequencies.
+   Unlike the models above, it ships with the program package.
+
+   Source:      FrequencyWords by Hermit Dave, content/2018/en/en_50k.txt
+                (https://github.com/hermitdave/FrequencyWords), derived from
+                the OpenSubtitles 2018 corpus.
+   Changes:     Only words made of two or more lowercase letters a-z were kept.
+                Ranks and counts are unchanged.
+   License:     Creative Commons Attribution-ShareAlike 4.0 International
+                (https://creativecommons.org/licenses/by-sa/4.0/).
+                english_words.tsv is likewise licensed under CC BY-SA 4.0.
+
+   As with the models, the ShareAlike condition applies to that file only.
+   dictionaries\english_tech.txt (a hand-written list of IT terms) is part of
+   the program and is under the MIT License.

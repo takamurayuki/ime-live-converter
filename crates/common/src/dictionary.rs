@@ -253,6 +253,36 @@ impl Dictionary {
         self.trie.fuzzy_search(target, max_dist)
     }
 
+    /// 外来語の末尾の長音を省いた表記（ブラウザー→ブラウザ）を補う。追加した語数を返す。
+    ///
+    /// IPA辞書の外来語は「ブラウザー」「アドベンチャー」のように末尾に長音の
+    /// 付いた表記しか持たないことが多い。IT 用語などで一般的な長音なしの
+    /// 「ぶらうざ」と打つと、辞書に1語として無いため「ブラ＋宇座」のような
+    /// カタカナ断片＋漢字断片に割れてしまう。JIS Z 8301 の慣例（3音以上の語は
+    /// 末尾の長音を省いてよい）に合わせ、次の条件の語だけ長音なし表記を補う。
+    /// - 品詞が名詞-一般／名詞-サ変接続（固有名詞は長音を省く慣習が無く、
+    ///   「イチロー→いちろ」のような読みが「一路」等を乗っ取るだけなので除く）
+    /// - 表記が全てカタカナで、長音を除いた読みが3音以上
+    /// - 同じ読み・表記が既に辞書に無い
+    ///
+    /// コストは元の語に `LONG_VOWEL_VARIANT_PENALTY` を足す（同じ読みの別の語や、
+    /// 読みを丸ごと覆う別の分割より優先しすぎないように）。
+    pub fn add_long_vowel_variants(&mut self) -> usize {
+        let mut variants = Vec::new();
+        collect_long_vowel_variants(&self.trie, &mut variants);
+        let mut added = 0;
+        for variant in variants {
+            let exists = self
+                .lookup(&variant.reading)
+                .is_some_and(|es| es.iter().any(|e| e.surface == variant.surface));
+            if !exists {
+                self.add_word(variant);
+                added += 1;
+            }
+        }
+        added
+    }
+
     /// 単語が1つも登録されていないか（`ViterbiConverter`の上乗せ辞書
     /// `overlay`が「一度もadd_wordされていない」状態かの判定に使う。
     /// 空なら検索を丸ごと省略でき、基底辞書（`Arc`共有、不変）だけを
@@ -302,9 +332,81 @@ impl CharCategory {
     }
 }
 
+/// 長音なし表記に付けるコストの上乗せ（`Dictionary::add_long_vowel_variants`）
+pub const LONG_VOWEL_VARIANT_PENALTY: i16 = 1000;
+
+fn collect_long_vowel_variants(node: &TrieNode, out: &mut Vec<WordEntry>) {
+    out.extend(node.entries.iter().filter_map(long_vowel_variant));
+    for child in node.children.values() {
+        collect_long_vowel_variants(child, out);
+    }
+}
+
+/// 拍の数（拗音・小書きの母音は前の文字と合わせて1拍、長音・促音・撥音は1拍）
+fn mora_count(kana: &str) -> usize {
+    kana.chars()
+        .filter(|c| !matches!(c, 'ァ' | 'ィ' | 'ゥ' | 'ェ' | 'ォ' | 'ャ' | 'ュ' | 'ョ' | 'ヮ'
+            | 'ぁ' | 'ぃ' | 'ぅ' | 'ぇ' | 'ぉ' | 'ゃ' | 'ゅ' | 'ょ' | 'ゎ'))
+        .count()
+}
+
+/// `add_long_vowel_variants` の対象なら、末尾の長音を除いた語を返す
+fn long_vowel_variant(w: &WordEntry) -> Option<WordEntry> {
+    if !(w.pos.starts_with("名詞-一般") || w.pos.starts_with("名詞-サ変接続")) {
+        return None;
+    }
+    if !w.surface.chars().all(|c| ('ァ'..='ヶ').contains(&c) || c == 'ー') {
+        return None;
+    }
+    let surface = w.surface.strip_suffix('ー')?;
+    let reading = w.reading.strip_suffix('ー')?;
+    // 「ー」の連続や促音・撥音で終わる形（アッー等）は語として不自然
+    if surface.ends_with(['ー', 'ッ', 'ン']) || mora_count(surface) < 3 {
+        return None;
+    }
+    Some(WordEntry {
+        surface: surface.to_string(),
+        reading: reading.to_string(),
+        cost: w.cost.saturating_add(LONG_VOWEL_VARIANT_PENALTY),
+        ..w.clone()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn noun(surface: &str, reading: &str, pos: &str, cost: i16) -> WordEntry {
+        WordEntry {
+            surface: surface.to_string(),
+            reading: reading.to_string(),
+            left_id: 1285,
+            right_id: 1285,
+            cost,
+            pos: pos.to_string(),
+        }
+    }
+
+    #[test]
+    fn long_vowel_variants_cover_general_loanwords_only() {
+        let mut dict = Dictionary::new();
+        dict.add_word(noun("ブラウザー", "ぶらうざー", "名詞-一般-*-*", 3657));
+        dict.add_word(noun("コピー", "こぴー", "名詞-サ変接続-*-*", 3000)); // 2音は長音を省かない
+        dict.add_word(noun("イチロー", "いちろー", "名詞-固有名詞-人名-名", 3000)); // 固有名詞
+        dict.add_word(noun("サーバー", "さーばー", "名詞-一般-*-*", 3000));
+        dict.add_word(noun("サーバ", "さーば", "名詞-一般-*-*", 3500)); // 既に長音なしがある
+        assert_eq!(dict.add_long_vowel_variants(), 1);
+
+        let added = dict.lookup("ぶらうざ").expect("ブラウザが補われる");
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0].surface, "ブラウザ");
+        assert_eq!(added[0].cost, 3657 + LONG_VOWEL_VARIANT_PENALTY);
+        assert!(dict.lookup("こぴ").is_none());
+        assert!(dict.lookup("いちろ").is_none());
+        assert_eq!(dict.lookup("さーば").unwrap().len(), 1);
+        // 2回呼んでも重複しない
+        assert_eq!(dict.add_long_vowel_variants(), 0);
+    }
 
     #[test]
     fn test_trie_insert_and_search() {

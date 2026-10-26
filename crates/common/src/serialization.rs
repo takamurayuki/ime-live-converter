@@ -86,6 +86,7 @@ impl Dictionary {
                 pos: entry.pos,
             });
         }
+        dict.add_long_vowel_variants();
 
         Ok(dict)
     }

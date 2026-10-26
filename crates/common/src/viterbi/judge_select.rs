@@ -33,8 +33,51 @@ impl JudgedCandidate {
 
 /// 2次 Viterbi（`lm_viterbi`）で各ノードに残す状態数
 pub const JUDGE_BEAM: usize = 4;
+/// 英単語の候補の辞書コスト（辞書の外来語 コード=2234・テスト=3637 程度）
+const ENGLISH_WORD_DICT_COST: i32 = 3000;
 /// 共起の文脈として覚えておく直前の確定文の名詞の数
 pub const CONTEXT_NOUNS_MAX: usize = 12;
+
+/// 文章から読み取る最大文字数（カーソルに近い側を残す）
+pub const FIELD_TEXT_MAX_CHARS: usize = 300;
+/// 名詞の最長一致で試す最大の文字数
+const FIELD_NOUN_MAX_CHARS: usize = 8;
+
+/// 漢字・カタカナ（長音符を含む）か。名詞の拾い出しはこの文字の連続の中だけで行う
+fn is_noun_char(c: char) -> bool {
+    matches!(c, '\u{4E00}'..='\u{9FFF}' | '\u{3400}'..='\u{4DBF}' | '\u{30A1}'..='\u{30FA}' | 'ー' | '々')
+}
+
+/// 文章中の共起モデルの名詞を、出現順（左から）に最長一致で拾う。1文字の語は
+/// 熟語の一部からの誤検出が多い（「会議」の「会」等）ので、前後がかなの
+/// 孤立した1文字（「駅まで」の「駅」）のときだけ拾う。
+fn extract_cooc_nouns(cooc: &crate::judge_cooc::JudgeCooc, text: &str) -> Vec<String> {
+    let all: Vec<char> = text.chars().collect();
+    let chars = &all[all.len().saturating_sub(FIELD_TEXT_MAX_CHARS)..];
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if !is_noun_char(chars[i]) {
+            i += 1;
+            continue;
+        }
+        let run_end = (i..chars.len()).find(|&k| !is_noun_char(chars[k])).unwrap_or(chars.len());
+        let run_start = i == 0 || !is_noun_char(chars[i - 1]);
+        let min_len = if run_start && run_end - i == 1 { 1 } else { 2 };
+        let longest = (min_len..=FIELD_NOUN_MAX_CHARS.min(run_end - i)).rev().find_map(|len| {
+            let s: String = chars[i..i + len].iter().collect();
+            cooc.noun_id(&s).map(|_| (s, len))
+        });
+        match longest {
+            Some((s, len)) => {
+                out.push(s);
+                i += len;
+            }
+            None => i += 1,
+        }
+    }
+    out
+}
 
 impl ViterbiConverter {
     /// 判断層を付け替える（`None` で従来の挙動に戻る）
@@ -43,6 +86,61 @@ impl ViterbiConverter {
     }
 
     /// 判断層の共起モデルを付け替える（`None` で共起を見ない）
+    /// 英単語の自動判定の頻度表を設定する（`None` で英単語の候補を出さない）
+    pub fn set_english(&mut self, english: Option<Arc<crate::english::EnglishLexicon>>) {
+        self.english = english;
+    }
+
+    /// 今の入力の読みがどの打鍵から来たかを設定する（片のかなをつなげると読みになる）。
+    /// 判断層はこれと一致する読み（またはその先頭部分）を変換するときだけ英単語の
+    /// 候補を足す。`None` なら英単語の候補を出さない。
+    /// `capital` は入力の直前に Shift で直接入力した大文字（無ければ空）。
+    pub fn set_romaji_hint(&mut self, pieces: Option<Vec<crate::english::RomajiPiece>>, capital: &str) {
+        self.romaji_hint = pieces;
+        self.romaji_capital.clear();
+        self.romaji_capital.push_str(capital);
+    }
+
+    /// 判断層のラティスに英単語の候補を足す（`crate::english`）。読みの文字位置
+    /// `min_start` より前（固定した先頭文節）には足さない。
+    fn add_english_nodes(&self, lattice: &mut Lattice, reading: &str, min_start: usize) {
+        let (Some(english), Some(pieces)) = (self.english.as_ref(), self.romaji_hint.as_ref()) else {
+            return;
+        };
+        // 打鍵の記録が今の読み（の先頭部分）と一致するときだけ使う
+        let mut covered = 0usize;
+        let mut n = 0usize;
+        for p in pieces {
+            if !reading[covered..].starts_with(p.kana.as_str()) {
+                break;
+            }
+            covered += p.kana.len();
+            n += 1;
+        }
+        if n == 0 {
+            return;
+        }
+        let byte_at: Vec<usize> = reading
+            .char_indices()
+            .map(|(b, _)| b)
+            .chain(std::iter::once(reading.len()))
+            .collect();
+        let continuation = if min_start == 0 && !self.romaji_capital.is_empty() {
+            english.continuation_spans(&pieces[..n], &self.romaji_capital)
+        } else {
+            Vec::new()
+        };
+        for span in english.spans(&pieces[..n]).into_iter().chain(continuation) {
+            if span.start < min_start {
+                continue;
+            }
+            let (start, end) = (byte_at[span.start], byte_at[span.end]);
+            for e in crate::english::english_entries(&span, &reading[start..end]) {
+                lattice.add_word(start, end, e);
+            }
+        }
+    }
+
     pub fn set_cooc(&mut self, cooc: Option<Arc<crate::judge_cooc::JudgeCooc>>) {
         self.cooc = cooc;
     }
@@ -62,6 +160,23 @@ impl ViterbiConverter {
     /// 話題がつながらないとき）
     pub fn clear_context(&mut self) {
         self.context_nouns.clear();
+    }
+
+    /// 入力欄に既にある文章（カーソルより前）の名詞を共起の文脈に加える。
+    ///
+    /// 自分の確定だけを文脈にすると、フォーカス移動やクリックで文脈が消え、
+    /// 返信先のメールや前に書いた段落など「画面には見えている話題」が使えない。
+    /// 文章は漢字かな混じりの表記なので、共起モデルの名詞の語彙を表記で
+    /// 最長一致して拾う（形態素解析はしない。漢字・カタカナの連続の中だけを見る）。
+    /// カーソルに近い名詞ほど新しい文脈として先頭に来る。
+    pub fn note_field_text(&mut self, text: &str) {
+        let Some(cooc) = self.cooc.as_ref() else { return };
+        let nouns = extract_cooc_nouns(cooc, text);
+        for surface in nouns {
+            self.context_nouns.retain(|n| n != &surface);
+            self.context_nouns.insert(0, surface);
+        }
+        self.context_nouns.truncate(CONTEXT_NOUNS_MAX);
     }
 
     /// 共起モデルの文脈語ID: 直前の確定文の名詞 ＋ `extra`
@@ -156,6 +271,11 @@ impl ViterbiConverter {
                 .copied()
                 .unwrap_or(0)
         };
+        // 英単語の候補の `cost` には英単語の対数確率が入っている（`english_entries`）。
+        // 辞書コストとしては辞書の外来語と同じくらいの一定値で扱う
+        if crate::english::is_english_entry(e) {
+            return (ENGLISH_WORD_DICT_COST, learned);
+        }
         (self.word_cost_with_learned(e, 0), learned)
     }
 
@@ -247,11 +367,13 @@ impl ViterbiConverter {
     /// 断片修復版。固定文節 `pinned` は全候補で保たれる。
     fn judge_candidate_paths(&self, judge: &JudgeLm, reading: &str, pinned: &[WordEntry]) -> Vec<Vec<WordEntry>> {
         let pinned = matching_pinned_prefix(reading, pinned);
-        let lattice = if pinned.is_empty() {
+        let mut lattice = if pinned.is_empty() {
             self.build_lattice(reading)
         } else {
             self.build_pinned_lattice(reading, pinned)
         };
+        let pinned_chars: usize = pinned.iter().map(|e| e.reading.chars().count()).sum();
+        self.add_english_nodes(&mut lattice, reading, pinned_chars);
         let Some(path) = self.lm_viterbi(judge, &lattice, None) else {
             return Vec::new();
         };
@@ -368,7 +490,11 @@ impl ViterbiConverter {
                             _ => 0.0,
                         };
                         let (wc, wc_learned) = word_costs[cur];
-                        let base = -(conn.saturating_add(wc) as f32) / params.dict_scale
+                        let english_cont = match prev_entry {
+                            Some(p) => judge.english_continuation(Some(p), e),
+                            None => 0.0,
+                        };
+                        let base = english_cont - (conn.saturating_add(wc) as f32) / params.dict_scale
                             + conn_learned.saturating_add(wc_learned) as f32 / params.learn_scale
                             + seed
                             + node_bonus.map_or(0.0, |b| b[cur])
@@ -477,7 +603,8 @@ impl ViterbiConverter {
         if judged.is_empty() || judged[0].is_baseline {
             return base;
         }
-        let best = judged.swap_remove(0);
+        let mut best = judged.swap_remove(0);
+        crate::english::space_between_english_words(&mut best.entries);
         crate::debug_log!(
             "judge: {}→{}（確率{:.2}, lm={:.1}, dict={}）",
             base.iter().map(|e| e.surface.as_str()).collect::<String>(),

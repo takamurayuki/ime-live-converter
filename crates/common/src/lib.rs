@@ -12,6 +12,8 @@ pub mod judge_cooc;
 pub mod brackets;
 pub mod conversion;
 pub mod paths;
+pub mod english;
+pub mod report;
 
 pub use dictionary::{Dictionary, WordEntry, TrieNode, ConnectionMatrix, CharCategory, PosId};
 pub use corpus_lm::CorpusLm;
@@ -460,30 +462,38 @@ impl RomajiConverter {
     ///
     /// 大文字は小文字として扱う（Shift押下時の入力も同じかなにする）。
     pub fn convert(&self, romaji: &str) -> String {
-        let mut result = String::new();
+        self.convert_aligned(romaji).into_iter().map(|(_, kana)| kana).collect()
+    }
+
+    /// `convert` と同じ変換を、出力の1片ごとに「その片を作った打鍵の文字数」と
+    /// 組にして返す（`kyo`→`(3, "きょ")`、`tt`→`(1, "っ"), (1, "t")`）。
+    /// 片をつなげると `convert` の結果になる。英単語の自動判定で、かなの各位置が
+    /// どの打鍵から来たか（こで ← code）を知るために使う。
+    pub fn convert_aligned(&self, romaji: &str) -> Vec<(usize, String)> {
+        let mut result = Vec::new();
         let mut i = 0;
         let chars: Vec<char> = romaji.chars().map(|c| c.to_ascii_lowercase()).collect();
-        
+
         while i < chars.len() {
             let mut matched = false;
-            
+
             // 最長一致を試す（4文字 → 3文字 → 2文字 → 1文字）
             for len in (1..=4).rev() {
                 if i + len > chars.len() {
                     continue;
                 }
-                
+
                 let substr: String = chars[i..i+len].iter().collect();
-                
+
                 // マッピングテーブルで検索
                 if let Some(kana) = self.mapping.get(substr.as_str()) {
-                    result.push_str(kana);
+                    result.push((len, kana.to_string()));
                     i += len;
                     matched = true;
                     break;
                 }
             }
-            
+
             // マッチしなかった場合
             if !matched {
                 // 促音処理: 同じ子音が続く場合
@@ -491,12 +501,12 @@ impl RomajiConverter {
                     let ch = chars[i];
                     // 子音の判定
                     if matches!(ch, 'k' | 's' | 't' | 'p' | 'g' | 'z' | 'd' | 'b' | 'c' | 'h' | 'm' | 'r' | 'w' | 'f' | 'v' | 'j' | 'q' | 'y') {
-                        result.push('っ');
+                        result.push((1, "っ".to_string()));
                         i += 1; // 最初の子音をスキップ
                         continue;
                     }
                 }
-                
+
                 // 'n' の特殊処理: 次が母音でない場合は「ん」
                 if chars[i] == 'n' {
                     // 次の文字を確認
@@ -504,25 +514,32 @@ impl RomajiConverter {
                         let next = chars[i + 1];
                         // 次が母音（a,i,u,e,o,y）でない場合は「ん」として確定
                         if !matches!(next, 'a' | 'i' | 'u' | 'e' | 'o' | 'y') {
-                            result.push('ん');
+                            result.push((1, "ん".to_string()));
                             i += 1;
                             continue;
                         }
                     } else {
                         // 最後の文字が 'n' ならそのまま（まだ確定しない）
-                        result.push('n');
+                        result.push((1, "n".to_string()));
                         i += 1;
                         continue;
                     }
                 }
-                
+
                 // それでもマッチしなければそのまま追加
-                result.push(chars[i]);
+                result.push((1, chars[i].to_string()));
                 i += 1;
             }
         }
-        
+
         result
+    }
+}
+
+impl RomajiConverter {
+    /// 対応表（ローマ字→かな）の全エントリ。逆引き（`report::kana_to_romaji`）用。
+    pub fn mapping_entries(&self) -> impl Iterator<Item = (&&'static str, &&'static str)> {
+        self.mapping.iter()
     }
 }
 

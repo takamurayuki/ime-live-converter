@@ -181,6 +181,17 @@ pub(crate) fn is_ime_toggle_vk(vk: u32) -> bool {
     matches!(vk, 0x19 | 0xF3 | 0xF4)
 }
 
+/// MS-IME を「ひらがな/カタカナ入力で開く」キーか。
+///
+/// JIS配列の「カタカナ/ひらがな」キー（単独=VK_DBE_HIRAGANA、Shift併用=
+/// VK_DBE_KATAKANA）と VK_KANA。スペースバーの隣にあり誤って触りやすく、
+/// MS-IME へ素通しすると MS-IME が開いて我々の注入文字と二重に変換される
+/// （実機報告: たまにひらがな変換が有効になって競合する）。
+/// ※ 0x15 は韓国語配列では 한/영 キーだが、本ツールは日本語専用なので問題ない。
+pub(crate) fn is_ime_hiragana_vk(vk: u32) -> bool {
+    matches!(vk, 0x15 | 0xF1 | 0xF2)
+}
+
 /// フォアグラウンド窓の「実際にキーボードフォーカスを持つ窓」を解決する。
 ///
 /// `ImmGetDefaultIMEWnd`はIMEコンテキストを引数のhwndから解決するが、
@@ -235,6 +246,53 @@ pub(crate) fn close_ms_ime_for_foreground() {
             30,
             None,
         );
+    }
+}
+
+/// フォアグラウンドウィンドウの MS-IME が開いていれば閉じる。閉じたら true。
+///
+/// UIAポーラー（バックグラウンドスレッド）からの見張り用。我々が MS-IME を
+/// 閉じるのは文字注入の直前・モード切替・環境切替のときだけなので、その
+/// 合間に MS-IME が外部要因（変換キーに「IME-オン」を割り当てた設定、
+/// タスクトレイ操作、アプリ側の入力欄ごとの既定状態など）で開くと、
+/// 英数/コマンドモードの打鍵が MS-IME にひらがなとして取り込まれる。
+/// 問い合わせを挟むのは、閉じている大半の周期で無駄な設定メッセージを
+/// 送らないため（判定ログを残すためでもある）。
+pub(crate) fn close_ms_ime_if_open_for_foreground() -> bool {
+    unsafe {
+        use windows::Win32::UI::WindowsAndMessaging::{SendMessageTimeoutW, SMTO_ABORTIFHUNG};
+        let hwnd_fg = GetForegroundWindow();
+        if hwnd_fg.0.is_null() {
+            return false;
+        }
+        let hwnd = resolve_ime_target_hwnd(hwnd_fg);
+        let ime_wnd = ImmGetDefaultIMEWnd(hwnd);
+        if ime_wnd.0.is_null() {
+            return false;
+        }
+        let mut open: usize = 0;
+        let ok = SendMessageTimeoutW(
+            ime_wnd,
+            WM_IME_CONTROL,
+            WPARAM(IMC_GETOPENSTATUS),
+            LPARAM(0),
+            SMTO_ABORTIFHUNG,
+            30,
+            Some(&mut open),
+        );
+        if ok.0 == 0 || open == 0 {
+            return false;
+        }
+        let _ = SendMessageTimeoutW(
+            ime_wnd,
+            WM_IME_CONTROL,
+            WPARAM(IMC_SETOPENSTATUS),
+            LPARAM(0),
+            SMTO_ABORTIFHUNG,
+            30,
+            None,
+        );
+        true
     }
 }
 
@@ -312,6 +370,12 @@ pub(crate) unsafe fn sync_window_mode() {
     };
     OUR_ACTIVE = mode;
     LAST_FG_HWND = fg;
+    // 新しい環境の MS-IME が開いていると、英数/コマンドモードの打鍵が MS-IME に
+    // ひらがなとして取り込まれて競合する（日本語モードでも素通しキーが同様）。
+    // 未知の環境の初期モードは上で MS-IME の状態から読み取り済みなので、
+    // ここで閉じても判定には影響しない。環境が変わったときだけ（=1回）なので
+    // フック内でも遅延は最大30ms。
+    close_ms_ime_for_foreground();
     // 日本語の下書きは環境をまたがないのでクリア
     if let Some(cm) = LIVE_CONTEXT.get() {
         if let Ok(mut c) = cm.try_lock() {
@@ -330,6 +394,41 @@ pub(crate) unsafe fn sync_window_mode() {
     // 戻ってきた環境がコマンドモードで、以前の入力が残っていれば予測を再表示する
     if !OUR_ACTIVE && IS_ENABLED && is_terminal_focused() {
         update_command_suggestions();
+    }
+}
+
+/// 誤変換レポートのホットキー（Ctrl+Alt+R）。変換中ならその変換、そうで
+/// なければ直前の確定（確定履歴の最新）を記録し、記録した表記を表示する。
+/// 正しい表記は分からないので空のまま（トリアージ時に人が埋める）。
+pub(crate) fn report_misconversion_hotkey() {
+    let target = LIVE_CONTEXT.get().and_then(|cm| {
+        let c = cm.try_lock().ok()?;
+        if !c.hiragana_buffer.is_empty() && !c.conversion_result.is_empty() {
+            Some((c.hiragana_buffer.clone(), c.conversion_result.clone()))
+        } else {
+            c.commit_ring.back().map(|e| (e.reading.clone(), e.surface.clone()))
+        }
+    });
+    match target {
+        Some((reading, wrong)) => {
+            crate::misreport::submit(common::report::ReportKind::Manual, &reading, &wrong, None);
+            flash_mode_indicator(&format!("誤変換を記録: {wrong}"));
+        }
+        None => flash_mode_indicator("記録できる変換がありません"),
+    }
+}
+
+/// 確定後の復元で別の候補を選び直した＝直前の確定は誤変換だった、として
+/// 記録する。`before`は確定前の確定履歴の最新、`action`は選び直しの結果。
+pub(crate) fn report_restore_choice(before: Option<CommittedEntry>, action: Option<&ConversionAction>) {
+    let (Some(before), Some(action)) = (before, action) else { return };
+    if action.insert_text != before.surface {
+        crate::misreport::submit(
+            common::report::ReportKind::Restore,
+            &before.reading,
+            &before.surface,
+            Some(&action.insert_text),
+        );
     }
 }
 
@@ -625,6 +724,8 @@ pub(crate) fn on_click_outside_popup() {
             c.invalidate_commit_ring();
             let settled = settle_composition_on_click(&mut c);
             debug_log!("ポップアップ外クリック: 下書き確定={}", settled);
+            // クリックでキャレットが移ったので入力欄の文章を読み直してもらう
+            request_field_text();
         }
     }
     hide_candidate_window();
@@ -1142,10 +1243,29 @@ fn low_level_keyboard_proc_impl(
                 return LRESULT(1);
             }
 
+            // Ctrl+Alt+R: 誤変換レポート。変換中ならその変換、そうでなければ
+            // 直前の確定を記録する（common::report）。修飾キー併用のパススルー
+            // （確定履歴を無効化する）より前で処理すること。
+            if is_ctrl_pressed() && is_alt_pressed() && !is_shift_pressed() && vk_code == 0x52 {
+                report_misconversion_hotkey();
+                return LRESULT(1);
+            }
+
             // 半角/全角キー: OUR_ACTIVE をトグル (MS-IME には届かせない)
             if is_ime_toggle_vk(vk_code) {
                 toggle_our_active();
                 return LRESULT(1); // 元のキーは MS-IME に渡さず消費
+            }
+
+            // カタカナ/ひらがなキー: MS-IME を開かせず、こちらの日本語入力に
+            // 切り替える（既に日本語入力中なら念のため MS-IME を閉じ直すだけ）。
+            if is_ime_hiragana_vk(vk_code) {
+                if OUR_ACTIVE {
+                    close_ms_ime_for_foreground();
+                } else {
+                    toggle_our_active();
+                }
+                return LRESULT(1);
             }
 
             // （Ctrl+Spaceのライブ変換トグルは、`!IS_ENABLED`のパススルーより
@@ -1244,7 +1364,9 @@ fn low_level_keyboard_proc_impl(
                     if let Ok(mut context) = context_mutex.try_lock() {
                         if context.is_restoring() {
                             if vk_code == VK_RETURN.0 as u32 {
+                                let before = context.commit_ring.back().cloned();
                                 let action = context.confirm_restore();
+                                report_restore_choice(before, action.as_ref());
                                 drop(context);
                                 hide_candidate_window();
                                 if let Some(action) = action {
@@ -1283,7 +1405,9 @@ fn low_level_keyboard_proc_impl(
                             // 直接選んでその場で確定する（巡回不要）。
                             if (0x31..=0x39).contains(&vk_code) {
                                 let index = (vk_code - 0x31) as usize;
+                                let before = context.commit_ring.back().cloned();
                                 let action = context.confirm_restore_at(index);
+                                report_restore_choice(before, action.as_ref());
                                 drop(context);
                                 if action.is_some() {
                                     hide_candidate_window();
@@ -1346,6 +1470,37 @@ fn low_level_keyboard_proc_impl(
                         ];
                         if CURSOR_MOVING_OR_DELETING_VKS.contains(&(vk_code as u16)) {
                             context.invalidate_commit_ring();
+                            // 入力中でなければキャレットが動いた＝周りの文章が
+                            // 変わったので、入力欄の文章を読み直してもらう
+                            // （入力中に読むと変換途中の表記まで拾ってしまう）
+                            if !context.is_composing() {
+                                request_field_text();
+                            }
+                        }
+                    }
+
+                    // 英字キーと Shift 以外のキーを挟んだら、Shift で直接入力した大文字の
+                    // 続きとして読むのをやめる（「D」Space「ocker」を Docker にしない）
+                    if !(0x41..=0x5A).contains(&vk_code) && !matches!(vk_code, 0x10 | 0xA0 | 0xA1) {
+                        context.forget_direct_capitals();
+                    }
+                    // 入力中でないときに素通しするキーで、次の入力が文頭かを更新する
+                    // （文頭の英単語の頭文字を大文字にする判定用）。Enter は改行＝文頭。
+                    // 英字・Space・修飾キー以外（数字・記号・Tab 等）は確定を経由せずに
+                    // 文字が入りうるので分からなくする（句読点のように変換を経由する
+                    // キーは、この後の確定で改めて決まる）
+                    if !context.is_composing() {
+                        match vk_code {
+                            0x0D => context.note_line_break(),
+                            0x41..=0x5A
+                            | 0x20
+                            | 0x10 | 0xA0 | 0xA1
+                            | 0x11 | 0xA2 | 0xA3
+                            | 0x12 | 0xA4 | 0xA5
+                            | 0x5B | 0x5C
+                            | 0x14
+                            | 0x70..=0x87 => {}
+                            _ => context.forget_sentence_start(),
                         }
                     }
 
@@ -1462,6 +1617,9 @@ fn low_level_keyboard_proc_impl(
                         // 経由しない文字挿入なので、リングバッファを無効化する
                         // （[[commit-ring-buffer]]）。
                         context.invalidate_commit_ring();
+                        // 続けて打つ小文字を、この大文字で始まる英単語の続きとして
+                        // 読めるように知らせる（Docker = D ＋ ocker、英単語の自動判定）
+                        context.note_direct_capital(char::from(vk_code as u8));
                         drop(context);
                         if let Some(action) = action {
                             execute_action(action);
@@ -1491,13 +1649,28 @@ fn low_level_keyboard_proc_impl(
                             }
                         }
 
-                        if let Some(action) = context.add_char(ch) {
-                            actions.push(action);
+                        // 新しい変換の始まり: UIAポーラーが読んでおいた入力欄の
+                        // 既存の文章を判断層の文脈として渡す（読み取り自体は
+                        // フック外。ここは取り出すだけ）
+                        if !context.is_composing() {
+                            if let Some(text) = take_field_text() {
+                                context.offer_field_text(text);
+                            }
                         }
-                        // 句読点は入力後に自動確定（日本語IMEの標準動作）
-                        if is_commit_char(ch) {
-                            if let Some(action) = context.commit() {
+                        // 句読点は入力後に自動確定（日本語IMEの標準動作）。入力中なら
+                        // 句読点を読みに入れて変換し直さず、表示中の変換をそのまま確定して
+                        // 句読点を後ろに足す（打った瞬間に正しい変換が別の変換に変わらないように）
+                        let punctuated = if is_commit_char(ch) { context.commit_with_punctuation(ch) } else { None };
+                        if let Some(punct_actions) = punctuated {
+                            actions.extend(punct_actions);
+                        } else {
+                            if let Some(action) = context.add_char(ch) {
                                 actions.push(action);
+                            }
+                            if is_commit_char(ch) {
+                                if let Some(action) = context.commit() {
+                                    actions.push(action);
+                                }
                             }
                         }
                         // 予測変換を更新して表示（番号キーで選べる）
@@ -1552,7 +1725,11 @@ fn low_level_keyboard_proc_impl(
                     //   （LLM校正は実用性が低いため廃止。誤字補正は「もしかして」
                     //    ＝即時のfuzzy補正で行う）
                     if vk_code == VK_SPACE.0 as u32 && context.is_composing() {
-                        let action = context.commit();
+                        // ローマ字として成り立たない打鍵（docker 等）は英字のまま確定
+                        let action = match context.english_word_on_commit() {
+                            Some(word) => context.commit_literal(word),
+                            None => context.commit(),
+                        };
                         drop(context);
                         if let Some(action) = action {
                             execute_action(action);
@@ -1657,6 +1834,28 @@ fn low_level_keyboard_proc_impl(
                         return CallNextHookEx(None, code, wparam, lparam);
                     }
 
+                    // F6/F7/F9/F10: 文字種変換して確定（MS-IME と同じ割り当て。
+                    // F6=ひらがな F7=カタカナ F9=全角英数 F10=半角英数＝打ったまま）。
+                    // 英単語の自動判定が効かない形（日本語に続けた英字等）の逃げ道。
+                    if context.is_composing() {
+                        let key = match vk_code {
+                            0x75 => Some(TransformKey::Hiragana),
+                            0x76 => Some(TransformKey::Katakana),
+                            0x78 => Some(TransformKey::FullwidthAlnum),
+                            0x79 => Some(TransformKey::HalfwidthAlnum),
+                            _ => None,
+                        };
+                        if let Some(key) = key {
+                            let action = context.commit_transformed(key);
+                            drop(context);
+                            if let Some(action) = action {
+                                execute_action(action);
+                            }
+                            hide_candidate_window();
+                            return LRESULT(1);
+                        }
+                    }
+
                     // Enter: 確定のみ（IME標準動作: 変換中のEnterは改行しない）
                     if vk_code == VK_RETURN.0 as u32 && context.is_composing() {
                         // 予測変換（もしかして/補完）が表示中なら、Enter で
@@ -1676,8 +1875,12 @@ fn low_level_keyboard_proc_impl(
                             show_prediction_popup(&preds, 0);
                             return LRESULT(1);
                         }
-                        // それ以外は通常の確定（確定後は次単語予測を表示）
-                        let action = context.commit();
+                        // それ以外は通常の確定（確定後は次単語予測を表示）。
+                        // ローマ字として成り立たない打鍵は英単語として英字のまま確定する。
+                        let action = match context.english_word_on_commit() {
+                            Some(word) => context.commit_literal(word),
+                            None => context.commit(),
+                        };
                         let preds = context.prediction_display();
                         drop(context);
                         if let Some(action) = action {
@@ -1811,6 +2014,15 @@ mod hook_pure_fn_tests {
         assert!(is_ime_toggle_vk(0xF3)); // VK_DBE_DBCSCHAR / VK_OEM_AUTO
         assert!(is_ime_toggle_vk(0xF4)); // VK_DBE_SBCSCHAR / VK_OEM_ENLW
         assert!(!is_ime_toggle_vk(0x41)); // 'A' は対象外
+    }
+
+    #[test]
+    fn is_ime_hiragana_vk_matches_kana_keys_only() {
+        assert!(is_ime_hiragana_vk(0x15)); // VK_KANA
+        assert!(is_ime_hiragana_vk(0xF1)); // VK_DBE_KATAKANA (Shift+ひらがな)
+        assert!(is_ime_hiragana_vk(0xF2)); // VK_DBE_HIRAGANA
+        assert!(!is_ime_hiragana_vk(0x19)); // 半角/全角は別扱い
+        assert!(!is_ime_hiragana_vk(0xF0)); // 英数キーは対象外
     }
 
     #[test]
