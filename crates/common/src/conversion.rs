@@ -624,6 +624,17 @@ impl LiveConversionState {
         self.direct_capitals.push(c);
     }
 
+    /// Shift＋英字で大文字を直接入力したときの後始末をまとめて行う: 確定後の復元用
+    /// リングを無効化し（`invalidate_commit_ring`）、続けて打った大文字の並び
+    /// （API）を保ったまま `c` を足す。`invalidate_commit_ring` 単体は大文字の記録も
+    /// 捨てるので、別々に呼ぶと頭字語が最後の1文字（I）しか残らない。
+    pub fn note_direct_capital_after_invalidate(&mut self, c: char) {
+        let capitals = std::mem::take(&mut self.direct_capitals);
+        self.invalidate_commit_ring();
+        self.direct_capitals = capitals;
+        self.direct_capitals.push(c);
+    }
+
     /// 直接入力した大文字の記録を捨てる（英字以外のキーを挟んだとき。呼び出し側が判断する）
     pub fn forget_direct_capitals(&mut self) {
         self.direct_capitals.clear();
@@ -2866,6 +2877,9 @@ impl LiveConversionState {
             .to_string();
         self.last_sent_length = self.conversion_result.chars().count();
         self.hiragana_buffer = self.hiragana_buffer.chars().skip(reading_len).collect();
+        // 部分確定した語は復元用リングに積まない（積まないまま前の確定の履歴を残すと、
+        // 画面の末尾とずれて復元が関係ない文字を消す）
+        self.commit_ring.clear();
         if self.kana_raw.get(reading_len).map_or(false, |(_, raw)| raw.is_empty()) {
             self.kana_raw.clear();
         } else {
@@ -2905,7 +2919,10 @@ impl LiveConversionState {
         let punct = self.match_closing_brackets(&punct);
         // 確定後の復元は「直前の確定がカーソルの直前にある」前提なので、句読点も
         // 直前の確定の一部として積み直す（句読点込みで選び直せる、従来と同じ形）
-        if self.commit_ring_pushes != pushes {
+        if self.commit_ring_pushes == pushes {
+            // 確定が履歴に積まれなかった: 句読点の前にある履歴はもう画面の末尾に無い
+            self.commit_ring.clear();
+        } else {
             if let Some(entry) = self.commit_ring.back_mut() {
                 entry.reading.push_str(&punct);
                 entry.surface.push_str(&punct);
@@ -3033,16 +3050,30 @@ impl LiveConversionState {
                 .as_ref()
                 .map(|c| c.n_best_strings(&reading, COMMIT_RING_N_BEST))
                 .unwrap_or_default();
-            if self.commit_ring.len() >= COMMIT_RING_CAPACITY {
-                self.commit_ring.pop_front();
+            // 画面にはかなにならないまま残った打鍵（kyouk の k）も確定されるので、
+            // それも含めて積む。復元は「画面の末尾の char_count 文字を置き換える」ので、
+            // 積んだ表記が画面の表示と食い違うと関係ない文字を消してしまう。
+            // 食い違うときは積まずに履歴を捨てる（復元できないほうが安全）
+            let tail = self.romaji_buffer.clone();
+            let surface = format!("{committed}{tail}");
+            if surface == self.conversion_result {
+                if self.commit_ring.len() >= COMMIT_RING_CAPACITY {
+                    self.commit_ring.pop_front();
+                }
+                self.commit_ring_pushes += 1;
+                self.commit_ring.push_back(CommittedEntry {
+                    char_count: surface.chars().count(),
+                    reading: format!("{reading}{tail}"),
+                    candidates: candidates.into_iter().map(|c| format!("{c}{tail}")).collect(),
+                    surface,
+                });
+            } else {
+                self.commit_ring.clear();
             }
-            self.commit_ring_pushes += 1;
-            self.commit_ring.push_back(CommittedEntry {
-                char_count: committed.chars().count(),
-                reading,
-                surface: committed.clone(),
-                candidates,
-            });
+        } else if !self.conversion_result.is_empty() {
+            // 文節にならない入力（打ち残しの英字だけ等）でも画面には文字が入るので、
+            // 前の確定の履歴はもう画面の末尾に無い
+            self.commit_ring.clear();
         }
         self.push_bracket_context(&committed);
         // 次単語予測のため、最後の文節の表記を覚える
@@ -4939,6 +4970,50 @@ mod state_machine_tests {
         assert_eq!((entry.surface.as_str(), entry.char_count), ("今日。", 3));
         // 入力中でなければ何もしない（呼び出し側が句読点だけを入力する）
         assert!(state.commit_with_punctuation(',').is_none());
+    }
+
+    /// 確定後の復元用リングの表記は、常に画面の末尾と一致していなければならない
+    /// （復元は末尾の char_count 文字を置き換えるので、ずれると関係ない文字を消す）。
+    /// かなにならない打ち残し（kyouk の k）があるときも、句読点で確定したときも。
+    #[test]
+    fn commit_ring_matches_screen_with_leftover_letters() {
+        let type_and_punct = |state: &mut LiveConversionState, sim: &mut String, s: &str| {
+            for ch in s.chars() {
+                apply_action_for_test(sim, state.add_char(ch));
+            }
+            for a in state.commit_with_punctuation('.').unwrap_or_default() {
+                apply_action_for_test(sim, Some(a));
+            }
+        };
+        // 打ち残しの k も含めて積む
+        let mut state = state_with_two_segment_dict();
+        let mut sim = String::new();
+        type_and_punct(&mut state, &mut sim, "kyouk");
+        assert_eq!(sim, "今日k。");
+        let entry = state.commit_ring.back().expect("確定は履歴に積まれる");
+        assert_eq!((entry.surface.as_str(), entry.char_count), ("今日k。", 4));
+        assert!(sim.ends_with(&entry.surface));
+
+        // 打ち残しだけの確定の後には、前の確定の履歴を残さない（もう画面の末尾に無い）
+        let mut state = state_with_two_segment_dict();
+        let mut sim = String::new();
+        type_and_punct(&mut state, &mut sim, "kyou");
+        type_and_punct(&mut state, &mut sim, "k");
+        assert_eq!(sim, "今日。k。");
+        assert!(state.commit_ring.back().map_or(true, |e| sim.ends_with(&e.surface)), "{:?}", state.commit_ring.back());
+    }
+
+    /// Shift で大文字を続けて直接入力（API）したら、全部を覚えておく
+    /// （2文字以上なら頭字語として、続く入力を英単語の続きにしない）
+    #[test]
+    fn consecutive_direct_capitals_are_kept() {
+        let mut state = state_with_two_segment_dict();
+        for c in ['A', 'P', 'I'] {
+            state.note_direct_capital_after_invalidate(c);
+        }
+        assert_eq!(state.direct_capitals, "API");
+        state.invalidate_commit_ring();
+        assert!(state.direct_capitals.is_empty());
     }
 
     fn apply_action_for_test(sim: &mut String, action: Option<ConversionAction>) {

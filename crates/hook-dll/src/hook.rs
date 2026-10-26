@@ -1616,10 +1616,10 @@ fn low_level_keyboard_proc_impl(
                         // このキー自体はアプリへそのまま渡す＝確定経路を
                         // 経由しない文字挿入なので、リングバッファを無効化する
                         // （[[commit-ring-buffer]]）。
-                        context.invalidate_commit_ring();
                         // 続けて打つ小文字を、この大文字で始まる英単語の続きとして
-                        // 読めるように知らせる（Docker = D ＋ ocker、英単語の自動判定）
-                        context.note_direct_capital(char::from(vk_code as u8));
+                        // 読めるように知らせる（Docker = D ＋ ocker、英単語の自動判定。
+                        // API のように大文字が続いたら頭字語として続きにしない）
+                        context.note_direct_capital_after_invalidate(char::from(vk_code as u8));
                         drop(context);
                         if let Some(action) = action {
                             execute_action(action);

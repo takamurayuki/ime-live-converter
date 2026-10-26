@@ -17,6 +17,11 @@
 #                              checkout) when there is no learning DB yet
 #     -NoAutostart             do not register the logon task (no admin needed)
 #     -NoStart                 do not start the IME after installing
+#     -NoShortcuts             do not create the Start menu shortcuts
+#
+# Updating later: run update.ps1 in the install folder (or the Start menu
+# shortcut "Update IME Live Converter"); it downloads the latest release and runs
+# its install.ps1.
 #
 # Registering the logon task needs admin rights (the task runs with highest
 # privileges so conversion also works in elevated apps); the script asks for
@@ -30,6 +35,8 @@ param(
     [string]$DataDir = "",
     [switch]$NoAutostart,
     [switch]$NoStart,
+    [switch]$NoShortcuts,
+    [string]$StartMenuDir = "",
     [switch]$Elevated
 )
 
@@ -45,6 +52,7 @@ $Src        = $PSScriptRoot
 # installs for the user who started the script.
 if (-not $InstallDir) { $InstallDir = Join-Path $env:LOCALAPPDATA "Programs\IMELiveConverter" }
 if (-not $DataDir)    { $DataDir    = Join-Path $env:LOCALAPPDATA "IMELiveConverter" }
+if (-not $StartMenuDir) { $StartMenuDir = Join-Path ([Environment]::GetFolderPath("Programs")) "IME Live Converter" }
 
 function Test-Admin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -62,8 +70,10 @@ function Finish([int]$code) {
 if (-not $NoAutostart -and -not (Test-Admin)) {
     Write-Host "Asking for administrator rights (needed to register the logon task)..."
     $argList = "-NoProfile -ExecutionPolicy Bypass -File " + (Quote $PSCommandPath) +
-        " -InstallDir " + (Quote $InstallDir) + " -DataDir " + (Quote $DataDir) + " -Elevated"
+        " -InstallDir " + (Quote $InstallDir) + " -DataDir " + (Quote $DataDir) +
+        " -StartMenuDir " + (Quote $StartMenuDir) + " -Elevated"
     if ($ModelsDir)        { $argList += " -ModelsDir " + (Quote $ModelsDir) }
+    if ($NoShortcuts)      { $argList += " -NoShortcuts" }
     if ($ImportLearningDb) { $argList += " -ImportLearningDb " + (Quote $ImportLearningDb) }
     if ($NoStart)          { $argList += " -NoStart" }
     $p = Start-Process powershell -Verb RunAs -ArgumentList $argList -Wait -PassThru
@@ -106,7 +116,7 @@ try {
     $samePlace = ((Resolve-Path $Src).Path.TrimEnd('\') -ieq (Resolve-Path $InstallDir).Path.TrimEnd('\'))
     if (-not $samePlace) {
         $items = @("conversion-service.exe", "hook_dll.dll", "run-hidden.vbs", "install.ps1", "uninstall.ps1",
-                   "VERSION", "MODELS_VERSION_REQUIRED", "README.txt")
+                   "update.ps1", "VERSION", "MODELS_VERSION_REQUIRED", "README.txt")
         foreach ($f in $items) {
             $from = Join-Path $Src $f
             if (Test-Path $from) { Copy-Item $from -Destination $InstallDir -Force }
@@ -202,6 +212,27 @@ try {
             -Principal $principal -Settings $settings -Force | Out-Null
     }
 
+    # ---- 5b. Start menu shortcuts (update / uninstall) -------------------------------
+    if ($NoShortcuts) {
+        Write-Host "5b) Skipping the Start menu shortcuts (-NoShortcuts)."
+    } else {
+        Write-Host "5b) Creating Start menu shortcuts in $StartMenuDir"
+        New-Item -ItemType Directory -Force -Path $StartMenuDir | Out-Null
+        $shell = New-Object -ComObject WScript.Shell
+        $ps = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+        $links = @(
+            @{ Name = "Update IME Live Converter.lnk";    Script = "update.ps1";    Args = "-Pause" },
+            @{ Name = "Uninstall IME Live Converter.lnk"; Script = "uninstall.ps1"; Args = "" }
+        )
+        foreach ($l in $links) {
+            $lnk = $shell.CreateShortcut((Join-Path $StartMenuDir $l.Name))
+            $lnk.TargetPath = $ps
+            $lnk.Arguments = "-NoProfile -ExecutionPolicy Bypass -File " + (Quote (Join-Path $InstallDir $l.Script)) + " " + $l.Args
+            $lnk.WorkingDirectory = $InstallDir
+            $lnk.Save()
+        }
+    }
+
     # ---- 6. start ----------------------------------------------------------------
     if ($NoStart) {
         Write-Host "6) Not starting (-NoStart)."
@@ -215,6 +246,7 @@ try {
 
     Write-Host ""
     Write-Host "Done: IME Live Converter $newVersion (models $modelsVersion)."
+    Write-Host "To update:    powershell -ExecutionPolicy Bypass -File `"$(Join-Path $InstallDir 'update.ps1')`""
     Write-Host "To uninstall: powershell -ExecutionPolicy Bypass -File `"$(Join-Path $InstallDir 'uninstall.ps1')`""
     Finish 0
 } catch {

@@ -17,8 +17,17 @@ Rust などの開発環境は不要です。
   - プログラムは %LOCALAPPDATA%\Programs\IMELiveConverter に入ります。
   - 学習データは %LOCALAPPDATA%\IMELiveConverter に保存され、更新しても消えません。
 
+■ 更新（2回目以降）
+  スタートメニューの「IME Live Converter」→「Update IME Live Converter」を開くだけです。
+  GitHub の最新版を調べ、新しければダウンロード（チェックサムを照合）して入れ替えます。
+  学習データはそのまま残ります。コマンドで行う場合:
+    powershell -ExecutionPolicy Bypass -File "%LOCALAPPDATA%\Programs\IMELiveConverter\update.ps1"
+  新しい版があるかだけ調べる: 上のコマンドに -CheckOnly を付ける
+  特定の版を入れる（戻す）:   上のコマンドに -Version 1.0.0 のように付ける
+
 ■ アンインストール
     powershell -ExecutionPolicy Bypass -File "%LOCALAPPDATA%\Programs\IMELiveConverter\uninstall.ps1"
+  （スタートメニューの「Uninstall IME Live Converter」からも実行できます）
   学習データも消すかを確認されます（既定は残す）。
 
 ■ 注意

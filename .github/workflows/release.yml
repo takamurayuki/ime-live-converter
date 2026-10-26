@@ -61,5 +61,7 @@ jobs:
           辞書・判断層モデル（[$models](https://github.com/${{ github.repository }}/releases/tag/$models)）は、
           未インストールまたは更新が必要なときだけ install.ps1 が自動で取得します。
           学習データ（%LOCALAPPDATA%\IMELiveConverter）は更新しても残ります。
+          インストール済みなら、スタートメニューの「Update IME Live Converter」
+          （または ``update.ps1``）でこの版に更新できます。
           "@
-          gh release create $tag (Get-ChildItem dist/*.zip).FullName --title "IME Live Converter $tag" --notes $notes --generate-notes
+          gh release create $tag (Get-ChildItem dist/*.zip, dist/*.zip.sha256).FullName --title "IME Live Converter $tag" --notes $notes --generate-notes

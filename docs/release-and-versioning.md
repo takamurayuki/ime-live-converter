@@ -145,7 +145,7 @@ GitHub Release に公開、を行う。バイナリは C ランタイムを静�
 | 4 置き場所 | `crates/common/src/paths.rs`。学習DBは `LearningRepository::open_default()`（無ければ起動フォルダ・exe の隣の旧DBを `VACUUM INTO` で移行。移行元は消さない）。`IME_DATA_DIR` で上書き可 |
 | 5 本体とモデル | `scripts/package.ps1`（`-Models` でモデルも）、`scripts/publish-models.ps1`、`packaging/models-version.txt` |
 | 6 スキーマの版 | `learning.rs` の `SCHEMA_VERSION` と `migrate()`。新しい版の DB は開かない |
-| 7 インストール・更新 | `packaging/install.ps1` / `uninstall.ps1` / `run-hidden.vbs`（配布物の直下に入る） |
+| 7 インストール・更新 | `packaging/install.ps1` / `uninstall.ps1` / `update.ps1` / `run-hidden.vbs`（配布物の直下に入る）。`install.ps1` がスタートメニューに「更新」「アンインストール」のショートカットを作る。`update.ps1` は GitHub の最新リリース（モデルのリリースは `--latest=false` なので対象外）を見て、ZIP と `.sha256` を取得して照合し、新しい ZIP の `install.ps1` を実行する |
 | 8 CI | `.github/workflows/release.yml`（タグ）、`ci.yml`（master への push・PR）。C ランタイムの静的リンクは `.cargo/config.toml` |
 
 ### リリース手順
@@ -155,7 +155,10 @@ GitHub Release に公開、を行う。バイナリは C ランタイムを静�
 2. `Cargo.toml` の `[workspace.package] version` を上げる（上の表に従う）
 3. `git tag vX.Y.Z` → `git push origin master vX.Y.Z`
 4. CI が テスト → パッケージ作成 → GitHub Release 公開 まで行う
-5. 利用者は新しい ZIP を展開して `install.ps1` を実行する（学習は残る）
+5. 利用者はスタートメニューの「Update IME Live Converter」（`update.ps1`）を開く。
+   GitHub の最新リリースを調べ、ZIP をダウンロードして `.sha256` と照合し、その ZIP の
+   `install.ps1` で入れ替える（学習は残る）。新しい ZIP を手で展開して `install.ps1` を
+   実行してもよい
 
 **モデルを変えたとき（辞書の作り直し・判断層の再学習）**
 1. `packaging/models-version.txt` を新しい版（例: `models-2026.11.01`）にする
@@ -211,3 +214,5 @@ GitHub Release に公開、を行う。バイナリは C ランタイムを静�
 - 2026-10-10: 実装を反映。`system.dic` が再現できないためモデル側で配ることにした理由、
   モデルを ZIP でなく個別ファイルで置く理由、リリース手順を追記。
 - 2026-10-11: 判断層モデルを CC BY-SA 4.0 で公開する決定と理由を追記。モデルの Release にライセンス表記を添付。
+- 2026-10-26: 更新を簡単にするため `update.ps1`（最新リリースの取得・チェックサム照合・`install.ps1` の実行）とスタートメニューのショートカットを追加。リリースに ZIP の `.sha256` を添付。
+- 2026-10-26: `extra.csv` に外来語を足して `system.dic` を作り直したため、モデルの版を `models-2026.10.26` に上げた（`models-2026.10.10` は未公開のまま欠番）。英単語の自動判定の頻度表 `english_words.tsv`（CC BY-SA 4.0）は小さいので本体パッケージに同梱し、帰属表示を `NOTICE.txt` に追加。

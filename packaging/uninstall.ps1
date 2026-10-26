@@ -13,6 +13,7 @@ param(
     [string]$DataDir = "",
     [switch]$RemoveUserData,
     [switch]$KeepUserData,
+    [string]$StartMenuDir = "",
     [switch]$Elevated
 )
 
@@ -20,6 +21,7 @@ $ErrorActionPreference = "Stop"
 $TaskName = "IMELiveConverter"
 if (-not $InstallDir) { $InstallDir = Join-Path $env:LOCALAPPDATA "Programs\IMELiveConverter" }
 if (-not $DataDir)    { $DataDir    = Join-Path $env:LOCALAPPDATA "IMELiveConverter" }
+if (-not $StartMenuDir) { $StartMenuDir = Join-Path ([Environment]::GetFolderPath("Programs")) "IME Live Converter" }
 
 function Test-Admin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -42,7 +44,8 @@ $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 if ($task -and -not (Test-Admin)) {
     Write-Host "Asking for administrator rights (needed to remove the logon task)..."
     $argList = "-NoProfile -ExecutionPolicy Bypass -File " + (Quote $PSCommandPath) +
-        " -InstallDir " + (Quote $InstallDir) + " -DataDir " + (Quote $DataDir) + " -Elevated"
+        " -InstallDir " + (Quote $InstallDir) + " -DataDir " + (Quote $DataDir) +
+        " -StartMenuDir " + (Quote $StartMenuDir) + " -Elevated"
     if ($RemoveUserData) { $argList += " -RemoveUserData" } else { $argList += " -KeepUserData" }
     $p = Start-Process powershell -Verb RunAs -ArgumentList $argList -Wait -PassThru
     exit $p.ExitCode
@@ -69,6 +72,11 @@ try {
         Remove-Item $InstallDir -Recurse -Force
     } else {
         Write-Host "3) Program folder not found (already removed?): $InstallDir"
+    }
+
+    if (Test-Path $StartMenuDir) {
+        Write-Host "3b) Removing the Start menu shortcuts: $StartMenuDir"
+        Remove-Item $StartMenuDir -Recurse -Force
     }
 
     if ($RemoveUserData -and (Test-Path $DataDir)) {

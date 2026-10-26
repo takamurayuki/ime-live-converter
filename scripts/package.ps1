@@ -62,6 +62,7 @@ Copy-Item (Join-Path $bin "hook_dll.dll") $stage
 Copy-Item (Join-Path $root "packaging\run-hidden.vbs") $stage
 Copy-Item (Join-Path $root "packaging\install.ps1") $stage
 Copy-Item (Join-Path $root "packaging\uninstall.ps1") $stage
+Copy-Item (Join-Path $root "packaging\update.ps1") $stage
 Copy-Item (Join-Path $root "packaging\README-dist.txt") (Join-Path $stage "README.txt")
 Copy-Item (Join-Path $root "packaging\licenses\*") (Join-Path $stage "licenses")
 foreach ($f in @("commands.csv", "word_priority.tsv", "word_assoc.tsv", "english_words.tsv", "english_tech.txt", "sample.dic")) {
@@ -77,6 +78,9 @@ if ($reported -ne $version) { throw "conversion-service.exe reports $reported, e
 $zip = Join-Path $out "$name.zip"
 if (Test-Path $zip) { Remove-Item $zip -Force }
 Compress-Archive -Path $stage -DestinationPath $zip
+# update.ps1 checks the download against this file (uploaded next to the zip)
+$zipHash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
+Set-Content -Path "$zip.sha256" -Value "$zipHash  $name.zip" -Encoding ASCII
 Write-Host "Program package: $zip"
 
 # ---- models (uploaded once per models version, not per program release) --------
