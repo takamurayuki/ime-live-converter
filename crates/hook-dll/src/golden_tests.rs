@@ -345,6 +345,26 @@ fn english_detection_with_judge() {
             failures.push(format!("「{before}」の後に {input} → 「{got}」（期待「{expected}」）"));
         }
     }
+    // 毎打鍵「もしかして」を更新する実際の経路でも、英単語を打ち間違い（ローマ字取り
+    // 残し）とみなして日本語に直す候補を出さない（出ていれば Enter でそれが確定する）
+    for case in parse_corpus(include_str!("golden/english.tsv")) {
+        let mut state = build_state(&dict);
+        state.converter.as_mut().unwrap().set_english(Some(std::sync::Arc::clone(&english)));
+        let got = run_case_with_predictions(&mut state, &case.input);
+        if got != case.expected {
+            failures.push(format!("もしかしてあり {} → 「{got}」（期待「{}」）", case.input, case.expected));
+        }
+    }
+    // 打ち間違いのコーパスは、英単語の候補があっても「もしかして」の結果が変わらない
+    for case in parse_corpus(CORRECTIONS_TSV) {
+        let mut with_state = build_state(&dict);
+        with_state.converter.as_mut().unwrap().set_english(Some(std::sync::Arc::clone(&english)));
+        let with = run_case_with_predictions(&mut with_state, &case.input);
+        let without = run_case_with_predictions(&mut build_state(&dict), &case.input);
+        if with != without {
+            failures.push(format!("もしかしての誤判定 {} → 「{with}」（英単語なしなら「{without}」）", case.input));
+        }
+    }
     for tsv in [REGRESSIONS_TSV, GENERAL_TSV, CORRECTIONS_TSV, COLLOCATIONS_TSV] {
         for case in parse_corpus(tsv) {
             let (with, without) = (run(&case.input, true), run(&case.input, false));

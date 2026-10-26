@@ -346,6 +346,11 @@ pub struct LiveConversionState {
     /// `commit_ring` に積んだ回数（`commit_with_punctuation` が、直前の確定が
     /// リングに積まれたかを知るため）
     commit_ring_pushes: u64,
+    /// 読みに残った英字（とかなにならないまま残った打鍵）が、すべて英単語の候補で
+    /// 説明できるか（`update_predictions` が補正器を走らせる前に求める）。そうなら
+    /// 「ローマ字取り残し」の補正（もしかして）を出さない（test・docker を打ち間違いと
+    /// みなして日本語に直す候補を出さない）。
+    letters_are_english: bool,
 }
 
 /// `commit_ring`の1エントリ（確定1回分）。
@@ -579,6 +584,7 @@ impl LiveConversionState {
             at_sentence_start: None,
             composition_at_sentence_start: false,
             commit_ring_pushes: 0,
+            letters_are_english: false,
         }
     }
 
@@ -936,6 +942,10 @@ impl LiveConversionState {
         if !embedded && !trailing_stuck {
             return None; // 取り残しなし（正常）
         }
+        // 残った英字が英単語として読めている（test・docker）なら打ち間違いではない
+        if self.letters_are_english {
+            return None;
+        }
         let converter = self.converter.as_ref()?;
         let full = format!("{}{}", self.hiragana_buffer, self.romaji_buffer);
         if full.chars().count() > 20 {
@@ -1173,6 +1183,7 @@ impl LiveConversionState {
         // 成さない断片」も fuzzy_suggest で拾っていたが、辞書のあいまい検索
         // による“その場の推測”は外れも多くノイズになるという実機フィード
         // バックにより対象から外した（[[fuzzy-correction-approach]]参照）。
+        self.letters_are_english = self.letters_explained_by_english();
         let mut correction_candidates: Vec<CorrectionCandidate> = Vec::new();
         correction_candidates.extend(LearnedTypoCorrector.suggest(self));
         correction_candidates.extend(RomajiRepairCorrector.suggest(self));
@@ -3152,28 +3163,55 @@ impl LiveConversionState {
         (inside && pos == end && raw.len() >= 3 && raw.chars().all(|c| c.is_ascii_alphabetic())).then_some(raw)
     }
 
-    /// かなにならないまま残った打鍵（`romaji_buffer`）を読みに入れて変換したとき、
-    /// 末尾が英単語になるか（test の st）。ならなければ確定時に読みへ入れない
-    /// （入れると英単語にならないのに日本語側の変換だけが変わる: seisakuk で
-    /// 「制作k」が「政策k」になった）。
-    fn pending_letters_end_english_word(&mut self) -> bool {
-        if !self.committed_segments.is_empty() {
-            return false;
-        }
+    /// かなにならないまま残った打鍵（`romaji_buffer`）を読みに入れて変換した結果。
+    /// 読みに入れたときの打鍵の対応で英単語の候補も作る（test の st まで含めて
+    /// 英単語になるか）。変換エンジンの打鍵の対応は今の読みのものに戻しておく。
+    fn convert_with_pending_letters(&mut self) -> Vec<crate::WordEntry> {
         let pending: Vec<char> = self.romaji_buffer.chars().map(|c| c.to_ascii_lowercase()).collect();
         let reading: String = self.hiragana_buffer.chars().chain(pending.iter().copied()).collect();
         let mut kana_raw = self.kana_raw.clone();
         kana_raw.extend(pending.iter().map(|&c| (c, c.to_string())));
-        let pieces = romaji_pieces_of(&kana_raw, &reading);
-        let Some(conv) = self.converter.as_mut() else { return false };
+        let pieces = if self.committed_segments.is_empty() { romaji_pieces_of(&kana_raw, &reading) } else { None };
+        let Some(conv) = self.converter.as_mut() else { return Vec::new() };
         conv.set_romaji_hint(pieces, &self.composition_capital);
         let entries = conv.convert_context_aware_pinned(&reading, &self.pinned);
-        // 次の変換のために今の読みの打鍵へ戻しておく
         let pieces = self.romaji_pieces();
         if let Some(conv) = self.converter.as_mut() {
             conv.set_romaji_hint(pieces, &self.composition_capital);
         }
-        entries.last().is_some_and(crate::english::is_english_entry)
+        entries
+    }
+
+    /// かなにならないまま残った打鍵を読みに入れて変換したとき、末尾が英単語に
+    /// なるか（test の st）。ならなければ確定時に読みへ入れない（入れると英単語に
+    /// ならないのに日本語側の変換だけが変わる: seisakuk で「制作k」が「政策k」になった）。
+    fn pending_letters_end_english_word(&mut self) -> bool {
+        if !self.committed_segments.is_empty() {
+            return false;
+        }
+        self.convert_with_pending_letters().last().is_some_and(crate::english::is_english_entry)
+    }
+
+    /// 読みに残った英字と、かなにならないまま残った打鍵が、すべて英単語の候補の
+    /// 中にあるか（`letters_are_english`）。英字が残っていなければ false。
+    fn letters_explained_by_english(&mut self) -> bool {
+        if !self.english_detection_active() || self.kana_tail_len != 0 {
+            return false;
+        }
+        let embedded = self.hiragana_buffer.chars().any(|c| c.is_ascii_alphabetic());
+        let trailing = !self.romaji_buffer.is_empty() && self.is_stuck_romaji(&self.romaji_buffer);
+        if !embedded && !trailing {
+            return false;
+        }
+        let entries = if trailing {
+            self.convert_with_pending_letters()
+        } else {
+            self.convert_buffer(&self.hiragana_buffer)
+        };
+        !entries.is_empty()
+            && entries
+                .iter()
+                .all(|e| crate::english::is_english_entry(e) || !e.reading.chars().any(|c| c.is_ascii_alphabetic()))
     }
 
     /// 英単語の自動判定（判断層が英単語の候補を比べる方式）が使えるか
