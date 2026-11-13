@@ -1108,6 +1108,21 @@ fn low_level_keyboard_proc_impl(
         let kb = *(lparam.0 as *const KBDLLHOOKSTRUCT);
         let event = wparam.0 as u32;
 
+        // 実キーの押下/離しの状態は、下のパスワード欄・昇格プロセスの素通しより
+        // 前に更新する。素通し中に届いた「離す」を見落とすと、そのキーは
+        // 押されたままの扱いで残り、次の本物の押下がOSのキーリピートと誤判定
+        // されて無視される（実機報告 2026-11-14: 入力欄ワープで別ウィンドウへ
+        // 移った直後、フォーカス変更でUnknownに落ちている間にCtrl+無変換の
+        // 無変換を離すと、次のCtrl+無変換が1回おきに効かなくなっていた）。
+        // ここで持つのはキーごとの押下フラグだけで、ログにも内容にも触れない。
+        // 自己送信キーは除外する（自分が送るBackspace等の連続送出を実キーの
+        // 押しっぱなしと誤認しないため。`track_key_repeat`の説明を参照）。
+        let is_key_repeat = if is_self_injected(kb.flags.0, kb.dwExtraInfo) {
+            false
+        } else {
+            track_key_repeat(kb.vkCode, event)
+        };
+
         // パスワード欄では他の判定より前に完全パススルーする（ログも一切
         // 残さない）。グローバルキーボードフック＋SendInputという構成は
         // 振る舞いがキーロガーと完全に一致するため、この判定は配布可否に
@@ -1161,10 +1176,6 @@ fn low_level_keyboard_proc_impl(
             return CallNextHookEx(None, code, wparam, lparam);
         }
 
-        // 実キーのリピート状態を更新（自己注入キーを除外した後で行う。
-        // 自分が送るBackspace/Enter等の連続送出を「押しっぱなし」と
-        // 誤認識すると、次の本物のキー入力まで誤ってリピート扱いされる）。
-        let is_key_repeat = track_key_repeat(kb.vkCode, event);
 
         // Ctrl+Space: ライブ変換全体のトグル（緊急OFF/ON用）。
         //
@@ -1227,6 +1238,22 @@ fn low_level_keyboard_proc_impl(
             // 環境(ウィンドウ)ごとのモードを同期（切替が全体に波及しないように）。
             // フォーカスが変わっていたら前の環境のモードを保存し、今の環境のを復元する。
             sync_window_mode();
+
+            // Ctrl+無変換 / Ctrl+Shift+無変換: 入力欄ワープ（次／前の入力欄へ
+            // フォーカスを移す。crate::field_jump）。UIAの走査は重いので、ここでは
+            // 依頼を積むだけで即座に返す。下書きがあればクリックと同じく確定扱いに
+            // する（フォーカスが移った先へ古い下書きの差分編集を送らないため）。
+            // 押しっぱなしのリピートでは連続移動しない。
+            if is_ctrl_pressed()
+                && !is_alt_pressed()
+                && vk_code == windows::Win32::UI::Input::KeyboardAndMouse::VK_NONCONVERT.0 as u32
+            {
+                if !is_key_repeat {
+                    on_click_outside_popup();
+                    crate::field_jump::request_jump(is_shift_pressed());
+                }
+                return LRESULT(1);
+            }
 
             // Ctrl+Alt+A: モードに応じて設定ウィンドウを出し分ける。
             //  - 日本語変換モード（OUR_ACTIVE=true） → 単語登録ウィンドウ
