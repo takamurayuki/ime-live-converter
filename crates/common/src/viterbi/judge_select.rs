@@ -192,17 +192,17 @@ impl ViterbiConverter {
         ids
     }
 
-    /// 語列の共起の加点（重み前）: 候補中の名詞ごとに、文中の他の名詞と直前の
-    /// 確定文の名詞の中で最も強い PMI（上限 `cooc_cap`）の合計
+    /// 語列の共起の加点（重み前）: 候補中の名詞・動詞（`cooc_target_key_entry`）
+    /// ごとに、文中の他の名詞と直前の確定文の名詞の中で最も強い PMI
+    /// （上限 `cooc_cap`）の合計
     pub fn path_cooc_bonus(&self, path: &[WordEntry]) -> f32 {
         let (Some(judge), Some(cooc)) = (self.judge.as_ref(), self.cooc.as_ref()) else {
             return 0.0;
         };
         let cap = judge.params().cooc_cap;
-        let targets: Vec<&str> = path
+        let targets: Vec<std::borrow::Cow<str>> = path
             .iter()
-            .filter(|e| crate::judge_cooc::is_cooc_target_entry(&e.pos, &e.surface))
-            .map(|e| e.surface.as_str())
+            .filter_map(|e| crate::judge_cooc::cooc_target_key_entry(&e.pos, &e.surface, &e.reading))
             .collect();
         if targets.is_empty() {
             return 0.0;
@@ -239,15 +239,15 @@ impl ViterbiConverter {
             .iter()
             .map(|n| {
                 let Some(e) = n.entry.as_ref() else { return 0.0 };
-                if !crate::judge_cooc::is_cooc_target_entry(&e.pos, &e.surface) {
+                let Some(key) = crate::judge_cooc::cooc_target_key_entry(&e.pos, &e.surface, &e.reading) else {
                     return 0.0;
-                }
+                };
                 let others = spans
                     .iter()
                     .filter(|&&(s, t, _)| t <= n.start || s >= n.end)
                     .map(|&(_, _, w)| w);
                 let ctx = self.cooc_context_ids(cooc, others);
-                params.cooc_weight * cooc.assoc(&e.surface, &ctx, params.cooc_cap)
+                params.cooc_weight * cooc.assoc(&key, &ctx, params.cooc_cap)
             })
             .collect();
         Some(bonus)

@@ -1,5 +1,5 @@
-//! 判断層（judge-lm）の共起モデル: 同じ文の中に一緒に出てくる名詞どうしの
-//! 結びつきの強さ（自己相互情報量, PMI）。
+//! 判断層（judge-lm）の共起モデル: 同じ文の中に一緒に出てくる名詞どうし、
+//! および名詞と動詞の結びつきの強さ（自己相互情報量, PMI）。
 //!
 //! トライグラムは直前2語しか見ないため、「駅のホームで待っていた**きしゃ**」の
 //! 「駅」「ホーム」のように離れた語は汽車/記者の判断に届かない。ここでは
@@ -12,6 +12,12 @@
 //! 対象語ごとに、文中の他の名詞と直前に確定した文の名詞の中で最も強い PMI を
 //! 加点する（`ViterbiConverter::path_cooc_bonus`）。`dict-builder judge-cooc` で
 //! 構築し、`judge_cooc.bin` が無ければ何もしない（判断層本体とは独立に外せる）。
+//!
+//! 対象には、同じ読みで漢字が違う動詞（活かす/行かす、追う/負う、図る/計る）も
+//! 含める（2026-11-14）。「キャリアに**いかせる**」の「キャリア」のように、動詞の
+//! 漢字を決める手がかりも離れた名詞にあることが多いため。動詞は活用で形が
+//! 変わるので、送り仮名を除いた漢字の部分と、その読みの組（`verb_key`。
+//! 「活かせる/いかせる」→「動:活/い」）を見出しにする。文脈は名詞だけ。
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -44,6 +50,42 @@ pub fn is_cooc_noun(pos1: &str, pos2: &str, surface: &str) -> bool {
 /// （1文字の漢字に加点すると、読みを1文字ずつに割る誤変換を後押ししかねない）。
 pub fn is_cooc_target(pos1: &str, pos2: &str, surface: &str) -> bool {
     is_cooc_noun(pos1, pos2, surface) && surface.chars().count() >= 2
+}
+
+/// 動詞の共起の見出し（「動:<漢字の部分>/<その読み>」）。自立動詞で漢字を
+/// 含むものだけ。表記の末尾のひらがな（送り仮名・活用語尾）を読みの末尾からも
+/// 同じだけ除いて、漢字の部分の読みを得る（活かせる/いかせる → 活/い、
+/// 追わ/おわ → 追/お）。送り仮名が読みの末尾と一致しなければ None。
+pub fn verb_key(pos1: &str, pos2: &str, surface: &str, reading: &str) -> Option<String> {
+    if pos1 != "動詞" || pos2 != "自立" || !surface.chars().any(is_kanji) {
+        return None;
+    }
+    let hira = |c: char| ('ぁ'..='ゖ').contains(&c);
+    let tail_len: usize = surface.chars().rev().take_while(|&c| hira(c)).map(char::len_utf8).sum();
+    let (stem, tail) = surface.split_at(surface.len() - tail_len);
+    let stem_reading = reading.strip_suffix(tail)?;
+    if stem.is_empty() || stem_reading.is_empty() {
+        return None;
+    }
+    Some(format!("動:{}/{}", stem, stem_reading))
+}
+
+/// IME 辞書の品詞文字列で `verb_key` を求める
+pub fn verb_key_entry(pos: &str, surface: &str, reading: &str) -> Option<String> {
+    let (p1, p2) = split_pos(pos);
+    verb_key(p1, p2, surface, reading)
+}
+
+/// 共起の対象としての見出し: 名詞なら表記、動詞なら `verb_key`。対象でなければ None
+pub fn cooc_target_key_entry<'a>(
+    pos: &str,
+    surface: &'a str,
+    reading: &str,
+) -> Option<std::borrow::Cow<'a, str>> {
+    if is_cooc_target_entry(pos, surface) {
+        return Some(std::borrow::Cow::Borrowed(surface));
+    }
+    verb_key_entry(pos, surface, reading).map(std::borrow::Cow::Owned)
 }
 
 fn split_pos(pos: &str) -> (&str, &str) {
@@ -193,5 +235,21 @@ mod tests {
         assert!(!is_cooc_noun_entry("名詞-一般-*-*", "ミ")); // カタカナ1字
         assert!(!is_cooc_noun_entry("動詞-自立-*-*", "走る"));
         assert!(!is_cooc_noun_entry("名詞-一般-*-*", "こころ")); // ひらがなだけ
+    }
+
+    #[test]
+    fn verb_key_strips_okurigana() {
+        let k = |s: &str, r: &str| verb_key_entry("動詞-自立-*-*", s, r);
+        assert_eq!(k("活か", "いか").as_deref(), Some("動:活/い"));
+        assert_eq!(k("活かせる", "いかせる").as_deref(), Some("動:活/い"));
+        assert_eq!(k("行か", "いか").as_deref(), Some("動:行/い"));
+        assert_eq!(k("追わ", "おわ").as_deref(), Some("動:追/お"));
+        assert_eq!(k("行い", "おこない").as_deref(), Some("動:行/おこな"));
+        // ひらがなだけ・非自立は対象外
+        assert_eq!(k("いる", "いる"), None);
+        assert_eq!(verb_key_entry("動詞-非自立-*-*", "見る", "みる"), None);
+        // 名詞はそのまま表記が見出し
+        assert_eq!(cooc_target_key_entry("名詞-一般-*-*", "汽車", "きしゃ").as_deref(), Some("汽車"));
+        assert_eq!(cooc_target_key_entry("動詞-自立-*-*", "負わ", "おわ").as_deref(), Some("動:負/お"));
     }
 }

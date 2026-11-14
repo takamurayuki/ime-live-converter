@@ -2,8 +2,11 @@
 //! 同音異義のある名詞（対象）と同じ文の他の名詞（文脈）の組を数え、PMI を作る。
 //!
 //! - 対象は IME の辞書（system.dic）で同じ読みに名詞の表記が2つ以上あるもの
-//!   （汽車/記者、政策/製作 等）。変換で選び分けが必要な語だけ数えることで、
-//!   組の数（メモリ）を抑える。
+//!   （汽車/記者、政策/製作 等）と、同じ読みに漢字の違う自立動詞が2つ以上ある
+//!   もの（活か/行か、追わ/負わ 等。見出しは `verb_key`）。変換で選び分けが必要な
+//!   語だけ数えることで、組の数（メモリ）を抑える。文脈は名詞だけ。
+//! - 数える文は従来どおり名詞を2つ以上含む文（動詞を足しても名詞どうしの PMI は
+//!   変わらない）。
 //! - 学習に使う文・評価用データに回す文の分け方は `judge-train` と同じ
 //!   （N 文に1文を評価用）。評価用データには、同じ文の前の文節に出た名詞を
 //!   「直前に確定した文の名詞」として4列目に付ける（`judge_eval` が共起の文脈に使う）。
@@ -11,7 +14,7 @@
 use crate::judge_train::{is_dev_clause, is_reading_char, katakana_to_hiragana, load_ipadic_ids, Clause};
 use anyhow::Result;
 use common::judge::vocab_key;
-use common::judge_cooc::{is_cooc_noun, is_cooc_target_entry, JudgeCooc, JudgeCoocData};
+use common::judge_cooc::{is_cooc_noun, is_cooc_target_entry, verb_key, verb_key_entry, JudgeCooc, JudgeCoocData};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -36,8 +39,9 @@ const MAX_NOUNS_PER_SENTENCE: usize = 40;
 /// 評価用データに付ける文脈名詞の上限（実行時の `CONTEXT_NOUNS_MAX` と同じ）
 const MAX_CTX: usize = 12;
 
-/// 1文の分かち書き結果: (文中の名詞（重複なし）, 評価用の文節列（文節, 読み, 表記, 表示, その文節より前の名詞）)
-type SentenceOut = (Vec<String>, Vec<(Clause, String, String, Vec<String>, Vec<String>)>);
+/// 1文の分かち書き結果: (文中の名詞（重複なし）, 文中の動詞の見出し（重複なし）,
+/// 評価用の文節列（文節, 読み, 表記, 表示, その文節より前の名詞）)
+type SentenceOut = (Vec<String>, Vec<String>, Vec<(Clause, String, String, Vec<String>, Vec<String>)>);
 
 fn analyze(
     worker: &mut vibrato::tokenizer::worker::Worker<'_>,
@@ -47,6 +51,7 @@ fn analyze(
     worker.reset_sentence(sentence);
     worker.tokenize();
     let mut nouns: Vec<String> = Vec::new();
+    let mut verbs: Vec<String> = Vec::new();
     let mut clauses = Vec::new();
     let mut words: Clause = Vec::new();
     let (mut reading, mut surface) = (String::new(), String::new());
@@ -93,6 +98,11 @@ fn analyze(
             clause_nouns.push(s.to_string());
         }
         let r = feature.split(',').nth(7).map(katakana_to_hiragana).unwrap_or_default();
+        if let Some(k) = verb_key(pos1, pos2, s, &r) {
+            if !verbs.contains(&k) && verbs.len() < MAX_NOUNS_PER_SENTENCE {
+                verbs.push(k);
+            }
+        }
         lookup.clear();
         lookup.push_str(s);
         lookup.push('\t');
@@ -110,23 +120,30 @@ fn analyze(
         }
     }
     flush(&mut words, &mut reading, &mut surface, &mut shown, &mut clause_nouns, &mut before, &mut clauses);
-    (nouns, clauses)
+    (nouns, verbs, clauses)
 }
 
-/// IME 辞書で同じ読みに名詞の表記が2つ以上ある名詞（共起の対象）
-fn homophone_nouns(dict_path: &Path) -> Result<HashSet<String>> {
+/// IME 辞書で同じ読みに名詞の表記が2つ以上ある名詞と、同じ読みに漢字の違う
+/// 自立動詞が2つ以上ある動詞の見出し（共起の対象）。(名詞, 動詞) の数も返す。
+fn homophone_targets(dict_path: &Path) -> Result<(HashSet<String>, usize, usize)> {
     let dict = common::Dictionary::load(dict_path)?;
-    let mut by_reading: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut nouns: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut verbs: HashMap<String, HashSet<String>> = HashMap::new();
     let mut stack: Vec<&common::TrieNode> = vec![&dict.trie];
     while let Some(node) = stack.pop() {
         for e in &node.entries {
             if is_cooc_target_entry(&e.pos, &e.surface) {
-                by_reading.entry(e.reading.clone()).or_default().insert(e.surface.clone());
+                nouns.entry(e.reading.clone()).or_default().insert(e.surface.clone());
+            } else if let Some(k) = verb_key_entry(&e.pos, &e.surface, &e.reading) {
+                verbs.entry(e.reading.clone()).or_default().insert(k);
             }
         }
         stack.extend(node.children.values().map(|c| c.as_ref()));
     }
-    Ok(by_reading.into_values().filter(|s| s.len() >= 2).flatten().collect())
+    let nouns: HashSet<String> = nouns.into_values().filter(|s| s.len() >= 2).flatten().collect();
+    let verbs: HashSet<String> = verbs.into_values().filter(|s| s.len() >= 2).flatten().collect();
+    let (n, v) = (nouns.len(), verbs.len());
+    Ok((nouns.into_iter().chain(verbs).collect(), n, v))
 }
 
 pub fn train(
@@ -138,8 +155,8 @@ pub fn train(
     dev_output: &Path,
     opts: &CoocOptions,
 ) -> Result<()> {
-    let targets = homophone_nouns(system_dic)?;
-    eprintln!("共起の対象（同音異義のある名詞）: {} 語", targets.len());
+    let (targets, n_noun_targets, n_verb_targets) = homophone_targets(system_dic)?;
+    eprintln!("共起の対象: 同音異義のある名詞 {} 語 / 動詞 {} 語", n_noun_targets, n_verb_targets);
     let (ids, _) = load_ipadic_ids(ipadic_dir)?;
     let reader = zstd::Decoder::new(File::open(vibrato_dict)?)?;
     let tokenizer = vibrato::Tokenizer::new(vibrato::Dictionary::read(reader)?);
@@ -155,7 +172,7 @@ pub fn train(
     let file = BufReader::with_capacity(1 << 20, File::open(corpus)?);
     let (job_tx, job_rx) = mpsc::sync_channel::<(usize, Vec<String>)>(opts.threads * 2);
     let job_rx = std::sync::Mutex::new(job_rx);
-    type Batch = (Vec<Vec<String>>, Vec<(usize, String, String, String, String)>);
+    type Batch = (Vec<(Vec<String>, Vec<String>)>, Vec<(usize, String, String, String, String)>);
     let (res_tx, res_rx) = mpsc::sync_channel::<Batch>(opts.threads * 2);
     const CHUNK: usize = 5000;
 
@@ -173,7 +190,7 @@ pub fn train(
                     let mut devs = Vec::new();
                     for (k, line) in lines.iter().enumerate() {
                         let idx = base + k;
-                        let (nouns, clauses) = analyze(&mut worker, ids, line);
+                        let (nouns, verbs, clauses) = analyze(&mut worker, ids, line);
                         if dev_every > 0 && idx % dev_every == 0 {
                             for (words, reading, surface, shown, before) in clauses {
                                 if is_dev_clause(&words, &reading, &surface) {
@@ -181,7 +198,7 @@ pub fn train(
                                 }
                             }
                         } else if nouns.len() >= 2 {
-                            sents.push(nouns);
+                            sents.push((nouns, verbs));
                         }
                     }
                     if res_tx.send((sents, devs)).is_err() {
@@ -218,26 +235,37 @@ pub fn train(
 
         let mut chunks = 0usize;
         let mut sent_ids: Vec<u32> = Vec::new();
+        let mut verb_ids: Vec<u32> = Vec::new();
         for (sents, devs) in res_rx {
-            for sent in sents {
+            for (sent, verbs) in sents {
                 sent_ids.clear();
-                for n in sent {
-                    let id = match noun_index.get(&n) {
+                verb_ids.clear();
+                // 名詞は文脈にも対象にもなる。動詞は対象のときだけ数える（文脈にはしない）
+                let words = sent.into_iter().map(|n| (n, false)).chain(verbs.into_iter().map(|v| (v, true)));
+                for (w, is_verb) in words {
+                    if is_verb && !targets.contains(&w) {
+                        continue;
+                    }
+                    let id = match noun_index.get(&w) {
                         Some(&id) => id,
                         None => {
                             let id = nouns.len() as u32;
-                            is_target.push(targets.contains(&n));
-                            noun_index.insert(n.clone(), id);
-                            nouns.push(n);
+                            is_target.push(targets.contains(&w));
+                            noun_index.insert(w.clone(), id);
+                            nouns.push(w);
                             sent_freq.push(0);
                             id
                         }
                     };
                     sent_freq[id as usize] += 1;
-                    sent_ids.push(id);
+                    if is_verb {
+                        verb_ids.push(id)
+                    } else {
+                        sent_ids.push(id)
+                    }
                 }
                 n_sentences += 1;
-                for &t in &sent_ids {
+                for &t in sent_ids.iter().chain(verb_ids.iter()) {
                     if !is_target[t as usize] {
                         continue;
                     }
