@@ -64,8 +64,7 @@ pub(crate) fn note_mouse_called() {
 /// 一切書かない。フックが外れた・張り直した事実を後から確認できるように）
 fn log_event(msg: &str) {
     use std::io::Write;
-    let path = common::paths::data_file("hook_watchdog.log");
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    if let Some(mut f) = common::paths::open_log_append("hook_watchdog.log", common::paths::LOG_MAX_BYTES / 5) {
         let _ = writeln!(f, "{} {}", chrono_like_now(), msg);
     }
 }

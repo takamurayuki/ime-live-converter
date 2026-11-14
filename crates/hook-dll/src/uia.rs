@@ -6,6 +6,9 @@ use windows::Win32::Foundation::HANDLE;
 /// フォーカス中の要素が「統合ターミナル」（VSCode の xterm 等）か。UIAポーラーが
 /// クラス名から判定して更新する。窓クラスで判別できないアプリの端末検出に使う。
 pub(crate) static FOCUSED_IS_TERMINAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// フォーカスがブラウザ（Chrome / Edge）の URL 欄にあるか。UIA ポーラーが
+/// フォーカス要素のクラス名（`OmniboxViewViews`）で判定して書く。
+pub(crate) static FOCUSED_IS_OMNIBOX: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// パスワード欄／昇格プロセス判定の3値状態。
 ///
 /// 2値(真偽)ではなく3値にしているのは、ポーリング間隔（アイドル時最大250ms）
@@ -313,6 +316,8 @@ pub(crate) fn start_uia_poller() {
                 false
             };
             FOCUSED_IS_TERMINAL.store(is_term, std::sync::atomic::Ordering::Relaxed);
+            let is_omnibox = fg_class == "Chrome_WidgetWin_1" && focused_element_is_omnibox(&auto);
+            FOCUSED_IS_OMNIBOX.store(is_omnibox, std::sync::atomic::Ordering::Relaxed);
 
             // パスワード欄判定は毎周期・無条件で行う（need_posのゲートに
             // 掛けない）。need_posは「変換中/ポップアップ表示中」限定だが、
@@ -584,6 +589,16 @@ pub(crate) unsafe fn console_caret_screen_pos(hwnd_fg: HWND) -> Option<(i32, i32
 /// VSCode の統合ターミナルはフォーカス要素のクラス名が "xterm-helper-textarea"、
 /// アクセシブル名に "Terminal"/"ターミナル" を含むことが多い。
 /// キャレットやテキスト範囲は触らない（クラス名/名前の読み取りのみ）ので軽い。
+/// フォーカス要素がブラウザ（Chrome / Edge）の URL 欄か
+pub(crate) unsafe fn focused_element_is_omnibox(
+    auto: &windows::Win32::UI::Accessibility::IUIAutomation,
+) -> bool {
+    auto.GetFocusedElement()
+        .and_then(|e| e.CurrentClassName())
+        .map(|c| c.to_string() == "OmniboxViewViews")
+        .unwrap_or(false)
+}
+
 pub(crate) unsafe fn focused_element_is_terminal(
     auto: &windows::Win32::UI::Accessibility::IUIAutomation,
 ) -> bool {

@@ -45,6 +45,23 @@ pub fn data_file(name: &str) -> PathBuf {
     data_dir().join(name)
 }
 
+/// ログファイルの1世代の上限（バイト）。超えたら `<名前>.old` に移して書き直す
+/// （古い `.old` は消える）。常駐中ずっと追記するログが利用者の PC で際限なく
+/// 大きくなるのを防ぐ（2026-11-14 時点で hook_latency.log が 320MB に達していた）。
+pub const LOG_MAX_BYTES: u64 = 5 * 1024 * 1024;
+
+/// データフォルダのログ `name` を追記用に開く。`max_bytes` を超えていたら、先に
+/// 1世代だけ `<name>.old` に回す。開けなければ None（ログは書けなくても動作は続ける）。
+pub fn open_log_append(name: &str, max_bytes: u64) -> Option<std::fs::File> {
+    let path = data_file(name);
+    if std::fs::metadata(&path).map(|m| m.len() > max_bytes).unwrap_or(false) {
+        let old = data_file(&format!("{name}.old"));
+        let _ = std::fs::remove_file(&old);
+        let _ = std::fs::rename(&path, &old);
+    }
+    std::fs::OpenOptions::new().create(true).append(true).open(&path).ok()
+}
+
 /// 学習DBのパス
 pub fn learning_db_path() -> PathBuf {
     data_file(LEARNING_DB_FILE)

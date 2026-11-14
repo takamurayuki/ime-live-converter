@@ -58,11 +58,10 @@ macro_rules! debug_log {
             use std::io::Write;
             let path = $crate::paths::data_file("hook_debug.log");
             let needs_bom = !path.exists();
-            if let Ok(mut file) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
+            if let Some(mut file) =
+                $crate::paths::open_log_append("hook_debug.log", 4 * $crate::paths::LOG_MAX_BYTES)
             {
+                let needs_bom = needs_bom || file.metadata().map(|m| m.len() == 0).unwrap_or(false);
                 if needs_bom {
                     let _ = file.write_all(&[0xEF, 0xBB, 0xBF]);
                 }

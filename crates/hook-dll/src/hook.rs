@@ -892,8 +892,7 @@ pub(crate) mod hook_latency {
 
     fn write_handler_sample(sample: &HandlerSample) {
         use std::io::Write;
-        let path = common::paths::data_file("hook_latency.log");
-        let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) else {
+        let Some(mut file) = common::paths::open_log_append("hook_latency.log", common::paths::LOG_MAX_BYTES) else {
             return;
         };
         let _ = writeln!(file, "  handler={} us={}", sample.name, sample.us);
@@ -912,8 +911,7 @@ pub(crate) mod hook_latency {
 
     fn write_snapshot(stats: &Snapshot) {
         use std::io::Write;
-        let path = common::paths::data_file("hook_latency.log");
-        let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) else {
+        let Some(mut file) = common::paths::open_log_append("hook_latency.log", common::paths::LOG_MAX_BYTES) else {
             return;
         };
         let _ = writeln!(file, "--- total_count={} ---", stats.total_count);
@@ -1685,6 +1683,11 @@ fn low_level_keyboard_proc_impl(
                             if let Some(text) = take_field_text() {
                                 context.offer_field_text(text);
                             }
+                            // ブラウザの URL 欄では、ローマ字だけの打ちかけを画面に出さない
+                            // （`hide_bare_romaji` の説明を参照）。変換の途中で切り替えると
+                            // 画面と食い違うので、新しい変換の始まりでだけ決める
+                            context.hide_bare_romaji =
+                                uia::FOCUSED_IS_OMNIBOX.load(std::sync::atomic::Ordering::Relaxed);
                         }
                         // 句読点は入力後に自動確定（日本語IMEの標準動作）。入力中なら
                         // 句読点を読みに入れて変換し直さず、表示中の変換をそのまま確定して

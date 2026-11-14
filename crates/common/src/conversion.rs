@@ -256,6 +256,13 @@ pub struct LiveConversionState {
     /// 文字数。変換中の文字列の下線（hook-dll の `composition_underline`）を
     /// この範囲だけに引く。ローマ字の打ちかけは含まない（`marker_range` で足す）。
     pub last_word_chars: usize,
+    /// かなになる前のローマ字だけの打ちかけ（`s`、`ky` 等）を画面に出さないか。
+    /// ブラウザの URL 欄では、英字だけを打った瞬間に履歴から続きが自動補完されて
+    /// 選択状態で表示され、次に送る Backspace がその選択を消すだけで終わり、
+    /// 最初のローマ字が残っていた（実機報告 2026-11-14: `sai` → `sさい`）。
+    /// かなが1文字でもできた後は従来どおりローマ字も表示する（日本語が混ざれば
+    /// 英字の自動補完は起きない）。hook-dll が変換の始まりで設定する。
+    pub hide_bare_romaji: bool,
     /// 確定時の学習（DB書き込み）をフックの外へ遅延させるか。
     /// hook-dll の実運用（`install_hook`）では true。確定はキーボードフック内で
     /// 行われるため、学習の記録はここに溜めておき、フックから戻った後に
@@ -574,6 +581,7 @@ impl LiveConversionState {
             pending_demotions: Vec::new(),
             pinned: Vec::new(),
             last_word_chars: 0,
+            hide_bare_romaji: false,
             predictions: Vec::new(),
             prediction_top_is_fuzzy: false,
             prediction_top_is_learned_typo: false,
@@ -2275,7 +2283,11 @@ impl LiveConversionState {
         };
 
         // 変換結果 + ローマ字（未確定）
-        let new_result = format!("{}{}", converted_hiragana, self.romaji_buffer);
+        let new_result = if self.hide_bare_romaji && converted_hiragana.is_empty() {
+            String::new()
+        } else {
+            format!("{}{}", converted_hiragana, self.romaji_buffer)
+        };
         self.apply_new_result(new_result)
     }
 
@@ -3056,6 +3068,8 @@ impl LiveConversionState {
 
         // 候補一覧で誤変換を直したか（下の「ん」補完・バッファのクリアより前に控える）
         let fix = self.candidate_fix();
+        // 画面に出していなかったローマ字の打ちかけは、確定で表に出す
+        let reveal_romaji = std::mem::take(&mut self.hide_bare_romaji) && !self.romaji_buffer.is_empty();
 
         // 末尾の未確定 'n' を「ん」に変換して表示を更新
         let action = if self.romaji_buffer == "n" {
@@ -3083,6 +3097,8 @@ impl LiveConversionState {
                 self.hiragana_buffer.push(c);
                 self.kana_raw.push((c, c.to_string()));
             }
+            self.update_conversion()
+        } else if reveal_romaji {
             self.update_conversion()
         } else {
             None
@@ -4545,6 +4561,38 @@ mod state_machine_tests {
             prefix_surface.starts_with(&pinned_surface),
             "prefix_surface={prefix_surface:?} pinned_surface={pinned_surface:?}"
         );
+    }
+
+    /// URL 欄向け: かなになる前のローマ字だけの打ちかけは画面に出さず、
+    /// 最初に画面へ送るのはかな（Backspace で消す英字が無い）。確定すれば表に出す。
+    #[test]
+    fn hidden_bare_romaji_is_never_sent_before_kana() {
+        let mut state = LiveConversionState::new();
+        state.converter = Some(particle_test_converter());
+        state.hide_bare_romaji = true;
+        let mut screen = String::new();
+        let a = state.add_char('k');
+        assert!(a.is_none());
+        let a = state.add_char('y');
+        assert!(a.is_none());
+        let a = state.add_char('o').expect("かなで初めて送る");
+        assert_eq!(a.delete_count, 0);
+        apply_to_screen(&mut screen, Some(a));
+        // かなができた後はローマ字も表示する
+        apply_to_screen(&mut screen, state.add_char('u'));
+        apply_to_screen(&mut screen, state.add_char('h'));
+        assert_eq!(screen, state.conversion_result);
+        assert!(screen.ends_with('h'), "{screen}");
+
+        // ローマ字だけのまま確定したら、そのローマ字を出す
+        let mut state = LiveConversionState::new();
+        state.converter = Some(particle_test_converter());
+        state.hide_bare_romaji = true;
+        let mut screen = String::new();
+        apply_to_screen(&mut screen, state.add_char('s'));
+        assert_eq!(screen, "");
+        apply_to_screen(&mut screen, state.commit());
+        assert_eq!(screen, "s");
     }
 
     /// 下線は直近の単語（後ろの助詞を含む）とローマ字の打ちかけにだけ引く
