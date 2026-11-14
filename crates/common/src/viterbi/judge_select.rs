@@ -279,6 +279,34 @@ impl ViterbiConverter {
         (self.word_cost_with_learned(e, 0), learned)
     }
 
+    /// 1文字漢字が2つ続き、読みをつなげると辞書の内容語（2文字以上の表記）になる
+    /// 並びで、2語の学習ユニグラム（`prev_learned`/`cur_learned`）を打ち消す量。
+    /// 「両方」が「両|方」に分かれて確定されると「りょう→両」が単独で学習され、
+    /// それが別の語の「じゅうりょう」まで「十|両」に割ってしまう（実測:
+    /// じゅうりょうかきん→十両課金、2026-10-29）。断片の学習は「その2文字で
+    /// 1語になる並び」では効かせず、漢字の選び分けは LM に任せる。断片を
+    /// さらに学習して悪化する自己強化も止まる
+    /// （[[learned-hiragana-fragments-longer-word-bug]] と同じ形）。
+    /// A|B|C で AB・BC どちらも語になる場合 B の分は2回引かれるが、
+    /// それは断片化をより不利にする向きなので構わない。
+    pub(crate) fn single_kanji_pair_learned_refund(
+        &self,
+        prev: &WordEntry,
+        cur: &WordEntry,
+        prev_learned: i32,
+        cur_learned: i32,
+    ) -> i32 {
+        let refund = prev_learned.saturating_add(cur_learned);
+        if refund == 0 || !is_single_kanji_surface(&prev.surface) || !is_single_kanji_surface(&cur.surface) {
+            return 0;
+        }
+        let combined_reading = format!("{}{}", prev.reading, cur.reading);
+        let forms_word = self.merged_lookup(&combined_reading).is_some_and(|entries| {
+            entries.iter().any(|e| is_content_pos(&e.pos) && e.surface.chars().count() >= 2)
+        });
+        if forms_word { refund } else { 0 }
+    }
+
     /// 2語間の (辞書側の接続コスト, 個人学習のバイグラムボーナス)
     pub(crate) fn judge_conn_cost(
         &self,
@@ -299,14 +327,17 @@ impl ViterbiConverter {
         let mut dict = 0i32;
         let mut learned = self.path_learned_assoc_bonus(path);
         let mut prev: Option<&WordEntry> = None;
+        let mut prev_wc_learned = 0;
         for e in path {
             let prev_right = prev.map(|p| p.right_id).unwrap_or(self.dictionary.bos_id);
             let (conn, conn_learned) =
                 self.judge_conn_cost(prev_right, prev.map(|p| p.surface.as_str()), e.left_id, &e.surface);
             let (wc, wc_learned) = self.judge_word_cost(e);
+            let refund = prev.map_or(0, |p| self.single_kanji_pair_learned_refund(p, e, prev_wc_learned, wc_learned));
             dict = dict.saturating_add(conn).saturating_add(wc);
-            learned = learned.saturating_add(conn_learned).saturating_add(wc_learned);
+            learned = learned.saturating_add(conn_learned).saturating_add(wc_learned).saturating_sub(refund);
             prev = Some(e);
+            prev_wc_learned = wc_learned;
         }
         let last_right = prev.map(|p| p.right_id).unwrap_or(self.dictionary.bos_id);
         dict = dict.saturating_add(self.dictionary.matrix.get(last_right, self.dictionary.eos_id) as i32);
@@ -490,12 +521,16 @@ impl ViterbiConverter {
                             _ => 0.0,
                         };
                         let (wc, wc_learned) = word_costs[cur];
+                        let refund = match prev_entry {
+                            Some(p) => self.single_kanji_pair_learned_refund(p, e, word_costs[prev].1, wc_learned),
+                            None => 0,
+                        };
                         let english_cont = match prev_entry {
                             Some(p) => judge.english_continuation(Some(p), e),
                             None => 0.0,
                         };
                         let base = english_cont - (conn.saturating_add(wc) as f32) / params.dict_scale
-                            + conn_learned.saturating_add(wc_learned) as f32 / params.learn_scale
+                            + conn_learned.saturating_add(wc_learned).saturating_sub(refund) as f32 / params.learn_scale
                             + seed
                             + node_bonus.map_or(0.0, |b| b[cur])
                             + params.lm_weight * (params.unk_char_logp * u.unk_chars as f32 + u.internal);

@@ -129,6 +129,10 @@ try {
             Copy-Item $_.FullName -Destination (Join-Path $InstallDir "dictionaries") -Force
         }
     }
+    # A ZIP downloaded with a browser marks every extracted file as "from the internet"
+    # (Mark of the Web) and Copy-Item keeps that mark; wscript would then show a security
+    # warning when the logon task starts run-hidden.vbs. Clear it on the installed copy.
+    Get-ChildItem $InstallDir -Recurse -File | Unblock-File -ErrorAction SilentlyContinue
 
     # ---- 3. models (only when the required version is not installed) ----------
     $dictDir = Join-Path $InstallDir "dictionaries"

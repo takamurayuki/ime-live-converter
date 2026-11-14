@@ -530,6 +530,23 @@ impl JudgeLm {
                 unk_chars: 0,
             };
         }
+        // extra.csv で人が精査して足した漢字語（従量 等）は IPADic に無いため
+        // コーパスでは必ず未知語になり、「未知の名詞」の極端に小さい確率と
+        // 文字数罰で、同じ読みの語彙内の語にまず勝てない（じゅうりょうかきん→
+        // 重量課金、2026-10-29）。実在の語なので、Wikipedia で希な語
+        // （十両・銃猟 程度）の確率で採点し、選び分けは前後の語とシードに任せる。
+        // 外来語（クライアント 等）も同じ。下の文字数罰の頭打ちだけでは未知名詞の
+        // 確率が残って断片と僅差になり、断片側（案）の学習が少し乗るだけで
+        // 「暗い案と」に負ける（2026-10-29）。
+        if is_curated_extra_word(&e.surface, &e.reading) {
+            return LmUnit {
+                first: None,
+                first_class: left,
+                last: LmCtx { word: None, class: right },
+                internal: CURATED_EXTRA_WORD_LOGP - self.unk_emit(left),
+                unk_chars: 0,
+            };
+        }
         // 辞書に実在するカタカナ語（extra.csv の外来語等）が語彙外なのは、学習時の
         // 分かち書き（IPADic）に無い語がコーパスで未知語になったためで、
         // 「辞書にない読みの塊を飲み込んだ」カタカナ・フォールバック（pos=カタカナ）とは
@@ -623,6 +640,33 @@ pub const DEFAULT_ENGLISH_BIAS: f32 = -3.0;
 
 /// 辞書に実在する語彙外のカタカナ語の、語彙外文字数罰の上限（文字数）
 const KATAKANA_DICT_WORD_UNK_CAP: u32 = 2;
+
+/// LM の語彙に無い extra.csv の語の出現確率（自然対数）。語彙内の希な名詞
+/// （十両 -12.7・銃猟 -14.2）と同程度にして、よく使う同音語（重量 -8.6）には
+/// 単独では勝たないようにする
+const CURATED_EXTRA_WORD_LOGP: f32 = -12.0;
+
+/// `dictionaries/extra.csv`（補助辞書。配布物には含まれないのでビルド時に埋め込む）に
+/// ある (表記, 読み) か
+fn is_curated_extra_word(surface: &str, reading: &str) -> bool {
+    use std::collections::HashSet;
+    static WORDS: std::sync::OnceLock<HashSet<(&'static str, &'static str)>> = std::sync::OnceLock::new();
+    WORDS
+        .get_or_init(|| {
+            include_str!("../../../dictionaries/extra.csv")
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .filter_map(|l| {
+                    let mut cols = l.split(',');
+                    let reading = cols.next()?.trim();
+                    let surface = cols.next()?.trim();
+                    Some((surface, reading))
+                })
+                .collect()
+        })
+        .contains(&(surface, reading))
+}
 
 fn is_katakana_surface(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| ('ァ'..='ヶ').contains(&c) || c == 'ー')
@@ -818,12 +862,25 @@ mod tests {
     #[test]
     fn unknown_dictionary_katakana_word_has_capped_penalty() {
         let lm = tiny();
-        // 辞書の外来語（くらいあんと→クライアント）は長くても罰が頭打ち
-        assert_eq!(lm.unit(&w("クライアント", "くらいあんと", N)).unk_chars, KATAKANA_DICT_WORD_UNK_CAP);
+        // 辞書の外来語は長くても罰が頭打ち
+        assert_eq!(lm.unit(&w("パケットロス", "ぱけっとろす", N)).unk_chars, KATAKANA_DICT_WORD_UNK_CAP);
         // カタカナ・フォールバック（ぐんぐんすすむ→グングンススム）は従来どおり読みの長さで罰する
         let mut fallback = w("グングンススム", "ぐんぐんすすむ", N);
         fallback.pos = "カタカナ".to_string();
         assert_eq!(lm.unit(&fallback).unk_chars, 7);
+    }
+
+    #[test]
+    fn curated_extra_word_is_scored_as_rare_word() {
+        let lm = tiny();
+        // extra.csv の語（従量・クライアント）は語彙外でも未知語の罰を受けず、希な語の確率で採点する
+        for (s, r) in [("従量", "じゅうりょう"), ("クライアント", "くらいあんと")] {
+            let u = lm.unit(&w(s, r, N));
+            assert_eq!(u.unk_chars, 0, "{s}");
+            assert_eq!(u.internal, CURATED_EXTRA_WORD_LOGP - lm.unk_emit(N), "{s}");
+        }
+        // 表記が同じでも読みが違えば対象外
+        assert!(lm.unit(&w("従量", "じゅうりよう", N)).unk_chars > 0);
     }
 
     #[test]

@@ -35,6 +35,10 @@ pub const MAX_CONVERSION_CANDIDATES: usize = 50;
 /// 候補一覧で「区切り方の違う2語の並び」を探す読みの最大文字数
 /// （直前の文節＋対象文節。長いと無関係な組み合わせばかりになる）
 const RESEGMENT_MAX_READING_CHARS: usize = 8;
+/// 候補一覧の対象を直後のひらがなの文節へ広げるとき、取り込む文節の最大数
+const RIGHT_EXTEND_MAX_SEGMENTS: usize = 2;
+/// 対象を右へ広げるのは、広げた読みがこの文字数以上の辞書の語になるときだけ
+const RIGHT_EXTEND_MIN_READING_CHARS: usize = 5;
 /// 区切り方の違う2語の並びのうち、候補一覧に加える数
 const RESEGMENT_MAX_ALTERNATIVES: usize = 3;
 /// 区切り方の違う2語の並びを探すとき、分け目ごとに左右それぞれ試す語の数
@@ -1605,6 +1609,8 @@ impl LiveConversionState {
             if freq >= AUTO_COMPOUND_MIN_FREQ
                 && crate::viterbi::is_content_pos(&pair[0].2)
                 && crate::viterbi::is_content_pos(&pair[1].2)
+                && is_compound_part_pos(&pair[0].2)
+                && is_compound_part_pos(&pair[1].2)
                 && is_registrable_compound_part(prev)
                 && is_registrable_compound_part(next)
             {
@@ -2648,6 +2654,52 @@ impl LiveConversionState {
                 }
             }
         }
+        // 対象の直後のひらがなの文節まで含めると辞書の語になるなら、対象を右へ広げる。
+        // 「くらいあんと」が「暗い案｜と」と区切られると対象は「くらいあん」だけになり、
+        // 「クライアント」が一覧に出ないため選び直せず、誤った区切りを確定するたびに
+        // 学習が固まった（2026-10-29）。元の対象の同音語は、取り込んだひらがなを
+        // 付けた形（クライアン＋と）で残す。短い読みでは「性｜か→成果」のような
+        // 無関係な結合が多いので、広げた読みが長いときだけにする。
+        // 語の始まりは対象より前の文節のこともある（暗い｜案｜と の対象は「案」）ので、
+        // 左へも既存の結合と同じく最大4文節まで探す。前に取り込んだ文節は
+        // 元の対象の同音語の候補では「そのまま」に置く（暗い＋庵＋と）。
+        let mut extended_head: Vec<crate::WordEntry> = Vec::new();
+        let mut extended_tail: Vec<crate::WordEntry> = Vec::new();
+        let mut orig_reading = String::new();
+        let reading_of = |r: std::ops::RangeInclusive<usize>| -> String {
+            entries[r].iter().map(|e| e.reading.as_str()).collect()
+        };
+        let mut trailing_kana_end = end;
+        while trailing_kana_end + 1 < entries.len()
+            && trailing_kana_end - end < RIGHT_EXTEND_MAX_SEGMENTS
+            && entries[trailing_kana_end + 1].surface == entries[trailing_kana_end + 1].reading
+        {
+            trailing_kana_end += 1;
+        }
+        let best = if fixed_head.is_empty() {
+            (end + 1..=trailing_kana_end).rev().find_map(|ext| {
+                (end.saturating_sub(3)..=start).find(|&s| {
+                    let reading = reading_of(s..=ext);
+                    reading.chars().count() >= RIGHT_EXTEND_MIN_READING_CHARS
+                        && converter.merged_lookup(&reading).is_some_and(|ws| {
+                            ws.iter().any(|w| crate::viterbi::is_content_pos(&w.pos) && w.surface != w.reading)
+                        })
+                })
+                .map(|s| (s, ext))
+            })
+        } else {
+            None
+        };
+        let (start, end) = match best {
+            Some((s, ext)) => {
+                extended_head = entries[s..start].to_vec();
+                extended_tail = entries[end + 1..=ext].to_vec();
+                orig_reading = reading_of(start..=end);
+                (s, ext)
+            }
+            None => (start, end),
+        };
+
         // 対象span [start..=end] の結合読み
         let seg_reading: String =
             entries[start..=end].iter().map(|e| e.reading.as_str()).collect();
@@ -2725,6 +2777,25 @@ impl LiveConversionState {
                     judge_score,
                     words: ws,
                 });
+            }
+        }
+        if !extended_tail.is_empty() {
+            let head_surface: String = extended_head.iter().map(|e| e.surface.as_str()).collect();
+            let tail_surface: String = extended_tail.iter().map(|e| e.surface.as_str()).collect();
+            if let Some(words) = converter.merged_lookup(&orig_reading) {
+                for w in words.iter() {
+                    let penalty = symbol_entry_penalty(&w.pos);
+                    let mut ws = extended_head.clone();
+                    ws.push(w.clone());
+                    ws.extend(extended_tail.iter().cloned());
+                    let (eff_cost, judge_score) = score_words(&ws, penalty);
+                    segs.push(Seg {
+                        surface: format!("{}{}{}", head_surface, w.surface, tail_surface),
+                        eff_cost,
+                        judge_score,
+                        words: ws,
+                    });
+                }
             }
         }
         for ws in resegmented {
@@ -3521,6 +3592,14 @@ pub fn is_registrable_compound_part(surface: &str) -> bool {
     contains_kanji(surface) || is_all_katakana(surface)
 }
 
+/// 自動複合語登録の部品になり得る品詞か（名詞・接頭詞）。形容詞・動詞・副詞は
+/// 後ろの名詞と並んでも句であって1語ではない。「暗い」+「案」を3回確定した
+/// だけで「くらいあん→暗い案」が登録され、「くらいあんと」が「クライアント」
+/// でなく「暗い案と」に固まった（2026-10-29）。
+fn is_compound_part_pos(pos: &str) -> bool {
+    pos.starts_with("名詞") || pos.starts_with("接頭詞")
+}
+
 /// この (読み, 表記) ペアを学習してよいか（`crate::is_learnable_pair`。
 /// `crates/dict-builder`のコーパスLM集計とも共有する）。
 pub use crate::is_learnable_pair;
@@ -3751,6 +3830,33 @@ mod auto_compound_tests {
             .find(|w| w.reading == "さいきどう" && w.surface == "再起動")
             .expect("DBにも登録されているはず");
         assert_eq!(auto.source, "auto");
+    }
+
+    /// 形容詞＋名詞（暗い＋案）は何度確定しても複合語として登録しない
+    /// （登録すると「くらいあんと」が「暗い案と」に固まる、2026-10-29）。
+    #[test]
+    fn adjective_noun_pair_is_not_auto_registered() {
+        let mut dict = crate::Dictionary::new();
+        dict.add_word(crate::WordEntry {
+            surface: "暗い".to_string(), reading: "くらい".to_string(),
+            left_id: 1, right_id: 1, cost: 4000, pos: "形容詞-自立-*-*".to_string(),
+        });
+        dict.add_word(crate::WordEntry {
+            surface: "案".to_string(), reading: "あん".to_string(),
+            left_id: 1, right_id: 1, cost: 4000, pos: "名詞-一般-*-*".to_string(),
+        });
+        let mut state = LiveConversionState::new();
+        state.converter = Some(ViterbiConverter::new(dict));
+        state.learning = crate::LearningRepository::in_memory().ok();
+        let segments = vec![
+            ("くらい".to_string(), "暗い".to_string(), "形容詞-自立-*-*".to_string()),
+            ("あん".to_string(), "案".to_string(), "名詞-一般-*-*".to_string()),
+        ];
+        for _ in 0..AUTO_COMPOUND_MIN_FREQ + 1 {
+            state.learn_from_segments(&segments);
+        }
+        let words = state.learning.as_ref().unwrap().get_all_user_words().unwrap();
+        assert!(!words.iter().any(|w| w.surface == "暗い案"), "形容詞＋名詞は登録しないはず");
     }
 
     /// カタカナ＋漢字（メモ＋帳）の組み合わせも、漢字＋漢字と同様に
@@ -5458,6 +5564,41 @@ mod resegment_candidate_tests {
             entries[0].iter().map(|e| e.surface.as_str()).collect::<Vec<_>>(),
             vec!["同", "河川"]
         );
+    }
+
+    /// くらいあんと: 自動変換が「暗い＋案＋と」でも、後ろのひらがな「と」まで含めた
+    /// 「クライアント」を一覧から選べる
+    #[test]
+    fn candidate_span_extends_over_trailing_kana_into_a_word() {
+        let mut dict = Dictionary::new();
+        dict.matrix = crate::ConnectionMatrix::new(10, 10);
+        for i in 0..10 {
+            for j in 0..10 {
+                dict.matrix.set(i, j, 200);
+            }
+        }
+        let w = |surface: &str, reading: &str, id: u16, cost: i16, pos: &str| crate::WordEntry {
+            surface: surface.to_string(),
+            reading: reading.to_string(),
+            left_id: id,
+            right_id: id,
+            cost,
+            pos: pos.to_string(),
+        };
+        dict.add_word(w("暗い", "くらい", 1, 2000, "形容詞-自立-*-*"));
+        dict.add_word(w("案", "あん", 2, 2000, "名詞-一般-*-*"));
+        dict.add_word(w("と", "と", 3, 500, "助詞-格助詞-一般-*"));
+        dict.add_word(w("クライアント", "くらいあんと", 2, 9000, "名詞-一般-*-*"));
+        let mut state = LiveConversionState::new();
+        state.converter = Some(ViterbiConverter::new(dict));
+        state.hiragana_buffer = "くらいあんと".to_string();
+        let _ = state.update_conversion();
+        assert_eq!(shown(&state), "暗い案と");
+        let (cands, reading, _, prefix, _, suffix, _, entries) = state.build_candidates_full();
+        assert_eq!((reading.as_str(), prefix.as_str(), suffix.as_str()), ("くらいあんと", "", ""));
+        assert_eq!(cands[0], "暗い案と", "表示中の変換が1位");
+        let i = cands.iter().position(|c| c == "クライアント").expect("クライアントが候補に無い");
+        assert_eq!(entries[i].iter().map(|e| e.surface.as_str()).collect::<Vec<_>>(), vec!["クライアント"]);
     }
 
     #[test]
