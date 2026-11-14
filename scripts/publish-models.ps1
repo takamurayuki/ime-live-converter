@@ -24,8 +24,14 @@ foreach ($f in $files) {
     if (-not (Test-Path $f)) { throw "Missing $f (run scripts\package.ps1 -Models first)" }
 }
 
+# Windows PowerShell 5.1 turns a native command's stderr into an error record, and
+# with $ErrorActionPreference = "Stop" that aborts the script even though "release
+# not found" is the expected answer here. Relax it just for this probe.
+$ErrorActionPreference = "Continue"
 gh release view $modelsVersion *> $null
-if ($LASTEXITCODE -eq 0) {
+$exists = ($LASTEXITCODE -eq 0)
+$ErrorActionPreference = "Stop"
+if ($exists) {
     throw "Release $modelsVersion already exists. Model releases are immutable: bump packaging\models-version.txt instead."
 }
 
