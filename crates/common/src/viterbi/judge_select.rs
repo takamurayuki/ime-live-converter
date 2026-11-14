@@ -200,9 +200,9 @@ impl ViterbiConverter {
             return 0.0;
         };
         let cap = judge.params().cooc_cap;
-        let targets: Vec<std::borrow::Cow<str>> = path
+        let targets: Vec<&WordEntry> = path
             .iter()
-            .filter_map(|e| crate::judge_cooc::cooc_target_key_entry(&e.pos, &e.surface, &e.reading))
+            .filter(|e| crate::judge_cooc::cooc_target_key_entry(&e.pos, &e.surface, &e.reading).is_some())
             .collect();
         if targets.is_empty() {
             return 0.0;
@@ -212,7 +212,35 @@ impl ViterbiConverter {
             .filter(|e| crate::judge_cooc::is_cooc_noun_entry(&e.pos, &e.surface))
             .map(|e| e.surface.as_str());
         let ctx = self.cooc_context_ids(cooc, nouns);
-        targets.iter().map(|t| cooc.assoc(t, &ctx, cap)).sum()
+        targets.iter().map(|e| self.cooc_target_bonus(cooc, e, &ctx, cap)).sum()
+    }
+
+    /// 1語の共起の加点（重み前）。名詞は文脈との最も強い PMI。
+    ///
+    /// 動詞は、同じ読みの漢字違いの動詞（活か/行か/生か）のうち最も結びつく
+    /// ものを基準にした差（0 以下）に `COOC_VERB_SCALE` を掛ける。動詞の見出しは
+    /// 漢字を含む形にしか無いので、生の PMI を足すとひらがなで書くのが普通の
+    /// 動詞まで漢字に寄せてしまう（評価用データで できる→出来る、つける→付ける、
+    /// なす→成す が多数悪化、2026-11-14）。差にすれば漢字違いの間の選び分けだけに効き、
+    /// ひらがなの表記より有利になることは無い。
+    fn cooc_target_bonus(&self, cooc: &crate::judge_cooc::JudgeCooc, e: &WordEntry, ctx: &[u32], cap: f32) -> f32 {
+        let Some(key) = crate::judge_cooc::cooc_target_key_entry(&e.pos, &e.surface, &e.reading) else {
+            return 0.0;
+        };
+        if !key.starts_with("動:") {
+            return cooc.assoc(&key, ctx, cap);
+        }
+        let own = cooc.assoc(&key, ctx, cap);
+        let best = self
+            .merged_lookup(&e.reading)
+            .map(|alts| {
+                alts.iter()
+                    .filter_map(|a| crate::judge_cooc::verb_key_entry(&a.pos, &a.surface, &a.reading))
+                    .map(|k| cooc.assoc(&k, ctx, cap))
+                    .fold(own, f32::max)
+            })
+            .unwrap_or(own);
+        cooc_verb_scale() * (own - best)
     }
 
     /// ラティスの各ノードの共起の加点（重み込み）。文脈は1回目の探索で選ばれた
@@ -239,15 +267,15 @@ impl ViterbiConverter {
             .iter()
             .map(|n| {
                 let Some(e) = n.entry.as_ref() else { return 0.0 };
-                let Some(key) = crate::judge_cooc::cooc_target_key_entry(&e.pos, &e.surface, &e.reading) else {
+                if crate::judge_cooc::cooc_target_key_entry(&e.pos, &e.surface, &e.reading).is_none() {
                     return 0.0;
-                };
+                }
                 let others = spans
                     .iter()
                     .filter(|&&(s, t, _)| t <= n.start || s >= n.end)
                     .map(|&(_, _, w)| w);
                 let ctx = self.cooc_context_ids(cooc, others);
-                params.cooc_weight * cooc.assoc(&key, &ctx, params.cooc_cap)
+                params.cooc_weight * self.cooc_target_bonus(cooc, e, &ctx, params.cooc_cap)
             })
             .collect();
         Some(bonus)
@@ -651,3 +679,22 @@ impl ViterbiConverter {
         best.entries
     }
 }
+
+/// 動詞の共起の差に掛ける係数。評価用に環境変数 `JUDGE_COOC_VERB_W` で上書きできる
+fn cooc_verb_scale() -> f32 {
+    static SCALE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *SCALE.get_or_init(|| {
+        std::env::var("JUDGE_COOC_VERB_W").ok().and_then(|v| v.parse().ok()).unwrap_or(COOC_VERB_SCALE)
+    })
+}
+
+/// 動詞の共起の差に掛ける既定の係数。既定は 0（使わない）。
+///
+/// 2026-11-14、Wikipedia 全量で学習した名詞＋動詞の共起モデルを評価用データ
+/// （2万文）で測ると、係数 1.0 で改善 39 / 悪化 63、0.5 でも 24 / 28 と悪化が
+/// 上回った。PMI は珍しい語ほど高く出るので、見る→観る・読む→詠む・取る→採る の
+/// ように珍しい漢字に寄り、見る/みる のような表記の揺れにも振り回される。
+/// 同じ文の名詞との共起は動詞の漢字を決める手がかりとして粗すぎるので、
+/// 「名詞＋助詞＋動詞」（キャリア に 活かす、責任 を 負う）の組で学ぶ方式に
+/// 作り直すまでは使わない。
+const COOC_VERB_SCALE: f32 = 0.0;
