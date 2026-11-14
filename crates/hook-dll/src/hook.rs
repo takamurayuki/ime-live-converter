@@ -1079,6 +1079,8 @@ pub extern "system" fn LowLevelKeyboardProc(
         return result;
     }
     let elapsed = __hook_latency_start.elapsed();
+    // 変換中の文字列の下線を取り直してもらう（通知を積むだけですぐ返る）
+    crate::composition_underline::notify();
     // バッファ長の取得は非ブロッキング（try_lock）。競合時は0扱いにする
     // （フックを絶対にブロックしないため、失敗を許容する設計）。
     let buffer_len = LIVE_CONTEXT

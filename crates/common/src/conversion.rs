@@ -248,6 +248,10 @@ pub struct LiveConversionState {
     /// 「変換の崩れ」を防ぐ。表示・候補一覧・Backspace・学習のすべてが
     /// `convert_buffer` を通してこの分解を共有する。確定・取消で空になる。
     pub pinned: Vec<crate::WordEntry>,
+    /// 表示中の変換のうち、直近の単語（後ろに付いた助詞・助動詞を含む）の
+    /// 文字数。変換中の文字列の下線（hook-dll の `composition_underline`）を
+    /// この範囲だけに引く。ローマ字の打ちかけは含まない（`marker_range` で足す）。
+    pub last_word_chars: usize,
     /// 確定時の学習（DB書き込み）をフックの外へ遅延させるか。
     /// hook-dll の実運用（`install_hook`）では true。確定はキーボードフック内で
     /// 行われるため、学習の記録はここに溜めておき、フックから戻った後に
@@ -565,6 +569,7 @@ impl LiveConversionState {
             pending_prediction_learning: Vec::new(),
             pending_demotions: Vec::new(),
             pinned: Vec::new(),
+            last_word_chars: 0,
             predictions: Vec::new(),
             prediction_top_is_fuzzy: false,
             prediction_top_is_learned_typo: false,
@@ -2195,14 +2200,20 @@ impl LiveConversionState {
         self.pinned.truncate(n);
     }
 
-    /// 読みが長くなったら、文節の切れ目で先頭側の文節を固定する
-    /// （`stable_prefix_segments`。固定済みより後ろまで伸びるときだけ更新）
+    /// 先頭側の文節を固定する（固定済みより後ろまで伸びるときだけ更新）。
+    /// 次のどちらか後ろまで固定する:
+    /// - 続けて打った文節: 後ろに打ち終わった文節が続いた文節
+    ///   （`continued_clause_prefix`。続けて打った前の変換は確定扱いにして、
+    ///   後続の入力や Backspace で変換し直さない）
+    /// - 長文: 読みが長くなったら末尾を残して文節の切れ目まで
+    ///   （`stable_prefix_segments`）
     fn extend_pinned(&mut self, entries: &[crate::WordEntry]) {
         let n = crate::viterbi::stable_prefix_segments(
             entries,
             crate::viterbi::STABILIZE_MIN_READING_CHARS,
             crate::viterbi::STABILIZE_KEEP_TAIL_CHARS,
-        );
+        )
+        .max(crate::viterbi::continued_clause_prefix(entries));
         if n > self.pinned.len() {
             self.pinned = entries[..n].to_vec();
             debug_log!(
@@ -2230,6 +2241,7 @@ impl LiveConversionState {
         let converted_hiragana = if self.converter.is_none() {
             // 辞書がない場合はひらがなのまま
             debug_log!("辞書なし: ひらがなのまま '{}'", self.hiragana_buffer);
+            self.last_word_chars = self.hiragana_buffer.chars().count();
             self.hiragana_buffer.clone()
         } else if self.hiragana_buffer.is_empty() {
             String::new()
@@ -2239,6 +2251,7 @@ impl LiveConversionState {
             let keep = total.saturating_sub(self.kana_tail_len);
             let prefix: String = self.hiragana_buffer.chars().take(keep).collect();
             let tail: String = self.hiragana_buffer.chars().skip(keep).collect();
+            self.last_word_chars = tail.chars().count();
             let conv: String = if prefix.is_empty() {
                 String::new()
             } else {
@@ -2251,12 +2264,35 @@ impl LiveConversionState {
             // 書き換わらないようにする（`stabilize.rs`）。
             let entries = self.convert_buffer(&self.hiragana_buffer);
             self.extend_pinned(&entries);
+            self.last_word_chars = last_word_chars(&entries);
             entries.iter().map(|e| e.surface.as_str()).collect()
         };
 
         // 変換結果 + ローマ字（未確定）
         let new_result = format!("{}{}", converted_hiragana, self.romaji_buffer);
         self.apply_new_result(new_result)
+    }
+
+    /// 下線を引く範囲。表示中の変換の末尾から数えた (始まり, 終わり) の文字数
+    /// （始まり > 終わり。末尾＝カーソルの位置が 0）。変換中でなければ None。
+    /// - 候補一覧を開いているとき: 選び直している語
+    /// - それ以外: 直近の単語（後ろに付いた助詞・助動詞を含む）＋ローマ字の打ちかけ
+    pub fn marker_range(&self) -> Option<(usize, usize)> {
+        let total = self.conversion_result.chars().count();
+        if total == 0 {
+            return None;
+        }
+        if !self.candidates.is_empty() {
+            let prefix = self.cand_prefix_surface.chars().count();
+            let suffix = self.cand_suffix_surface.chars().count();
+            let seg = total.checked_sub(prefix + suffix)?;
+            if seg == 0 {
+                return None;
+            }
+            return Some((seg + suffix, suffix));
+        }
+        let n = (self.last_word_chars + self.romaji_buffer.chars().count()).min(total);
+        (n > 0).then_some((n, 0))
     }
 
     /// 表示テキストを new_result に差し替えるための差分アクションを作る
@@ -3489,6 +3525,22 @@ pub fn is_registrable_compound_part(surface: &str) -> bool {
 /// `crates/dict-builder`のコーパスLM集計とも共有する）。
 pub use crate::is_learnable_pair;
 
+/// 文節列の直近の単語の文字数。末尾の助詞・助動詞・記号はその前の単語に
+/// 含める（「学校に」の「に」だけに下線が引かれて、打つたびに線が細かく
+/// 飛ぶのを避ける）。
+fn last_word_chars(entries: &[crate::WordEntry]) -> usize {
+    let mut n = 0;
+    for e in entries.iter().rev() {
+        n += e.surface.chars().count();
+        let functional =
+            e.pos.starts_with("助詞") || e.pos.starts_with("助動詞") || e.pos.starts_with("記号");
+        if !functional {
+            break;
+        }
+    }
+    n
+}
+
 /// ポップアップの一候補を最大24文字に収める（UTF-8の途中で切らない）。
 fn compact_prediction_text(text: &str) -> String {
     if text.chars().count() <= 24 {
@@ -4269,26 +4321,27 @@ mod state_machine_tests {
         }
         assert_eq!(state.conversion_result, "今日は学校に今日は学校に今日は学校に");
         assert_eq!(screen, state.conversion_result);
-        // 末尾12文字以上を残せる最後の切れ目（2つ目の「は」の直後）まで固定
+        // 後ろに打ち終わった文節が続いた文節（最後の「学校に」の手前）まで固定
         let pinned: String = state.pinned.iter().map(|e| e.surface.as_str()).collect();
-        assert_eq!(pinned, "今日は学校に今日は");
+        assert_eq!(pinned, "今日は学校に今日は学校に今日は");
 
         // 以後「きょう」は「強」が優先される学習が入っても、固定部分は「今日」のまま。
-        // 未固定の末尾（3つ目の「きょう」）だけが「強」になる。
+        // 新しく打った未固定の「きょう」だけが「強」になる。
         state.converter.as_mut().unwrap().learn_unigram("きょう", "強", 10);
-        for ch in "ni".chars() {
+        for ch in "kyou".chars() {
             let action = state.add_char(ch);
             apply_to_screen(&mut screen, action);
         }
-        assert_eq!(state.conversion_result, "今日は学校に今日は学校に強は学校にに");
+        assert_eq!(state.conversion_result, "今日は学校に今日は学校に今日は学校に強");
         assert_eq!(screen, state.conversion_result);
 
         // Backspace で固定領域まで削ると、固定は読みと一致する範囲に縮む
+        let before = state.pinned.len();
         for _ in 0..8 {
             let action = state.backspace();
             apply_to_screen(&mut screen, action);
         }
-        assert!(state.pinned.len() < 6, "pinned={:?}", state.pinned);
+        assert!(state.pinned.len() < before, "pinned={:?}", state.pinned);
         assert_eq!(screen, state.conversion_result);
 
         // 確定で固定は解除され、学習用の文節列は固定部分も含めて揃う
@@ -4388,16 +4441,41 @@ mod state_machine_tests {
         );
     }
 
-    /// しきい値未満の短い入力では固定しない
+    /// 下線は直近の単語（後ろの助詞を含む）とローマ字の打ちかけにだけ引く
     #[test]
-    fn short_input_is_not_pinned() {
+    fn marker_covers_only_the_latest_word() {
         let mut state = LiveConversionState::new();
         state.converter = Some(particle_test_converter());
         for ch in "kyouhagakkouni".chars() {
             let _ = state.add_char(ch);
         }
         assert_eq!(state.conversion_result, "今日は学校に");
+        // 「学校に」（「に」は前の単語に含める）
+        assert_eq!(state.marker_range(), Some((3, 0)));
+        let _ = state.add_char('k');
+        assert_eq!(state.conversion_result, "今日は学校にk");
+        assert_eq!(state.marker_range(), Some((4, 0)));
+        let _ = state.commit();
+        assert_eq!(state.marker_range(), None);
+    }
+
+    /// 文節は、後ろに打ち終わった文節が続くまで固定しない
+    /// （直後の文節を見て同音異義語を選び直せるように）
+    #[test]
+    fn clause_is_pinned_only_after_the_next_clause_is_typed() {
+        let mut state = LiveConversionState::new();
+        state.converter = Some(particle_test_converter());
+        for ch in "kyouhagakkou".chars() {
+            let _ = state.add_char(ch);
+        }
+        assert_eq!(state.conversion_result, "今日は学校");
         assert!(state.pinned.is_empty());
+        for ch in "ni".chars() {
+            let _ = state.add_char(ch);
+        }
+        assert_eq!(state.conversion_result, "今日は学校に");
+        let pinned: String = state.pinned.iter().map(|e| e.surface.as_str()).collect();
+        assert_eq!(pinned, "今日は");
     }
 
     /// 対応する開き括弧が無ければ `]` は既定の 」 のまま

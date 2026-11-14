@@ -45,6 +45,46 @@ pub fn is_clause_boundary(e: &WordEntry) -> bool {
     e.pos.starts_with("助動詞")
 }
 
+/// 文節に内容語（名詞・動詞・形容詞など、助詞・助動詞・記号以外）が含まれるか
+fn has_content_word(entries: &[WordEntry]) -> bool {
+    entries.iter().any(|e| {
+        !(e.pos.starts_with("助詞") || e.pos.starts_with("助動詞") || e.pos.starts_with("記号"))
+    })
+}
+
+/// 続けて打たれた文節の分だけ、先頭側を固定してよい文節数を返す。
+///
+/// 文節の切れ目（`is_clause_boundary`）で区切った文節のうち、その後ろに
+/// 「切れ目まで打ち終わった文節」がもう1つ以上続いているものまでを固定する。
+/// つまり、今打っている途中の文節と、その直前の文節は固定しない（直前の
+/// 文節の同音異義語は、直後の文節を見て選び直せる）。
+///
+/// 固定する文節も、その後ろに続く文節も、内容語（名詞・動詞など）を含む
+/// ものに限る。打ち途中の一瞬だけ現れる誤った区切り（「あさはや」→
+/// 「朝|は|や」、「せつぞ」→「せ|つ|ぞ」、文頭の「か」「で」だけの文節）を、
+/// 続けて打った文節と取り違えて固定しないため（2026-11-14、ゴールデン
+/// テストで「か対医師」「せつ属する」「朝はヤク」になったのを確認）。
+pub fn continued_clause_prefix(entries: &[WordEntry]) -> usize {
+    // 打ち終わった文節（切れ目で終わる）ごとの (終わりの位置, 内容語を含むか)
+    let mut clauses = Vec::new();
+    let mut start = 0;
+    for (i, e) in entries.iter().enumerate() {
+        if is_clause_boundary(e) {
+            clauses.push((i + 1, has_content_word(&entries[start..=i])));
+            start = i + 1;
+        }
+    }
+    let mut best = 0;
+    for w in clauses.windows(2) {
+        let ((cut, ok), (_, next_ok)) = (w[0], w[1]);
+        if !ok || !next_ok {
+            break;
+        }
+        best = cut;
+    }
+    best
+}
+
 /// 1-best の文節列 `entries` のうち、先頭から何文節を固定してよいかを返す。
 ///
 /// - 読み全体が `min_reading_chars` 未満なら 0
@@ -373,5 +413,35 @@ mod tests {
         // 読みが一致しなければ固定は無視され通常変換になる
         let out = converter.convert_with_pinned_prefix("あきょう", &pinned);
         assert_eq!(out.len(), converter.convert("あきょう").len());
+    }
+
+    #[test]
+    fn pins_clauses_once_the_next_clause_is_typed() {
+        let n = |e: &[WordEntry]| continued_clause_prefix(e);
+        // 今日は|学校に|行き… → 「学校に」まで打ち終わったら「今日は」を固定
+        let e = [
+            w("今日", "きょう", "名詞-副詞可能-*-*"),
+            w("は", "は", "助詞-係助詞-*-*"),
+            w("学校", "がっこう", "名詞-一般-*-*"),
+            w("に", "に", "助詞-格助詞-一般-*"),
+            w("行き", "いき", "動詞-自立-*-*"),
+        ];
+        assert_eq!(n(&e), 2);
+        // 直後の文節がまだ打ち途中なら固定しない
+        assert_eq!(n(&e[..3]), 0);
+        // 後ろの「文節」が打ち途中の1文字（「や」）だけなら固定しない（あさはや）
+        let e = [
+            w("朝", "あさ", "名詞-副詞可能-*-*"),
+            w("は", "は", "助詞-係助詞-*-*"),
+            w("や", "や", "助動詞-*-*-*"),
+        ];
+        assert_eq!(n(&e), 0);
+        // 内容語の無い文節（文頭の「か」だけ）は固定しない
+        let e = [
+            w("か", "か", "助詞-副助詞／並立助詞／終助詞-*-*"),
+            w("対", "たい", "名詞-一般-*-*"),
+            w("を", "を", "助詞-格助詞-一般-*"),
+        ];
+        assert_eq!(n(&e), 0);
     }
 }

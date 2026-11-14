@@ -68,6 +68,7 @@ static mut INITIAL_CHECK_DONE: bool = false;
 // （CLIとhook-dllが同一の変換エンジンを使うようにするため。
 // [[golden-test-harness]]参照）。
 mod command_mode;
+mod composition_underline;
 mod field_jump;
 mod hook;
 mod hook_thread;
@@ -143,6 +144,7 @@ pub extern "C" fn install_hook() -> bool {
         start_uia_poller();
         // 入力欄ワープ（Ctrl+無変換）の走査・フォーカス移動用スレッド
         field_jump::start_field_jump_worker();
+        composition_underline::start_composition_underline_worker();
         // パスワード欄/昇格プロセス判定を、ポーリング（最大250ms遅延）だけに
         // 頼らず、フォーカス変更の瞬間に`Unknown`へ落とすための監視を開始する。
         // UIスレッド（今この関数を呼んでいるスレッド）で行う必要がある
